@@ -24,6 +24,8 @@ import asyncio
 import json
 import os
 import sys
+import time
+
 from dataclasses import dataclass, field
 
 
@@ -40,6 +42,8 @@ class Worktree:
     last_rel: str = ""
     last_iso: str = ""
     mtime: float = 0.0
+    file_mtime: float = 0.0  # most recent file modification time
+    file_mtime_rel: str = ""  # relative time string for file_mtime
     behind: int = 0
     session_status: str = ""
     session_kind: str = ""
@@ -128,6 +132,52 @@ async def list_worktrees(cwd: str) -> tuple[str, list[Worktree]]:
     return main_path, linked
 
 
+def _mtime_to_relative(mtime: float) -> str:
+    """Convert a file modification timestamp to a relative time string like '2 hours ago'."""
+    if mtime <= 0:
+        return ""
+    now = time.time()
+    delta = int(now - mtime)
+    if delta < 0:
+        return "in the future"
+    if delta < 60:
+        return "just now" if delta < 10 else f"{delta}s ago"
+    if delta < 3600:
+        minutes = delta // 60
+        return f"{minutes}m ago"
+    if delta < 86400:
+        hours = delta // 3600
+        return f"{hours}h ago"
+    if delta < 604800:
+        days = delta // 86400
+        return f"{days}d ago"
+    weeks = delta // 604800
+    return f"{weeks}w ago"
+
+
+def _get_most_recent_file_mtime(path: str) -> float:
+    """Recursively find the most recent file modification time in a directory tree.
+    
+    Walks the entire directory tree (except .git) and returns the highest mtime found.
+    Returns 0.0 if no files found or on error.
+    """
+    max_mtime = 0.0
+    try:
+        for root, dirs, files in os.walk(path):
+            # Skip .git directory
+            dirs[:] = [d for d in dirs if d != ".git"]
+            for fname in files:
+                try:
+                    fpath = os.path.join(root, fname)
+                    mtime = os.stat(fpath).st_mtime
+                    max_mtime = max(max_mtime, mtime)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return max_mtime
+
+
 async def fill_state(wt: Worktree, base: str, cwd: str) -> None:
     """Populate a worktree's dirty/commit/last-commit/mtime/behind fields."""
     status_t = run_git(["-C", wt.path, "status", "--porcelain"], cwd)
@@ -151,6 +201,10 @@ async def fill_state(wt: Worktree, base: str, cwd: str) -> None:
         wt.mtime = os.stat(wt.path).st_mtime
     except OSError:
         wt.mtime = 0.0
+    # For dirty worktrees, compute the most recent file modification time
+    if wt.dirty:
+        wt.file_mtime = _get_most_recent_file_mtime(wt.path)
+        wt.file_mtime_rel = _mtime_to_relative(wt.file_mtime)
 
 
 async def load_sessions() -> list[dict]:
@@ -210,20 +264,22 @@ def _truncate(text: str, width: int) -> str:
 
 def render_table(worktrees: list[Worktree]) -> str:
     """Render a box-drawing table + per-worktree distinct-commit lists."""
-    headers = ["Worktree", "Branch", "State", "Commits", "Last commit", "Session"]
+    headers = ["Worktree", "Branch", "State", "Commits", "Last modified", "Session"]
     caps = [22, 24, 5, 7, 16, 14]
     rows: list[list[str]] = []
     for wt in worktrees:
         sess = f"{wt.session_status}" if wt.session_status else "—"
         if wt.session_kind:
             sess = f"{wt.session_status}/{wt.session_kind}"
+        # For dirty worktrees show file_mtime_rel, for clean show last_rel
+        display_time = wt.file_mtime_rel if wt.dirty else wt.last_rel
         rows.append(
             [
                 _truncate(os.path.basename(wt.path.rstrip("/")), caps[0]),
                 _truncate(wt.branch, caps[1]),
                 "dirty" if wt.dirty else "clean",
                 str(wt.commit_count),
-                _truncate(wt.last_rel, caps[4]),
+                _truncate(display_time, caps[4]),
                 _truncate(sess, caps[5]),
             ]
         )
@@ -271,6 +327,8 @@ def to_json(worktrees: list[Worktree]) -> str:
             "last_rel": wt.last_rel,
             "last_iso": wt.last_iso,
             "mtime": wt.mtime,
+            "file_mtime": wt.file_mtime,
+            "file_mtime_rel": wt.file_mtime_rel,
             "session_status": wt.session_status,
             "session_kind": wt.session_kind,
             "session_name": wt.session_name,
