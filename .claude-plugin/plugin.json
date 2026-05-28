@@ -1,0 +1,6 @@
+{
+  "name": "worktrees",
+  "version": "2026.05.28.1",
+  "description": "Surfaces a repo's mergeable git worktrees (those with no live claude session) at session start and offers a guided, confidence-gated, conflict-aware merge into the default branch. Repo-scoped — never looks cross-repo.",
+  "author": { "name": "Joel Thornton" }
+}
