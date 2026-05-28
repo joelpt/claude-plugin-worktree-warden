@@ -21,9 +21,11 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_worktrees.py $ARGUMENTS
 
 - **Empty output** → there are no mergeable worktrees. Say so in one line and
   stop (when triggered by the SessionStart hook, just continue silently).
-- **Otherwise** → show the table verbatim to the user. By default it lists only
-  **orphans** (worktrees with no live `claude` session); `--show-all` adds the
-  ones that have a session, annotated with their `status`/`kind`.
+- **Otherwise** → **Display the table output verbatim to the user in a code block.**
+  Do NOT paraphrase or summarize—show the exact table output from the command.
+  By default it lists only **orphans** (worktrees with no live `claude` session);
+  `--show-all` adds the ones that have a session, annotated with their
+  `status`/`kind`.
 
 ### 2. Get the structured set
 Fetch the machine-readable list (same flags you used above, plus `--json`):
