@@ -16,9 +16,12 @@ exits with the contract code below):
                    rebase is LEFT IN PROGRESS for the caller to resolve.
   rebase-continue  `git rebase --continue` after the caller staged a resolution;
                    ff-merges when the rebase completes.
-  snapshot         emit the restore anchors (target tip + each branch tip).
-  undo             reset target + branches back to a snapshot (scoped, AUTHORIZED
-                   `git reset --hard` — the only place it is used).
+  snapshot         persist restore anchors to a JSON file (target tip, each
+                   branch tip, and its worktree path) so a later undo can rebuild
+                   the pre-land branch/target tips and the worktrees.
+  undo             restore target + branches from a snapshot (scoped, AUTHORIZED
+                   `git reset --hard`) and recreate any torn-down worktree on its
+                   branch.
   teardown         idempotent worktree removal + branch -d + prune (post-land).
 
 Exit codes:
@@ -90,7 +93,7 @@ def _git(args: list[str], cwd: str | None = None, check: bool = True, strip: boo
     return proc.stdout.strip() if strip else proc.stdout
 
 
-def _git_rc(args: list[str], cwd: str | None = None, env: dict | None = None) -> tuple[int, str, str]:
+def _git_rc(args: list[str], cwd: str | None = None, env: dict[str, str] | None = None) -> tuple[int, str, str]:
     """Run a git command, returning (returncode, stdout, stderr) — never raises."""
     proc = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, env=env)
     return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
@@ -335,35 +338,105 @@ def cmd_rebase_continue(worktree: str, branch: str, target: str, repo: str) -> O
     return _ff_merge(branch, target, repo, base)
 
 
-def cmd_snapshot(repo: str, target: str, branches: list[str]) -> Outcome:
-    """Emit restore anchors: the target tip and each branch tip SHA."""
+def _git_common_dir(repo: str) -> str:
+    """Absolute path of the repo's shared git dir (stable across worktrees)."""
+    cd = _git(["rev-parse", "--git-common-dir"], cwd=repo)
+    return cd if os.path.isabs(cd) else os.path.realpath(os.path.join(repo, cd))
+
+
+def cmd_snapshot(
+    repo: str, target: str, branches: list[str], out_path: str | None = None
+) -> Outcome:
+    """Persist restore anchors: target tip, each branch tip + its worktree path.
+
+    `merge-worktrees` commits all worktree changes (tracked and untracked) before
+    snapshotting, so each branch tip already captures the full content; undo only
+    needs the SHA plus the worktree path to rebuild the worktree on that branch.
+    The snapshot is written as JSON (default: under the shared git dir) and its
+    path is emitted.
+
+    Args:
+        repo: Primary checkout path.
+        target: Default branch being landed into.
+        branches: Branch names whose worktrees are being landed.
+        out_path: Where to write the snapshot JSON; defaults under the git dir.
+
+    Returns:
+        Outcome carrying the snapshot file path and captured anchors.
+    """
     try:
         target_sha = _git(["rev-parse", target], cwd=repo)
-        branch_shas = {b: _git(["rev-parse", b], cwd=repo) for b in branches}
+        branch_info: dict[str, object] = {}
+        for branch in branches:
+            branch_info[branch] = {
+                "sha": _git(["rev-parse", branch], cwd=repo),
+                "worktree": _worktree_for_branch(branch, repo),
+            }
+        path = out_path or os.path.join(_git_common_dir(repo), "worktree-snapshot.json")
     except GitError as exc:
         return Outcome(EXIT_GIT_ERROR, "git_error", str(exc), target=target)
+
+    data: dict[str, object] = {
+        "target": target,
+        "target_sha": target_sha,
+        "branches": branch_info,
+    }
+    try:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(json.dumps(data, indent=2) + "\n")
+    except OSError as exc:
+        return Outcome(EXIT_GIT_ERROR, "git_error", f"could not write snapshot: {exc}", target=target)
+
     out = Outcome(EXIT_OK, "snapshot", f"Captured anchors for {target} + {len(branches)} branch(es).", target=target)
-    out.details = {"target_sha": target_sha, "branch_shas": branch_shas}
+    out.details = {"snapshot_file": path, **data}
     return out
 
 
-def cmd_undo(repo: str, target: str, target_sha: str, branch_shas: dict[str, str]) -> Outcome:
-    """Restore target + branches to a snapshot via scoped `git reset --hard`.
+def cmd_undo(repo: str, snapshot_path: str) -> Outcome:
+    """Restore target, branches, and worktrees from a snapshot.
 
-    AUTHORIZED reset exception: only safe because the caller commits all work
-    and snapshots AFTER the last commit, so no uncommitted tracked changes
-    exist; `--hard` never touches untracked files.
+    Restores the target and each branch tip (scoped, AUTHORIZED `git reset --hard`
+    where a worktree exists; `update-ref` where it does not) and recreates any
+    torn-down worktree on its branch. The recreated worktree is a clean checkout
+    of the restored tip, which already holds all pre-land content (committed by
+    `merge-worktrees` before the snapshot); whether to `git reset` that content
+    back into the working tree is the user's call.
+
+    Args:
+        repo: Primary checkout path.
+        snapshot_path: Path to the JSON written by `snapshot`.
+
+    Returns:
+        Outcome listing what was restored, or a partial/error state.
     """
     try:
         primary = _primary_worktree(repo)
     except GitError as exc:
-        return Outcome(EXIT_GIT_ERROR, "git_error", str(exc), target=target)
-    out = Outcome(EXIT_OK, "undone", "", target=target, primary=primary)
+        return Outcome(EXIT_GIT_ERROR, "git_error", str(exc))
+    out = Outcome(EXIT_OK, "undone", "", primary=primary)
 
-    # Pre-validate every anchor resolves to a commit before touching anything.
-    for sha in [target_sha, *branch_shas.values()]:
+    try:
+        data = json.loads(Path(snapshot_path).read_text())
+    except (OSError, ValueError) as exc:
+        out.code, out.status = EXIT_GIT_ERROR, "bad_snapshot"
+        out.message = f"could not read snapshot {snapshot_path}: {exc}"
+        return out
+
+    target = str(data.get("target", ""))
+    target_sha = data.get("target_sha")
+    branches: dict[str, dict[str, object]] = data.get("branches", {}) or {}
+    out.target = target
+
+    anchors = [target_sha, *(info.get("sha") for info in branches.values())]
+    for sha in anchors:
+        # Explicit type guard before any git call: anchors come from on-disk JSON,
+        # and a non-str (or flag-like) value must never reach a git command.
+        if not isinstance(sha, str):
+            out.code, out.status = EXIT_GIT_ERROR, "bad_anchor"
+            out.message = f"Anchor {sha!r} is not a SHA string; refusing undo (nothing changed)."
+            return out
         rc, _, _ = _git_rc(["rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"], cwd=repo)
-        if rc != 0:
+        if not sha or rc != 0:
             out.code, out.status = EXIT_GIT_ERROR, "bad_anchor"
             out.message = f"Anchor '{sha}' does not resolve to a commit; refusing undo (nothing changed)."
             return out
@@ -371,24 +444,45 @@ def cmd_undo(repo: str, target: str, target_sha: str, branch_shas: dict[str, str
     restored: list[str] = []
     failed: list[str] = []
 
-    # Primary (target) FIRST — main is what verify/tests read, so it must be
-    # restored even if a later branch reset fails.
-    rc, _, err = _git_rc(["reset", "--hard", target_sha], cwd=primary)
+    # Target FIRST — main is what verify/tests read, so restore it even if a
+    # later branch step fails.
+    rc, _, err = _git_rc(["reset", "--hard", str(target_sha)], cwd=primary)
     (restored if rc == 0 else failed).append(
-        f"{target}->{target_sha[:8]}" if rc == 0 else f"{target}: {err}"
+        f"{target}->{str(target_sha)[:8]}" if rc == 0 else f"{target}: {err}"
     )
 
-    for branch, sha in branch_shas.items():
-        wt = _worktree_for_branch(branch, repo)
-        if wt is None:
-            rc, _, err = _git_rc(["update-ref", f"refs/heads/{branch}", sha], cwd=repo)
+    for branch, info in branches.items():
+        sha = str(info.get("sha"))
+        wt_path = info.get("worktree")
+        cur_wt = _worktree_for_branch(branch, repo)
+
+        if cur_wt is not None:
+            if _rebase_in_progress(cur_wt):
+                _git_rc(["rebase", "--abort"], cwd=cur_wt, env=_REBASE_ENV)
+            rc, _, err = _git_rc(["reset", "--hard", sha], cwd=cur_wt)
         else:
-            if _rebase_in_progress(wt):
-                _git_rc(["rebase", "--abort"], cwd=wt, env=_REBASE_ENV)
-            rc, _, err = _git_rc(["reset", "--hard", sha], cwd=wt)
-        (restored if rc == 0 else failed).append(
-            f"{branch}->{sha[:8]}" if rc == 0 else f"{branch}: {err}"
-        )
+            # update-ref is reached only when NO worktree (primary included —
+            # _worktree_for_branch scans every porcelain record) holds the branch,
+            # so it never desyncs a live checkout.
+            rc, _, err = _git_rc(["update-ref", f"refs/heads/{branch}", sha], cwd=repo)
+
+        if rc != 0:
+            failed.append(f"{branch}: {err}")
+            continue
+
+        if isinstance(wt_path, str) and cur_wt is None:
+            # Clear stale worktree admin records first so a prior (even partial)
+            # teardown doesn't make `worktree add` think the path is still linked.
+            _git_rc(["worktree", "prune"], cwd=repo)
+            rc2, _, err2 = _git_rc(["worktree", "add", wt_path, branch], cwd=repo)
+            if rc2 != 0:
+                # Branch tip is already restored; only the checkout is missing.
+                # `git worktree add` refuses a non-empty leftover dir — surface the
+                # path so the user can clear it and re-add, rather than silently half-restore.
+                failed.append(f"{branch} worktree ({wt_path}) — restore by hand: {err2}")
+                continue
+
+        restored.append(f"{branch}->{sha[:8]}")
 
     if failed:
         out.code, out.status = EXIT_GIT_ERROR, "partial_undo"
@@ -398,7 +492,7 @@ def cmd_undo(repo: str, target: str, target_sha: str, branch_shas: dict[str, str
         )
         out.details = {"restored": restored, "failed": failed}
         return out
-    out.message = f"Restored to pre-land anchors: {', '.join(restored)}."
+    out.message = f"Restored to snapshot: {', '.join(restored)}."
     out.details = {"restored": restored}
     return out
 
@@ -466,15 +560,6 @@ def cmd_teardown(branch: str, target: str, repo: str, dry_run: bool) -> Outcome:
     return base
 
 
-def _parse_branch_shas(pairs: list[str]) -> dict[str, str]:
-    out: dict[str, str] = {}
-    for pair in pairs:
-        if "=" in pair:
-            name, sha = pair.split("=", 1)
-            out[name] = sha
-    return out
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="worktree_engine.py")
     parser.add_argument("--repo", default=os.getcwd(), help="Primary checkout (default: cwd).")
@@ -493,11 +578,10 @@ def main(argv: list[str] | None = None) -> int:
     p_snap = sub.add_parser("snapshot")
     p_snap.add_argument("--target", default="main")
     p_snap.add_argument("--branches", default="", help="Comma-separated branch names.")
+    p_snap.add_argument("--out", default=None, help="Snapshot JSON path (default: under git dir).")
 
     p_undo = sub.add_parser("undo")
-    p_undo.add_argument("--target", default="main")
-    p_undo.add_argument("--target-sha", required=True)
-    p_undo.add_argument("--branch-shas", nargs="*", default=[], help="name=sha pairs.")
+    p_undo.add_argument("--snapshot", required=True, help="Path to the snapshot JSON.")
 
     p_td = sub.add_parser("teardown")
     p_td.add_argument("--branch", required=True)
@@ -513,9 +597,9 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_rebase_continue(args.worktree, args.branch, args.target, repo).emit()
         if args.cmd == "snapshot":
             branches = [b for b in args.branches.split(",") if b]
-            return cmd_snapshot(repo, args.target, branches).emit()
+            return cmd_snapshot(repo, args.target, branches, args.out).emit()
         if args.cmd == "undo":
-            return cmd_undo(repo, args.target, args.target_sha, _parse_branch_shas(args.branch_shas)).emit()
+            return cmd_undo(repo, args.snapshot).emit()
         if args.cmd == "teardown":
             return cmd_teardown(args.branch, args.target, repo, args.dry_run).emit()
     except GitError as exc:
