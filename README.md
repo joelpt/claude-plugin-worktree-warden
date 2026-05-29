@@ -1,7 +1,9 @@
 # worktrees
 
-Surfaces a repo's **mergeable git worktrees** at session start and offers a
-guided, confidence-gated, conflict-aware merge into the default branch.
+Keeps substantive edits **inside git worktrees**: a `PreToolUse` gate blocks
+edits to a repo's main checkout (with a deliberate, time-boxed exception
+mechanism), surfaces a repo's **mergeable git worktrees** at session start, and
+offers a guided, confidence-gated, conflict-aware merge into the default branch.
 
 A worktree is "mergeable" when it has **no live `claude` session** sitting in it.
 Everything is **repo-scoped**: although `claude agents --json` lists sessions
@@ -10,6 +12,15 @@ worktrees of the repo your current session belongs to — never cross-repo.
 
 ## Components
 
+- **PreToolUse gate** (`Edit|Write`) — hard-blocks edits to a repo's **main
+  checkout**, steering substantive work into a worktree. Enforced under every
+  permission mode (it blocks via **exit code 2**, *before* the permission layer,
+  so `bypassPermissions` does not slip past it). It auto-allows — no action
+  needed — when cwd is a linked worktree, the file is outside the checkout
+  (cross-repo / `~/.claude`), the path is inside `.git/`, or cwd is not a git
+  repo. It **fails open**: any unexpected error allows the edit, so a bug can
+  never brick editing. On by default; opt out per-repo or globally. See
+  [Enforcement gate](#enforcement-gate).
 - **SessionStart hook** — on `startup`/`resume`, only when cwd is the repo's
   **main** worktree, silently checks for mergeable worktrees. If any exist, it
   emits a user-facing `systemMessage` banner naming the count and pointing the
@@ -36,20 +47,70 @@ worktrees of the repo your current session belongs to — never cross-repo.
 
 ## Scripts
 
+- `scripts/worktree_gate.py` — the gate's pure decision policy plus the
+  `worktree-gate` CLI (`grant`, `finished`, `disable`, `enable`, `set-window`,
+  `status`). The PreToolUse hook imports its policy; the CLI manages exceptions
+  and persistent settings.
 - `scripts/check_worktrees.py` — async, stdlib-only detector/renderer. Shared by
   the hook (`--json`, for the gate) and the skill (table + `--json`).
   `--cwd <path>`, `--show-all`, `--json`.
 - `scripts/worktree_engine.py` — deterministic land engine: `land` (preflight +
   rebase + ff-merge; leaves the rebase in progress on conflict), `rebase-continue`,
-  `snapshot` / `undo` (exact-state restore), and `teardown` (idempotent, path-gated
-  worktree removal + `branch -d`, no `--force`/`-D`).
+  `snapshot` (writes a JSON of the target tip, each branch tip, and its worktree
+  path) / `undo` (restores those tips and **recreates any torn-down worktree on
+  its branch** — so a roll-back even after teardown reconstructs the worktrees),
+  and `teardown` (idempotent, path-gated worktree removal + `branch -d`, no
+  `--force`/`-D`).
+
+## Enforcement gate
+
+The gate is **on by default**. When it blocks a main-checkout edit it prints the
+commands to proceed. Two ways forward:
+
+- **Isolate the work** (preferred): call `EnterWorktree`, then retry the edit.
+- **Open a timed exception** when the edit is *legitimately* main-side (conflict
+  resolution, landing to the default branch, or an explicit request to edit
+  main):
+
+  ```bash
+  worktree_gate grant "resolving a merge conflict on main"   # opens a window
+  # ... do the main-side edits ...
+  worktree_gate finished                                     # close it early
+  ```
+
+  An exception is a single deliberate, **logged**, self-expiring window
+  (15 min by default); it covers a burst of related edits and then closes on its
+  own. Closing it the moment the work is done (`finished`) is expected.
+
+### Settings & opt-out
+
+Persisted as small JSON config at two scopes; a **project** value overrides the
+**user** value key-by-key:
+
+- user — `${XDG_CONFIG_HOME:-~/.config}/worktree-gate/config.json` (all repos).
+- project — `<git-common-dir>/worktree-gate-config.json` (this clone only; lives
+  inside `.git`, never committed).
+
+```bash
+worktree_gate disable            # turn the gate off for this repo
+worktree_gate disable --user     # turn it off everywhere
+worktree_gate enable [--user]    # turn it back on
+worktree_gate set-window 30m     # tune the exception window (e.g. 900, 30s, 1h)
+worktree_gate status             # show effective settings + any active exception
+```
+
+The grant token and project config live next to each other under the repo's
+git directory; the user config and an `audit.log` of grants/uses/blocks live
+under the user config dir.
 
 ## Safety
 
 - Linear history only — rebase + ff-merge, never a merge commit.
-- Rollback is a **scoped, anchor-protected `git reset --hard`** (engine `undo`): safe
-  because everything is committed and snapshotted before any rebase, and `--hard`
-  never touches untracked files. Mid-rebase conflicts abort cleanly (no reset).
+- Rollback (engine `undo`) restores the target + each branch tip via a **scoped,
+  anchor-protected `git reset --hard`** (or `update-ref` where no worktree holds the
+  branch) and recreates any torn-down worktree on its branch: safe because everything
+  is committed and snapshotted before any rebase, and `--hard` never touches untracked
+  files. Mid-rebase conflicts abort cleanly (no reset).
 - Conflict resolution prompts the user only when confidence is low/medium.
 - Teardown refuses dirty worktrees and unmerged branches.
 - Respects the active project's CLAUDE.md (e.g. SSH-approval gates).

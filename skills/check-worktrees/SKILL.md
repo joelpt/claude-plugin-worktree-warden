@@ -13,9 +13,10 @@ one this session's cwd belongs to) and its linked worktrees — never cross-repo
 ## Procedure
 
 ### 1. Render the table
+
 Run the detector (pass `--show-all` only if the user supplied it):
 
-```
+```bash
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_worktrees.py $ARGUMENTS
 ```
 
@@ -28,9 +29,10 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_worktrees.py $ARGUMENTS
   `status`/`kind`.
 
 ### 2. Get the structured set
+
 Fetch the machine-readable list (same flags you used above, plus `--json`):
 
-```
+```bash
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_worktrees.py --json $ARGUMENTS
 ```
 
@@ -39,7 +41,9 @@ Each entry has `path`, `branch`, `dirty`, `commit_count`, `behind_base`,
 needs the exact `path` + `branch` of each chosen worktree.
 
 ### 3. Ask which to merge
+
 `AskUserQuestion` — *"Merge worktrees before continuing?"* with options:
+
 - **Merge all N** — every listed worktree.
 - **Merge none** — stop here, change nothing.
 - **Choose specific** — proceed to subset selection.
@@ -50,10 +54,12 @@ For **Choose specific**, present the worktrees with `multiSelect: true` in
 until every worktree has been offered. The union of ticked options is the set.
 
 ### 4. Hand off
+
 If the chosen set is non-empty, invoke **`/worktrees:merge-worktrees`**, passing
 the chosen worktrees' `path` + `branch` (from step 2's JSON). If empty, stop.
 
 ## Notes
+
 - `--show-all` is for manual inspection; never merge a worktree that has a live
   session without the user explicitly choosing it (the merge skill re-checks).
 - This skill only lists and asks — all merging/pruning happens in

@@ -1,0 +1,4 @@
+{
+  "include": ["scripts", "hooks", "tst"],
+  "extraPaths": ["scripts"]
+}
