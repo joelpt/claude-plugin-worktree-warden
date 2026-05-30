@@ -106,6 +106,7 @@ class MainEmitTest(TestCase):
         *,
         mode: str = "always",
         enforcement: bool = False,
+        disabled_scope: str | None = None,
         source: str = "startup",
         is_main: bool = True,
     ) -> tuple[int, str]:
@@ -113,7 +114,9 @@ class MainEmitTest(TestCase):
         payload = json.dumps({"source": source, "cwd": "/repo"})
         with (
             mock.patch.object(hook, "is_main_worktree", return_value=is_main),
-            mock.patch.object(hook, "get_gate_state", return_value=(mode, enforcement)),
+            mock.patch.object(
+                hook, "get_gate_state", return_value=(mode, enforcement, disabled_scope)
+            ),
             mock.patch.object(hook, "gather", return_value=worktrees),
             mock.patch("sys.stdin", io.StringIO(payload)),
             contextlib.redirect_stdout(io.StringIO()) as out,
@@ -163,3 +166,27 @@ class MainEmitTest(TestCase):
         rc, out = self._run_main([_wt(commit_count=1)], is_main=False)
         self.assertEqual(rc, 0)
         self.assertEqual(out.strip(), "")
+
+    def test_project_disabled_emits_warning_in_system_message(self) -> None:
+        rc, out = self._run_main(
+            [_wt(commit_count=1)],
+            mode="always",
+            enforcement=False,
+            disabled_scope="project",
+        )
+        self.assertEqual(rc, 0)
+        emitted = json.loads(out)
+        self.assertIn("⚠️", emitted["systemMessage"])
+        self.assertIn("project config", emitted["systemMessage"].lower())
+        self.assertNotIn("additionalInformation", emitted)
+
+    def test_project_disabled_warning_prepended_to_banner(self) -> None:
+        rc, out = self._run_main(
+            [_wt(commit_count=1)],
+            mode="always",
+            enforcement=False,
+            disabled_scope="project",
+        )
+        self.assertEqual(rc, 0)
+        emitted = json.loads(out)
+        self.assertTrue(emitted["systemMessage"].startswith("⚠️"))

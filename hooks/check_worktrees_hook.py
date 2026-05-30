@@ -80,8 +80,8 @@ _ENFORCEMENT_MSG = (
 )
 
 
-def get_gate_state(cwd: str) -> tuple[str, bool]:
-    """Return the effective (startup_display_mode, enforcement_active) for cwd.
+def get_gate_state(cwd: str) -> tuple[str, bool, str | None]:
+    """Return the effective (startup_display_mode, enforcement_active, disabled_scope).
 
     Reads the shared worktree-gate config (user scope overridden by project).
     Falls back to safe defaults on any error so a config-read failure never
@@ -91,16 +91,17 @@ def get_gate_state(cwd: str) -> tuple[str, bool]:
         cwd: Absolute path used to locate the repo's gate configuration.
 
     Returns:
-        A tuple of (startup_display, enforcement_active) where enforcement_active
-        is True when the gate is enabled (no scope has disabled it).
+        A tuple of (startup_display, enforcement_active, disabled_scope) where
+        enforcement_active is True when the gate is enabled and disabled_scope
+        is the scope that disabled it ("user" or "project"), or None if active.
     """
     try:
         import worktree_gate as wg  # noqa: PLC0415
 
         settings = wg.resolve_settings(wg.git_facts(cwd))
-        return settings.startup_display, settings.disabled_scope is None
+        return settings.startup_display, settings.disabled_scope is None, settings.disabled_scope
     except Exception:
-        return "always", False
+        return "always", False, None
 
 
 def gather(cwd: str) -> list[cw.Worktree]:
@@ -200,7 +201,7 @@ def main() -> int:
     if not is_main_worktree(cwd):
         return 0
 
-    mode, enforcement_active = get_gate_state(cwd)
+    mode, enforcement_active, disabled_scope = get_gate_state(cwd)
     if mode == "never" and not enforcement_active:
         return 0
 
@@ -209,8 +210,25 @@ def main() -> int:
         banner = build_banner(gather(cwd), mode)
         if banner:
             output["systemMessage"] = banner
+
     if enforcement_active:
         output["additionalInformation"] = _ENFORCEMENT_MSG
+    elif disabled_scope == "project":
+        # Project config (committable) disabled enforcement — surface it so the
+        # user notices that a checked-in file is overriding the safety gate.
+        warning = (
+            "⚠️  Worktree gate DISABLED by project config "
+            "(.claude/settings.worktree-warden.json). "
+            "Direct main-checkout edits are not blocked in this repo. "
+            "Run `worktree_gate enable` to re-enable, or verify this is intentional."
+        )
+        existing = output.get("systemMessage", "")
+        output["systemMessage"] = (warning + "\n\n" + existing).strip()
+        try:
+            import worktree_gate as wg  # noqa: PLC0415
+            wg.log_event("project-disabled-notice", "SessionStart: project config disabled enforcement", None)
+        except Exception:
+            pass
 
     if output:
         print(json.dumps(output))

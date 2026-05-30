@@ -67,6 +67,8 @@ def main() -> int:
         if decision.allow:
             if decision.log_grant_use:
                 gate.log_event("use", decision.reason, file_path)
+            elif settings.disabled_scope == "project":
+                gate.log_event("project-disabled", "edit allowed: project config disabled enforcement", file_path)
             return 0
 
         gate.log_event("block", decision.reason, file_path)
