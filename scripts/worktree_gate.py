@@ -14,9 +14,10 @@ Persistent settings live in a small JSON config at two scopes:
   * project -- ``<git-common-dir>/worktree-gate-config.json``; personal to this
               clone (it lives inside ``.git`` and is never committed).
 
-Each config may set ``enforce`` (bool) and ``window_seconds`` (int). A project
-value overrides the user value key-by-key; absent keys fall back to the user
-config and then to the built-in defaults.
+Each config may set ``enforce`` (bool), ``window_seconds`` (int), and
+``startup_display`` (one of "mergeable"/"always"/"never"). A project value
+overrides the user value key-by-key; absent keys fall back to the user config
+and then to the built-in defaults.
 """
 
 from __future__ import annotations
@@ -34,6 +35,9 @@ from typing import cast
 DEFAULT_WINDOW_SECONDS = 15 * 60
 MIN_WINDOW_SECONDS = 60
 MAX_WINDOW_SECONDS = 8 * 60 * 60
+
+STARTUP_DISPLAY_VALUES = ("mergeable", "always", "never")
+DEFAULT_STARTUP_DISPLAY = "always"
 
 GRANT_FILENAME = "worktree-gate-grant.json"
 PROJECT_CONFIG_FILENAME = "worktree-gate-config.json"
@@ -72,10 +76,14 @@ class Settings:
         disabled_scope: The scope that turned enforcement off ("user" or
             "project"), or None when enforcement is active.
         window_seconds: Lifetime applied to a freshly granted exception.
+        startup_display: Which worktrees the SessionStart banner surfaces:
+            "mergeable" (only when at least one is offerable), "always"
+            (whenever any linked worktree exists), or "never" (suppressed).
     """
 
     disabled_scope: str | None
     window_seconds: int
+    startup_display: str
 
 
 @dataclass(frozen=True)
@@ -270,7 +278,18 @@ def resolve_settings(facts: GitFacts) -> Settings:
         value = cfg.get("window_seconds")
         if isinstance(value, int) and not isinstance(value, bool):
             window = _clamp_window(value)
-    return Settings(disabled_scope=disabled_scope, window_seconds=window)
+
+    startup_display = DEFAULT_STARTUP_DISPLAY
+    for cfg in (user_cfg, proj_cfg):  # project visited last, so it overrides user
+        value = cfg.get("startup_display")
+        if isinstance(value, str) and value in STARTUP_DISPLAY_VALUES:
+            startup_display = value
+
+    return Settings(
+        disabled_scope=disabled_scope,
+        window_seconds=window,
+        startup_display=startup_display,
+    )
 
 
 def read_teardown_mode(facts: GitFacts) -> str:
@@ -479,6 +498,22 @@ def cmd_set_window(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_set_startup_display(args: argparse.Namespace) -> int:
+    """Persist which worktrees the SessionStart banner shows, at the chosen scope."""
+    facts = git_facts(os.getcwd())
+    path = _scope_config_path(args, facts)
+    if path is None:
+        print("worktree-gate: not in a git repo; use --user for global scope.")
+        return 1
+    _update_config(path, startup_display=args.mode)
+    scope = "user" if args.user else "project"
+    print(
+        f"worktree-gate: startup worktree display set to '{args.mode}' "
+        f"({scope} scope) -> {path}"
+    )
+    return 0
+
+
 def cmd_status() -> int:
     """Print effective settings and any active exception."""
     facts = git_facts(os.getcwd())
@@ -487,6 +522,7 @@ def cmd_status() -> int:
     scope = f" ({settings.disabled_scope} scope)" if settings.disabled_scope else ""
     print(f"worktree-gate: enforcement {state}{scope}")
     print(f"  exception window: {settings.window_seconds // 60} min")
+    print(f"  startup worktree display: {settings.startup_display}")
     if not facts.is_repo:
         print("  repo: not inside a git repository")
         return 0
@@ -581,6 +617,14 @@ def build_parser() -> argparse.ArgumentParser:
     set_window.add_argument("duration", help="e.g. 900, 30s, 15m, 1h")
     set_window.add_argument("--user", action="store_true", help="global scope")
 
+    startup = sub.add_parser(
+        "set-startup-display",
+        help="which worktrees the session-start banner shows: "
+        "mergeable | always | never",
+    )
+    startup.add_argument("mode", choices=STARTUP_DISPLAY_VALUES)
+    startup.add_argument("--user", action="store_true", help="global scope")
+
     sub.add_parser("status", help="show effective settings")
 
     teardown = sub.add_parser(
@@ -604,6 +648,7 @@ def main(argv: list[str] | None = None) -> int:
         "enable": cmd_enable,
         "set-window": cmd_set_window,
         "teardown-mode": cmd_teardown_mode,
+        "set-startup-display": cmd_set_startup_display,
     }
     if args.command in handlers_with_args:
         return handlers_with_args[args.command](args)

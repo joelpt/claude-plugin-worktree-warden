@@ -199,6 +199,25 @@ class SettingsTest(unittest.TestCase):
         settings = gate.resolve_settings(self.facts)
         self.assertIsNone(settings.disabled_scope)
         self.assertEqual(settings.window_seconds, gate.DEFAULT_WINDOW_SECONDS)
+        self.assertEqual(settings.startup_display, gate.DEFAULT_STARTUP_DISPLAY)
+
+    def test_user_startup_display(self) -> None:
+        self._write_user({"startup_display": "never"})
+        self.assertEqual(gate.resolve_settings(self.facts).startup_display, "never")
+
+    def test_project_startup_display_overrides_user(self) -> None:
+        self._write_user({"startup_display": "never"})
+        self._write_project({"startup_display": "mergeable"})
+        self.assertEqual(
+            gate.resolve_settings(self.facts).startup_display, "mergeable"
+        )
+
+    def test_invalid_startup_display_falls_back_to_default(self) -> None:
+        self._write_user({"startup_display": "bogus"})
+        self.assertEqual(
+            gate.resolve_settings(self.facts).startup_display,
+            gate.DEFAULT_STARTUP_DISPLAY,
+        )
 
     def test_user_opt_out(self) -> None:
         self._write_user({"enforce": False})

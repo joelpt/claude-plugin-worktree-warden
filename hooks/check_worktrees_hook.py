@@ -1,25 +1,32 @@
 #!/usr/bin/env python3
-"""SessionStart hook: surface this repo's mergeable worktrees.
+"""SessionStart hook: surface this repo's git worktrees.
 
 Gate-then-inject. Fires only for startup/resume (enforced by hooks.json
-matchers; re-checked defensively here). Stays completely silent unless:
-  - cwd is inside a git repo, AND
-  - cwd is the repo's MAIN worktree (never a linked worktree — the review
-    skill must not run from inside a worktree), AND
-  - the repo has >=1 linked worktree that is actionable — ready to merge,
-    mergeable after a commit, or empty/already-merged and prunable (i.e. not
-    every worktree is blocked by a live session or held on the recent-activity
-    cooldown).
+matchers; re-checked defensively here). Two preconditions always hold before
+anything is shown: cwd is inside a git repo, and cwd is the repo's MAIN
+worktree (never a linked worktree — the review skill must not run from inside
+one).
 
-When all hold, it emits a JSON hook result whose `systemMessage` shows the
-user a banner with the count of actionable worktrees plus the same box-drawing
-table that /check-worktrees renders (which lists every worktree, blocked ones
-included), so the user can see at a glance what's in scope before running
-/merge-worktrees. `systemMessage` is user-facing only — it is
-NOT added to the agent's context and never instructs the agent to act.
-Merging is a deliberate, explicit user opt-in (the user types the slash
-command), so nothing relies on the agent honoring an injected instruction.
-This hook never merges or mutates anything.
+What it then surfaces is governed by the `startup_display` setting (resolved
+through the shared worktree-gate config, user scope overridden by project):
+
+  - "always" (default) — show a banner whenever the repo has >=1 linked
+    worktree of any kind, so a worktree you forgot about (sitting on cooldown
+    or open in another tab's live session) is still surfaced for awareness.
+  - "mergeable" — show only when >=1 worktree is offerable for auto-merge
+    (ready, mergeable-after-commit, or prunable); stay silent when every
+    worktree is blocked by a live session or held on the recent-activity
+    cooldown.
+  - "never" — never show the banner.
+
+The banner's `systemMessage` carries a category breakdown (mergeable /
+cooldown / live-session), the same box-drawing table /check-worktrees renders
+(every worktree, held-back ones included), and a concise recommendation of
+what each command does. `systemMessage` is user-facing only — it is NOT added
+to the agent's context and never instructs the agent to act. Merging is a
+deliberate, explicit user opt-in (the user types the slash command), so
+nothing relies on the agent honoring an injected instruction. This hook never
+merges or mutates anything.
 
 Repo-scoped by construction: the detector only inspects worktrees of this
 repo. Exit code is always 0 — a failing SessionStart hook would degrade the
@@ -34,15 +41,19 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 _root = os.environ.get("CLAUDE_PLUGIN_ROOT")
 _scripts_dir = (Path(_root) if _root else Path(__file__).resolve().parent.parent) / "scripts"
 sys.path.insert(0, str(_scripts_dir))
 
+if TYPE_CHECKING:
+    import check_worktrees as cw
+
 ALLOWED_SOURCES = {"startup", "resume"}
 
 
-def read_stdin() -> dict:
+def read_stdin() -> dict[str, object]:
     try:
         return json.load(sys.stdin)
     except Exception:
@@ -70,66 +81,124 @@ def is_main_worktree(cwd: str) -> bool:
     return os.path.realpath(git_dir) == os.path.realpath(common_dir)
 
 
-def get_ready_info(cwd: str) -> tuple[int, str]:
-    """Gather every linked worktree, count the actionable ones, render the table.
+def resolve_startup_display(cwd: str) -> str:
+    """Return the effective startup-display mode for cwd's repo.
 
-    The count is the number of *ready* worktrees — mergeable, mergeable-after-
-    commit, or empty-and-prunable — collapsed into one figure (prune is not
-    distinguished from merge in the banner). The table shows ALL worktrees,
-    including any blocked by a live session, so the user sees the full picture.
-
-    Returns (ready_count, rendered_table). Returns (0, '') when nothing is
-    actionable — i.e. there are no worktrees, or every one is blocked by a live
-    session or held on the recent-activity cooldown — or on any error, which
-    keeps the SessionStart banner silent.
+    Reads the shared worktree-gate config (user scope overridden by project).
+    Falls back to the built-in default on any error — a config-read failure
+    must never silence the banner unexpectedly nor crash the hook.
     """
     try:
-        import check_worktrees as cw  # noqa: PLC0415
-    except Exception:
-        return 0, ""
+        import worktree_gate as wg  # noqa: PLC0415
 
+        return wg.resolve_settings(wg.git_facts(cwd)).startup_display
+    except Exception:
+        return "always"
+
+
+def gather(cwd: str) -> list[cw.Worktree]:
+    """Resolve every linked worktree of cwd's repo, or [] on any error."""
     try:
-        worktrees = asyncio.run(
-            asyncio.wait_for(cw.gather_worktrees(cwd), timeout=20.0)
-        )
-    except Exception:
-        return 0, ""
+        import check_worktrees as cw  # noqa: PLC0415
 
-    ready_count = sum(1 for wt in worktrees if wt.is_mergeable)
-    if ready_count == 0:
-        return 0, ""
+        return asyncio.run(asyncio.wait_for(cw.gather_worktrees(cwd), timeout=20.0))
+    except Exception:
+        return []
+
+
+def build_banner(worktrees: list[cw.Worktree], mode: str) -> str | None:
+    """Compose the SessionStart banner for the given mode, or None to stay silent.
+
+    Args:
+        worktrees: Every linked worktree of the repo (any readiness).
+        mode: One of "mergeable", "always", "never".
+
+    Returns:
+        The banner text, or None when nothing should be shown — "never", no
+        worktrees at all, or "mergeable" mode with nothing offerable.
+    """
+    if mode == "never" or not worktrees:
+        return None
+
+    # Safe import: a non-empty `worktrees` can only have come from gather(),
+    # which already imported check_worktrees — so this is a sys.modules hit.
+    import check_worktrees as cw  # noqa: PLC0415
+
+    mergeable = [wt for wt in worktrees if wt.is_mergeable]
+    cooldown = [wt for wt in worktrees if wt.readiness is cw.Readiness.COOLDOWN]
+    blocked = [wt for wt in worktrees if wt.readiness is cw.Readiness.BLOCKED]
+
+    if mode == "mergeable" and not mergeable:
+        return None
 
     try:
         table = cw.render_table(worktrees)
     except Exception:
         table = ""
 
-    return ready_count, table
+    header = _summary(len(worktrees), len(mergeable), len(cooldown), len(blocked))
+    recommendation = _recommendation(
+        len(mergeable), len(cooldown), len(blocked), cw.RECENT_WINDOW_SECONDS // 60
+    )
+    body = "\n\n".join(part for part in (table, recommendation) if part)
+    return f"\n\n{header}\n\n{body}"
+
+
+def _summary(total: int, n_merge: int, n_cool: int, n_block: int) -> str:
+    """One-line header: total worktrees with a per-category breakdown."""
+    noun = "worktree" if total == 1 else "worktrees"
+    parts: list[str] = []
+    if n_merge:
+        parts.append(f"{n_merge} mergeable")
+    if n_cool:
+        parts.append(f"{n_cool} on cooldown")
+    if n_block:
+        parts.append(f"{n_block} in a live session")
+    detail = f" — {', '.join(parts)}" if parts else ""
+    return f"🌳 {total} git {noun} in this repo{detail}."
+
+
+def _recommendation(n_merge: int, n_cool: int, n_block: int, cooldown_min: int) -> str:
+    """Per-category lines describing what acting on each kind would do."""
+    lines: list[str] = []
+    if n_merge:
+        them = "it" if n_merge == 1 else "them"
+        lines.append(
+            f"→ /merge-worktrees lands the {n_merge} mergeable into the default branch "
+            f"by rebase + fast-forward (empty/already-merged ones are pruned instead); "
+            f"/check-worktrees reviews {them} first."
+        )
+    if n_cool:
+        lines.append(
+            f"→ ⏳ on cooldown = edited in the last {cooldown_min} min, held back so "
+            "half-baked work isn't auto-landed; merges once quiet, or land one now via "
+            "/check-worktrees if you're sure."
+        )
+    if n_block:
+        lines.append(
+            "→ ❌ live session = a claude session is open in it (another tab/agent); "
+            "shown for awareness, never auto-merged."
+        )
+    return "\n".join(lines)
 
 
 def main() -> int:
     payload = read_stdin()
-    source = payload.get("source", "")
+    source = str(payload.get("source", ""))
     if source and source not in ALLOWED_SOURCES:
         return 0
-    cwd = payload.get("cwd") or os.getcwd()
+    cwd = str(payload.get("cwd") or os.getcwd())
 
     if not is_main_worktree(cwd):
         return 0
 
-    n, table = get_ready_info(cwd)
-    if n <= 0:
+    mode = resolve_startup_display(cwd)
+    if mode == "never":
         return 0
 
-    plural = "worktree" if n == 1 else "worktrees"
-    pronoun = "it" if n == 1 else "them"
-    header = (
-        f"\n\n🌳 {n} mergeable git {plural} found by worktree-warden. "
-        f"Run /merge-worktrees to land {pronoun} into the default branch, "
-        f"or /check-worktrees to review first."
-    )
-    message = f"{header}\n\n{table}" if table else header
-    print(json.dumps({"systemMessage": message}))
+    message = build_banner(gather(cwd), mode)
+    if message:
+        print(json.dumps({"systemMessage": message}))
     return 0
 
 

@@ -2,7 +2,7 @@
 
 Keeps substantive edits **inside git worktrees**: a `PreToolUse` gate blocks
 edits to a repo's main checkout (with a deliberate, time-boxed exception
-mechanism), surfaces a repo's **mergeable git worktrees** at session start, and
+mechanism), surfaces a repo's **git worktrees** at session start, and
 offers a guided, confidence-gated, conflict-aware merge into the default branch.
 
 `/check-worktrees` lists **every** linked worktree with a `Ready?` verdict: ✅ ready
@@ -26,17 +26,21 @@ worktrees of the repo your current session belongs to — never cross-repo.
   never brick editing. On by default; opt out per-repo or globally. See
   [Enforcement gate](#enforcement-gate).
 - **SessionStart hook** — on `startup`/`resume`, only when cwd is the repo's
-  **main** worktree, silently checks for actionable worktrees (ready to merge,
-  mergeable after a commit, or prunable — prune is not distinguished from merge
-  in the count; recently-active ⏳ and live-session ❌ worktrees are excluded).
-  If any exist, it emits a user-facing `systemMessage` banner
-  naming the count plus the full table, and points the user at `/merge-worktrees`
-  to land them (or `/check-worktrees` to review first). It stays silent when
-  there is nothing actionable — including when **every** worktree is blocked by
-  a live session. The banner is shown to the user only — it is **not** injected
-  into the agent's context and never asks the agent to act, so merging stays a
-  deliberate, explicit user opt-in (you type the slash command). The hook never
-  merges or mutates anything.
+  **main** worktree, surfaces the repo's linked worktrees as a user-facing
+  `systemMessage` banner: a category breakdown (mergeable / ⏳ cooldown / ❌
+  live-session), the full `Ready?` table, and a concise recommendation of what
+  each command does. What triggers it is the **`startup_display`** setting:
+  - `always` (**default**) — show whenever the repo has ≥1 linked worktree of
+    any kind, so a worktree you forgot about (on cooldown, or open in another
+    tab's live session) is still surfaced for awareness.
+  - `mergeable` — show only when ≥1 worktree is offerable for auto-merge; stay
+    silent when every worktree is held back by cooldown or a live session.
+  - `never` — suppress the banner entirely.
+
+  The banner is shown to the user only — it is **not** injected into the agent's
+  context and never asks the agent to act, so merging stays a deliberate,
+  explicit user opt-in (you type the slash command). The hook never merges or
+  mutates anything.
 - **`/worktrees:check-worktrees`** — renders a table of **every** linked worktree
   with a `Ready?` verdict and a concise `Note` (state, commits ahead, last edit),
   then asks which to merge (All / None / a paged subset). Worktrees blocked by a
@@ -59,8 +63,8 @@ worktrees of the repo your current session belongs to — never cross-repo.
 
 - `scripts/worktree_gate.py` — the gate's pure decision policy plus the
   `worktree-gate` CLI (`grant`, `finished`, `disable`, `enable`, `set-window`,
-  `status`). The PreToolUse hook imports its policy; the CLI manages exceptions
-  and persistent settings.
+  `set-startup-display`, `status`). The PreToolUse hook imports its policy; the
+  CLI manages exceptions and persistent settings.
 - `scripts/check_worktrees.py` — async, stdlib-only detector/renderer that lists
   every linked worktree and classifies each one's readiness. Shared by the hook
   and the skill (table + `--json`). Flags: `--cwd <path>`, `--json`.
@@ -102,12 +106,17 @@ Persisted as small JSON config at two scopes; a **project** value overrides the
   inside `.git`, never committed).
 
 ```bash
-worktree_gate disable            # turn the gate off for this repo
-worktree_gate disable --user     # turn it off everywhere
-worktree_gate enable [--user]    # turn it back on
-worktree_gate set-window 30m     # tune the exception window (e.g. 900, 30s, 1h)
-worktree_gate status             # show effective settings + any active exception
+worktree_gate disable                    # turn the gate off for this repo
+worktree_gate disable --user             # turn it off everywhere
+worktree_gate enable [--user]            # turn it back on
+worktree_gate set-window 30m             # tune the exception window (e.g. 900, 30s, 1h)
+worktree_gate set-startup-display never  # session-start banner: mergeable | always | never
+worktree_gate status                     # show effective settings + any active exception
 ```
+
+The `set-startup-display` mode controls the SessionStart banner (see the
+SessionStart hook above); like the other keys it is stored per scope, project
+overriding user.
 
 The grant token and project config live next to each other under the repo's
 git directory; the user config and an `audit.log` of grants/uses/blocks live
