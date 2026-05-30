@@ -1,6 +1,6 @@
 ---
 name: check-worktrees
-description: List every linked git worktree of the current repo with a Ready? verdict (✅ ready / mergeable after commit, 🧹 empty or already-merged & prunable, ⏳ recently active so held back, ❌ blocked by a live session) and a concise Note, then offer to merge the actionable ones. Use on /check-worktrees, "show worktrees", "any stale worktrees?", or when the SessionStart hook flags mergeable worktrees.
+description: List and offer to merge this repo's worktrees
 allowed-tools: Bash(python3 *) Skill(worktree-warden:merge-worktrees)
 ---
 

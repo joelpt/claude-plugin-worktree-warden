@@ -1,6 +1,6 @@
 ---
 name: auto-teardown
-description: Assess worktree completion state and commit/merge/teardown per the configured auto-teardown policy. Invoked automatically by the Stop hook when eligible pending work exists, or directly by the user.
+description: Auto-commit, merge, and tear down worktrees
 ---
 
 You are running the **auto-teardown** skill. This is invoked either automatically by the Stop hook (which detected pending worktree work) or manually by the user.

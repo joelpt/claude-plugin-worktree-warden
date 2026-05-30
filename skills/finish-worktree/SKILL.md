@@ -1,6 +1,6 @@
 ---
 name: finish-worktree
-description: Land the current git worktree into the default branch and tear it down. Plugin replacement for /rmws — works whether the session arrived via EnterWorktree or started in the worktree directly (background jobs, /worktree-started sessions). Use on /finish-worktree, /rmws, "done with this worktree", "land this and clean up", "merge and remove this worktree", or "remove this worktree".
+description: Land current worktree to main and tear it down
 disable-model-invocation: true
 argument-hint: "[target-branch]"
 allowed-tools: Bash(git *) Bash(cd *) ExitWorktree EnterWorktree Skill(worktree-warden:merge-worktrees) Skill(worktree-warden:check-worktrees)

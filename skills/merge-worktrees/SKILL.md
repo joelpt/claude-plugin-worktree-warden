@@ -1,6 +1,6 @@
 ---
 name: merge-worktrees
-description: Land a chosen set of the current repo's linked git worktrees into the default branch by rebase + fast-forward (never a merge commit), in a determined order, with confidence-gated conflict handling, post-land tests, exact-state rollback on failure, and scripted teardown. Use on /merge-worktrees or after /check-worktrees selects worktrees. Repo-scoped — never cross-repo.
+description: Rebase+ff-merge chosen worktrees into main
 allowed-tools: Bash(python3 *) Bash(git *) Skill(commit-commands:commitall) Skill(tao:thinkdeep) Skill(tao:chat) Skill(think) Skill(tao:consensus) Skill(tao:vet) Skill(tao:synthesize)
 ---
 
