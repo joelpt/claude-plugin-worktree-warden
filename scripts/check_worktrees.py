@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Detect a repo's linked worktrees and which ones are mergeable.
+"""Detect a repo's linked worktrees and classify each one's merge readiness.
 
 Repo-scoped by construction: `git worktree list` only ever returns worktrees
 of the repo that `--cwd` belongs to, so this never looks cross-repo. The
 `claude agents --json` data is used ONLY to test whether a live session's cwd
 falls inside one of THIS repo's worktrees.
 
+Every linked worktree is always listed (no orphan filtering); each is tagged
+with a `Readiness` bucket — ready to merge, mergeable after a commit, empty or
+already-merged (prunable), recently active (held back as a safety harness), or
+blocked by a live session.
+
 Modes:
-  (default)     pretty box-drawing table of mergeable worktrees (orphans:
-                no live claude session), or nothing if there are none.
-  --show-all    include every linked worktree (annotate session status),
-                not just orphans.
-  --json        emit a JSON array instead of the table (for the skill to
-                drive selection/merge). Honors --show-all.
+  (default)     pretty box-drawing table of every linked worktree, or nothing
+                if there are none.
+  --json        emit a JSON array instead of the table (for the skill to drive
+                selection / merge / prune).
 
 Exit code is always 0; absence of output means "nothing to surface".
 """
@@ -25,8 +28,45 @@ import json
 import os
 import sys
 import time
+import unicodedata
 
 from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from pathlib import Path
+
+
+RECENT_WINDOW_SECONDS = 15 * 60
+
+
+class Readiness(str, Enum):
+    """How a worktree relates to being landed into the default branch."""
+
+    READY = "ready"  # clean, commits ahead of base — land as-is
+    NEEDS_COMMIT = "needs_commit"  # uncommitted work — commit, then land
+    MERGED = "merged"  # clean, HEAD already in base's chain but behind it — prune
+    PRUNE = "prune"  # clean, HEAD == base tip — nothing here, just prune
+    COOLDOWN = "cooldown"  # active within the recent window — hold off (overridable)
+    BLOCKED = "blocked"  # a live claude session sits inside it
+
+
+_EMOJI: dict[Readiness, str] = {
+    Readiness.READY: "✅",
+    Readiness.NEEDS_COMMIT: "✅",
+    Readiness.MERGED: "🧹",
+    Readiness.PRUNE: "🧹",
+    Readiness.COOLDOWN: "⏳",
+    Readiness.BLOCKED: "❌",
+}
+
+_NOTE: dict[Readiness, str] = {
+    Readiness.READY: "ready to merge",
+    Readiness.NEEDS_COMMIT: "can merge after commit",
+    Readiness.MERGED: "merged, can be pruned",
+    Readiness.PRUNE: "empty, can be pruned",
+    Readiness.COOLDOWN: "active <15m ago",
+    Readiness.BLOCKED: "live session",
+}
 
 
 @dataclass
@@ -48,10 +88,57 @@ class Worktree:
     session_status: str = ""
     session_kind: str = ""
     session_name: str = ""
+    recently_active: bool = False  # edited or had transcript activity within the window
 
     @property
     def has_session(self) -> bool:
+        """True iff a live claude session sits inside this worktree."""
         return bool(self.session_status)
+
+    @property
+    def readiness(self) -> Readiness:
+        """Classify the worktree. A live session blocks regardless of content.
+
+        Recent activity (an edit or transcript write within the window) holds
+        the worktree on COOLDOWN below a live session but above its git state —
+        a safety harness against landing half-baked work, overridable on
+        explicit request. A clean worktree with no commits ahead of base has its
+        HEAD already in base's chain; `behind > 0` means real history that base
+        has moved past (merged), while `behind == 0` means HEAD sits exactly on
+        base (empty).
+        """
+        if self.has_session:
+            return Readiness.BLOCKED
+        if self.recently_active:
+            return Readiness.COOLDOWN
+        if self.dirty:
+            return Readiness.NEEDS_COMMIT
+        if self.commit_count > 0:
+            return Readiness.READY
+        if self.behind > 0:
+            return Readiness.MERGED
+        return Readiness.PRUNE
+
+    @property
+    def ready_emoji(self) -> str:
+        """The Ready? column glyph for this worktree's bucket."""
+        return _EMOJI[self.readiness]
+
+    @property
+    def ready_note(self) -> str:
+        """A concise, deterministic reason for this worktree's bucket."""
+        return _NOTE[self.readiness]
+
+    @property
+    def is_mergeable(self) -> bool:
+        """True iff this worktree is *offerable* for auto-merge.
+
+        That means neither blocked by a live session nor on the recent-activity
+        cooldown. Git state may still permit an explicit merge of a cooldown
+        worktree — this gate only governs what is offered/counted automatically,
+        never the engine, so an explicit user request can still land one.
+        """
+        return self.readiness not in (Readiness.BLOCKED, Readiness.COOLDOWN)
 
 
 async def run_git(args: list[str], cwd: str) -> tuple[int, str]:
@@ -178,6 +265,65 @@ def _get_most_recent_file_mtime(path: str) -> float:
     return max_mtime
 
 
+def _recent(mtime: float, now: float, window: int = RECENT_WINDOW_SECONDS) -> bool:
+    """True iff `mtime` is a real timestamp within `window` seconds of `now`."""
+    return mtime > 0 and (now - mtime) <= window
+
+
+def _last_edit_mtime(wt: Worktree) -> float:
+    """Epoch of the worktree's last edit, mirroring the table's `Last edit`.
+
+    For dirty worktrees that is the newest working-tree file mtime. For clean
+    worktrees it is the last commit time, but ONLY when the worktree has its own
+    commits ahead of base — a 0-ahead worktree's `last_iso` is the base tip it
+    inherited, not activity in this worktree, so using it would falsely flag the
+    worktree as recently active whenever base was just committed. Returns 0.0
+    when unknown, inherited, or unparseable (the transcript signal still stands).
+    """
+    if wt.dirty:
+        return wt.file_mtime
+    if wt.commit_count > 0 and wt.last_iso:
+        try:
+            return datetime.fromisoformat(wt.last_iso).timestamp()
+        except ValueError:
+            return 0.0
+    return 0.0
+
+
+def _projects_dir() -> Path:
+    """Resolve the Claude config `projects/` dir holding session transcripts."""
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    root = Path(base) if base else Path.home() / ".claude"
+    return root / "projects"
+
+
+def _encode_project_dir(path: str) -> str:
+    """Encode an absolute cwd into its `~/.claude/projects/` folder name.
+
+    Claude maps a cwd to a transcript dir by replacing `/` and `.` with `-`;
+    the encoding is lossy (not reversible) but stable forward, which is all we
+    need to look up a known worktree path's transcripts.
+    """
+    return os.path.realpath(path).replace("/", "-").replace(".", "-")
+
+
+def _latest_transcript_mtime(path: str, projects_dir: Path) -> float:
+    """Newest transcript `.jsonl` mtime for sessions whose cwd is `path`.
+
+    Keys on the worktree's exact path (top-level `*.jsonl` only), so a session
+    rooted in a *subdir* of the worktree, or a subagent transcript nested under
+    a `subagents/` dir, won't contribute — the last-edit signal usually covers
+    those. Fail-silent: a missing dir, odd encoding, or permission error yields
+    0.0 so the recency check degrades to the last-edit signal rather than
+    erroring.
+    """
+    try:
+        d = projects_dir / _encode_project_dir(path)
+        return max((f.stat().st_mtime for f in d.glob("*.jsonl")), default=0.0)
+    except OSError:
+        return 0.0
+
+
 async def fill_state(wt: Worktree, base: str, cwd: str) -> None:
     """Populate a worktree's dirty/commit/last-commit/mtime/behind fields."""
     status_t = run_git(["-C", wt.path, "status", "--porcelain"], cwd)
@@ -258,41 +404,72 @@ def match_sessions(worktrees: list[Worktree], sessions: list[dict]) -> None:
                 break
 
 
+def _display_width(text: str) -> int:
+    """Terminal column count, counting East-Asian-wide glyphs (emoji) as 2.
+
+    The status emoji (✅/❌/🧹) carry East Asian width 'W', so plain ``len`` would
+    under-count them by one and skew the table's right border.
+    """
+    return sum(2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in text)
+
+
 def _truncate(text: str, width: int) -> str:
-    return text if len(text) <= width else text[: width - 1] + "…"
+    """Trim text to a display width, appending '…' when it overflows.
+
+    Display-width aware to match the renderer's padding/width logic, so a wide
+    glyph in a capped cell can't push the cell past its column.
+    """
+    if _display_width(text) <= width:
+        return text
+    out, used = "", 0
+    for ch in text:
+        ch_w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if used + ch_w > width - 1:  # reserve one column for the ellipsis
+            break
+        out += ch
+        used += ch_w
+    return out + "…"
+
+
+def _pad(text: str, width: int, *, right: bool = False) -> str:
+    """Pad text to a display width, accounting for wide glyphs."""
+    gap = width - _display_width(text)
+    if gap <= 0:
+        return text
+    return (" " * gap + text) if right else (text + " " * gap)
 
 
 def render_table(worktrees: list[Worktree]) -> str:
     """Render a box-drawing table + per-worktree distinct-commit lists."""
-    headers = ["Worktree", "Branch", "State", "Commits", "Last modified", "Session"]
-    caps = [22, 24, 5, 7, 16, 14]
+    headers = ["Ready?", "Worktree", "State", "Commits", "Last edit", "Note"]
+    caps = [6, 22, 5, 7, 16, 22]
     rows: list[list[str]] = []
     for wt in worktrees:
-        sess = f"{wt.session_status}" if wt.session_status else "—"
-        if wt.session_kind:
-            sess = f"{wt.session_status}/{wt.session_kind}"
         # For dirty worktrees show file_mtime_rel, for clean show last_rel
         display_time = wt.file_mtime_rel if wt.dirty else wt.last_rel
         rows.append(
             [
-                _truncate(os.path.basename(wt.path.rstrip("/")), caps[0]),
-                _truncate(wt.branch, caps[1]),
+                wt.ready_emoji,
+                _truncate(os.path.basename(wt.path.rstrip("/")), caps[1]),
                 "dirty" if wt.dirty else "clean",
                 str(wt.commit_count),
                 _truncate(display_time, caps[4]),
-                _truncate(sess, caps[5]),
+                _truncate(wt.ready_note, caps[5]),
             ]
         )
     widths = [
-        min(caps[i], max(len(headers[i]), *(len(r[i]) for r in rows)) if rows else len(headers[i]))
+        min(
+            caps[i],
+            max(len(headers[i]), *(_display_width(r[i]) for r in rows))
+            if rows
+            else len(headers[i]),
+        )
         for i in range(len(headers))
     ]
     right = {3}  # right-align the Commits column
 
     def fmt_row(cells: list[str]) -> str:
-        out = []
-        for i, c in enumerate(cells):
-            out.append(c.rjust(widths[i]) if i in right else c.ljust(widths[i]))
+        out = [_pad(c, widths[i], right=i in right) for i, c in enumerate(cells)]
         return "│ " + " │ ".join(out) + " │"
 
     def rule(left: str, mid: str, rightc: str) -> str:
@@ -332,14 +509,23 @@ def to_json(worktrees: list[Worktree]) -> str:
             "session_status": wt.session_status,
             "session_kind": wt.session_kind,
             "session_name": wt.session_name,
+            "recently_active": wt.recently_active,
+            "category": wt.readiness.value,
+            "note": wt.ready_note,
+            "ready": wt.is_mergeable,
         }
         for wt in worktrees
     ]
     return json.dumps(payload, indent=2)
 
 
-async def gather_worktrees(cwd: str, show_all: bool) -> list[Worktree]:
-    """Resolve, populate, session-match, and filter the repo's worktrees."""
+async def gather_worktrees(cwd: str) -> list[Worktree]:
+    """Resolve, populate, and session-match every linked worktree of the repo.
+
+    Returns all linked worktrees (oldest first); readiness classification is a
+    per-worktree property, so callers filter on `is_mergeable`/`readiness`
+    rather than this function pre-filtering the list.
+    """
     if not await is_git_repo(cwd):
         return []
     linked = (await list_worktrees(cwd))[1]
@@ -349,23 +535,28 @@ async def gather_worktrees(cwd: str, show_all: bool) -> list[Worktree]:
     await asyncio.gather(*(fill_state(wt, base_branch, cwd) for wt in linked))
     sessions = await load_sessions()
     match_sessions(linked, sessions)
+    now = time.time()
+    projects_dir = _projects_dir()
+    for wt in linked:
+        wt.recently_active = _recent(_last_edit_mtime(wt), now) or _recent(
+            _latest_transcript_mtime(wt.path, projects_dir), now
+        )
     linked.sort(key=lambda w: w.mtime)
-    if show_all:
-        return linked
-    # Mergeable = no live session AND has something to contribute (commits ahead
-    # of base OR dirty files). A clean, fully-merged worktree with no session is
-    # not actionable and should not appear as "mergeable".
-    return [wt for wt in linked if not wt.has_session and (wt.commit_count > 0 or wt.dirty)]
+    return linked
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="check_worktrees")
     parser.add_argument("--cwd", default=os.getcwd())
-    parser.add_argument("--show-all", action="store_true")
     parser.add_argument("--json", dest="as_json", action="store_true")
     args = parser.parse_args()
 
-    worktrees = asyncio.run(gather_worktrees(args.cwd, args.show_all))
+    try:
+        worktrees = asyncio.run(gather_worktrees(args.cwd))
+    except Exception:  # noqa: BLE001 — honor the "exit 0, no output" contract
+        if args.as_json:
+            print("[]")
+        return 0
     if not worktrees:
         if args.as_json:
             print("[]")

@@ -6,12 +6,16 @@ matchers; re-checked defensively here). Stays completely silent unless:
   - cwd is inside a git repo, AND
   - cwd is the repo's MAIN worktree (never a linked worktree — the review
     skill must not run from inside a worktree), AND
-  - the repo has >=1 linked worktree with NO live claude session.
+  - the repo has >=1 linked worktree that is actionable — ready to merge,
+    mergeable after a commit, or empty/already-merged and prunable (i.e. not
+    every worktree is blocked by a live session or held on the recent-activity
+    cooldown).
 
 When all hold, it emits a JSON hook result whose `systemMessage` shows the
-user a banner with the orphan count plus the same box-drawing table that
-/check-worktrees renders, so the user can see at a glance what's in scope
-before running /merge-worktrees. `systemMessage` is user-facing only — it is
+user a banner with the count of actionable worktrees plus the same box-drawing
+table that /check-worktrees renders (which lists every worktree, blocked ones
+included), so the user can see at a glance what's in scope before running
+/merge-worktrees. `systemMessage` is user-facing only — it is
 NOT added to the agent's context and never instructs the agent to act.
 Merging is a deliberate, explicit user opt-in (the user types the slash
 command), so nothing relies on the agent honoring an injected instruction.
@@ -66,11 +70,18 @@ def is_main_worktree(cwd: str) -> bool:
     return os.path.realpath(git_dir) == os.path.realpath(common_dir)
 
 
-def get_orphan_info(cwd: str) -> tuple[int, str]:
-    """Gather orphan worktrees in-process and render the display table.
+def get_ready_info(cwd: str) -> tuple[int, str]:
+    """Gather every linked worktree, count the actionable ones, render the table.
 
-    Returns (count, rendered_table). Returns (0, '') when there are no
-    orphans or on any error.
+    The count is the number of *ready* worktrees — mergeable, mergeable-after-
+    commit, or empty-and-prunable — collapsed into one figure (prune is not
+    distinguished from merge in the banner). The table shows ALL worktrees,
+    including any blocked by a live session, so the user sees the full picture.
+
+    Returns (ready_count, rendered_table). Returns (0, '') when nothing is
+    actionable — i.e. there are no worktrees, or every one is blocked by a live
+    session or held on the recent-activity cooldown — or on any error, which
+    keeps the SessionStart banner silent.
     """
     try:
         import check_worktrees as cw  # noqa: PLC0415
@@ -79,13 +90,13 @@ def get_orphan_info(cwd: str) -> tuple[int, str]:
 
     try:
         worktrees = asyncio.run(
-            asyncio.wait_for(cw.gather_worktrees(cwd, show_all=False), timeout=20.0)
+            asyncio.wait_for(cw.gather_worktrees(cwd), timeout=20.0)
         )
     except Exception:
         return 0, ""
 
-    n = len(worktrees)
-    if n == 0:
+    ready_count = sum(1 for wt in worktrees if wt.is_mergeable)
+    if ready_count == 0:
         return 0, ""
 
     try:
@@ -93,7 +104,7 @@ def get_orphan_info(cwd: str) -> tuple[int, str]:
     except Exception:
         table = ""
 
-    return n, table
+    return ready_count, table
 
 
 def main() -> int:
@@ -106,7 +117,7 @@ def main() -> int:
     if not is_main_worktree(cwd):
         return 0
 
-    n, table = get_orphan_info(cwd)
+    n, table = get_ready_info(cwd)
     if n <= 0:
         return 0
 
