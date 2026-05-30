@@ -267,5 +267,72 @@ class GrantExpiryTest(unittest.TestCase):
         self.assertIsNone(gate.read_grant_expiry(self.common))
 
 
+class TeardownModeTest(unittest.TestCase):
+    """Teardown mode config read and CLI round-trip."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self._xdg = base / "xdg"
+        self._git = base / "repo" / ".git"
+        self._git.mkdir(parents=True)
+        self._prev_xdg = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self._xdg)
+        self.common_dir = str(os.path.realpath(str(self._git)))
+        self.facts = _main_facts(str(base / "repo"), str(self._git))
+
+    def tearDown(self) -> None:
+        if self._prev_xdg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._prev_xdg
+        self._tmp.cleanup()
+
+    def _write_user(self, data: dict[str, object]) -> None:
+        path = gate.user_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+
+    def _write_project(self, data: dict[str, object]) -> None:
+        path = gate.project_config_path(self.common_dir)
+        assert path is not None
+        path.write_text(json.dumps(data))
+
+    def test_default_is_ask(self) -> None:
+        self.assertEqual(gate.read_teardown_mode(self.facts), "ask")
+
+    def test_user_mode_respected(self) -> None:
+        self._write_user({"teardown_mode": "auto"})
+        self.assertEqual(gate.read_teardown_mode(self.facts), "auto")
+
+    def test_all_valid_modes(self) -> None:
+        for mode in gate.VALID_TEARDOWN_MODES:
+            self._write_user({"teardown_mode": mode})
+            self.assertEqual(gate.read_teardown_mode(self.facts), mode)
+
+    def test_project_overrides_user(self) -> None:
+        self._write_user({"teardown_mode": "auto"})
+        self._write_project({"teardown_mode": "never"})
+        self.assertEqual(gate.read_teardown_mode(self.facts), "never")
+
+    def test_invalid_mode_ignored_falls_back_to_default(self) -> None:
+        self._write_user({"teardown_mode": "invalid"})
+        self.assertEqual(gate.read_teardown_mode(self.facts), "ask")
+
+    def test_empty_project_config_does_not_override_user(self) -> None:
+        self._write_user({"teardown_mode": "never"})
+        self._write_project({})
+        self.assertEqual(gate.read_teardown_mode(self.facts), "never")
+
+    def test_project_invalid_mode_does_not_override_user(self) -> None:
+        self._write_user({"teardown_mode": "auto"})
+        self._write_project({"teardown_mode": "bogus"})
+        self.assertEqual(gate.read_teardown_mode(self.facts), "auto")
+
+    def test_no_repo_returns_default(self) -> None:
+        no_repo = gate.GitFacts(False, None, None, False)
+        self.assertEqual(gate.read_teardown_mode(no_repo), "ask")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -40,6 +40,9 @@ PROJECT_CONFIG_FILENAME = "worktree-gate-config.json"
 USER_CONFIG_BASENAME = "config.json"
 AUDIT_BASENAME = "audit.log"
 
+VALID_TEARDOWN_MODES = ("ask", "auto", "always", "commit-only", "never")
+DEFAULT_TEARDOWN_MODE = "ask"
+
 
 @dataclass(frozen=True)
 class GitFacts:
@@ -270,6 +273,28 @@ def resolve_settings(facts: GitFacts) -> Settings:
     return Settings(disabled_scope=disabled_scope, window_seconds=window)
 
 
+def read_teardown_mode(facts: GitFacts) -> str:
+    """Return the effective auto-teardown mode, resolving user → project scope.
+
+    Project config overrides user config key-by-key. Unknown or invalid values
+    are ignored; the function always returns a member of VALID_TEARDOWN_MODES.
+
+    Args:
+        facts: Resolved git context (project config is keyed by its common dir).
+
+    Returns:
+        The effective teardown mode string.
+    """
+    user_cfg = _load_json(user_config_path())
+    proj_cfg = _load_json(project_config_path(facts.git_common_dir))
+    mode = DEFAULT_TEARDOWN_MODE
+    for cfg in (user_cfg, proj_cfg):
+        value = cfg.get("teardown_mode")
+        if isinstance(value, str) and value in VALID_TEARDOWN_MODES:
+            mode = value
+    return mode
+
+
 def read_grant_expiry(git_common_dir: str | None) -> float | None:
     """Return the active exception's expiry epoch, or None if there is none."""
     data = _load_json(grant_path(git_common_dir))
@@ -476,6 +501,66 @@ def cmd_status() -> int:
     return 0
 
 
+def cmd_teardown_mode(args: argparse.Namespace) -> int:
+    """Show or set the auto-teardown mode at the chosen scope.
+
+    Without a mode argument, prints the current effective mode and its source
+    scope. With a mode argument, persists that mode to the config file for
+    the selected scope (project by default, user with --user).
+
+    Args:
+        args: Parsed arguments; ``args.mode`` is the mode to set or None to
+            show, ``args.user`` selects user scope.
+
+    Returns:
+        Process exit code (0 on success, 1 on error).
+    """
+    facts = git_facts(os.getcwd())
+
+    if not args.mode:
+        user_cfg = _load_json(user_config_path())
+        proj_cfg = _load_json(project_config_path(facts.git_common_dir))
+        user_val = user_cfg.get("teardown_mode")
+        proj_val = proj_cfg.get("teardown_mode")
+        effective = read_teardown_mode(facts)
+
+        if (
+            isinstance(proj_val, str)
+            and proj_val in VALID_TEARDOWN_MODES
+            and isinstance(user_val, str)
+            and user_val in VALID_TEARDOWN_MODES
+            and proj_val != user_val
+        ):
+            print(
+                f"worktree-gate teardown-mode: {effective} "
+                f"(project) overrides {user_val} (user)"
+            )
+        elif isinstance(proj_val, str) and proj_val in VALID_TEARDOWN_MODES:
+            print(f"worktree-gate teardown-mode: {effective} (project scope)")
+        elif isinstance(user_val, str) and user_val in VALID_TEARDOWN_MODES:
+            print(f"worktree-gate teardown-mode: {effective} (user scope)")
+        else:
+            print(f"worktree-gate teardown-mode: {effective} (default)")
+        return 0
+
+    if args.mode not in VALID_TEARDOWN_MODES:
+        valid = ", ".join(VALID_TEARDOWN_MODES)
+        print(f"worktree-gate: invalid teardown mode {args.mode!r}; choose from: {valid}")
+        return 1
+
+    path = _scope_config_path(args, facts)
+    if path is None:
+        print("worktree-gate: not in a git repo; use --user for global scope.")
+        return 1
+
+    _update_config(path, teardown_mode=args.mode)
+    scope = "user" if args.user else "project"
+    print(
+        f"worktree-gate teardown-mode: set to '{args.mode}' ({scope} scope) -> {path}"
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the worktree-gate argument parser."""
     parser = argparse.ArgumentParser(prog="worktree-gate")
@@ -497,6 +582,16 @@ def build_parser() -> argparse.ArgumentParser:
     set_window.add_argument("--user", action="store_true", help="global scope")
 
     sub.add_parser("status", help="show effective settings")
+
+    teardown = sub.add_parser(
+        "teardown-mode", help="show or set the auto-teardown mode"
+    )
+    valid = "|".join(VALID_TEARDOWN_MODES)
+    teardown.add_argument(
+        "mode", nargs="?", metavar=f"{{{valid}}}", help="mode to set (omit to show)"
+    )
+    teardown.add_argument("--user", action="store_true", help="global scope")
+
     return parser
 
 
@@ -508,6 +603,7 @@ def main(argv: list[str] | None = None) -> int:
         "disable": cmd_disable,
         "enable": cmd_enable,
         "set-window": cmd_set_window,
+        "teardown-mode": cmd_teardown_mode,
     }
     if args.command in handlers_with_args:
         return handlers_with_args[args.command](args)
