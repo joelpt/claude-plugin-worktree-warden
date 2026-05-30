@@ -113,7 +113,7 @@ def main() -> int:
     plural = "worktree" if n == 1 else "worktrees"
     pronoun = "it" if n == 1 else "them"
     header = (
-        f"🌳 {n} mergeable git {plural} found (no live claude session). "
+        f"\n\n🌳 {n} mergeable git {plural} found by worktree-warden. "
         f"Run /merge-worktrees to land {pronoun} into the default branch, "
         f"or /check-worktrees to review first."
     )
