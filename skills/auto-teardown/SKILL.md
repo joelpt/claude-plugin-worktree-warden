@@ -1,9 +1,10 @@
 ---
 name: auto-teardown
 description: Commit, merge, teardown worktrees
+disable-model-invocation: true
 ---
 
-You are running the **auto-teardown** skill. This is invoked either automatically by the Stop hook (which detected pending worktree work) or manually by the user.
+You are running the **auto-teardown** skill. This is invoked automatically by the Stop hook when it detects pending worktree work.
 
 ## Step 1 — Read the configured mode
 
