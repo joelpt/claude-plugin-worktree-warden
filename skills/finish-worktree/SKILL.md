@@ -3,7 +3,7 @@ name: finish-worktree
 description: Land the current git worktree into the default branch and tear it down. Plugin replacement for /rmws — works whether the session arrived via EnterWorktree or started in the worktree directly (background jobs, /worktree-started sessions). Use on /finish-worktree, /rmws, "done with this worktree", "land this and clean up", "merge and remove this worktree", or "remove this worktree".
 disable-model-invocation: true
 argument-hint: "[target-branch]"
-allowed-tools: Bash(git *) Bash(cd *) ExitWorktree EnterWorktree Skill(worktrees:merge-worktrees) Skill(worktrees:check-worktrees)
+allowed-tools: Bash(git *) Bash(cd *) ExitWorktree EnterWorktree Skill(worktree-warden:merge-worktrees) Skill(worktree-warden:check-worktrees)
 ---
 
 ## Live context
@@ -16,7 +16,7 @@ allowed-tools: Bash(git *) Bash(cd *) ExitWorktree EnterWorktree Skill(worktrees
 ## What /finish-worktree does
 
 Lands **this linked worktree** into `$ARGUMENTS` (default: the repo's default branch) and
-tears it down — by delegating to the worktrees plugin's `/worktrees:merge-worktrees` engine
+tears it down — by delegating to the worktrees plugin's `/worktree-warden:merge-worktrees` engine
 (rebase + ff-merge, post-land tests, exact-state rollback on failure). Handles the one thing
 the engine can't: relocating the session out of the worktree before teardown.
 
@@ -40,7 +40,7 @@ snapshot before any rebase.
 
 - **Not a git repo** → stop and report.
 - **`git-dir` is `.git`** (cwd is the primary checkout, not a linked worktree) → this is not
-  what `/finish-worktree` lands. Punt to **`/worktrees:check-worktrees`** (it surfaces the
+  what `/finish-worktree` lands. Punt to **`/worktree-warden:check-worktrees`** (it surfaces the
   repo's mergeable worktrees and offers to land any). Do not proceed to step 2.
 - **Inside a linked worktree but already on the target branch** → stop (misconfiguration;
   nothing to land).
@@ -68,7 +68,7 @@ Call **`ExitWorktree(action:"keep")`**:
 
 ### 4. Delegate the land
 
-Invoke **`/worktrees:merge-worktrees`** passing:
+Invoke **`/worktree-warden:merge-worktrees`** passing:
 - `--worktree $WORKTREE_PATH`
 - `--branch $BRANCH`
 - `--repo $PRIMARY` (explicit; merge-worktrees uses this for all engine calls and skips its
@@ -88,7 +88,7 @@ tests → teardown, with confidence-gated conflict/rollback handling.
 
 ## Hard rules
 
-- Never hand-roll merge or teardown — `/worktrees:merge-worktrees` owns all git mutation.
+- Never hand-roll merge or teardown — `/worktree-warden:merge-worktrees` owns all git mutation.
 - Never `ExitWorktree action:"remove"` (refuses for session-created worktrees; no-op
   otherwise) — always use `"keep"` then delegate.
 - Exit-12/13-style refusals from the engine are full stops — report, don't force.

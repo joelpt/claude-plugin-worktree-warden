@@ -10,9 +10,9 @@ to `worktree-warden`. The repo directory and GitHub repo move from
 > **plugin identity** (brand); leave the **generic git-worktree vocabulary**
 > alone. A blind global find/replace of `worktree(s)` will break the plugin.
 >
-> - **RENAME (plugin identity):** `plugin.json` `name`, the `worktrees:` skill
+> - **RENAME (plugin identity):** `plugin.json` `name`, the `worktree-warden:` skill
 >   namespace prefix, the repo dir, both marketplace entries, the GitHub repo,
->   README branding, the global-CLAUDE.md mentions of "the `worktrees` plugin".
+>   README branding, the global-CLAUDE.md mentions of "the `worktree-warden` plugin".
 > - **DO NOT RENAME (describes git worktrees, not the brand):** script files
 >   `worktree_engine.py` / `worktree_gate.py` / `check_worktrees.py` /
 >   `enforce_worktree_hook.py` / `check_worktrees_hook.py`, the `worktree_gate`
@@ -34,8 +34,8 @@ to `worktree-warden`. The repo directory and GitHub repo move from
 
 Renaming the plugin breaks existing users on the prior version:
 
-- Skill invocation namespace changes: `/worktrees:check-worktrees` →
-  `/worktree-warden:check-worktrees` (same for `merge-worktrees`).
+- Skill invocation namespace changes: `/worktree-warden:check-worktrees`
+  (same for `merge-worktrees`).
 - The installed plugin reference changes name, so users must disable the old
   install and enable the new one (a marketplace update alone won't rename it).
 
@@ -48,17 +48,15 @@ forward-migration notes in the README, and record `BREAKING:` in the commit body
 
 - [ ] `.claude-plugin/plugin.json` — `name`: `worktrees` → `worktree-warden`.
       Bump `version` (CalVer `YYYY.MM.DD.N`) in the same commit.
-- [ ] `skills/check-worktrees/SKILL.md` — `allowed-tools:
-      Skill(worktrees:merge-worktrees)` and body refs `/worktrees:merge-worktrees`
-      → `worktree-warden:...`.
-- [ ] `skills/merge-worktrees/SKILL.md` — any `worktrees:` namespace refs.
-- [ ] `README.md` — title/branding, install command, and every
-      `/worktrees:check-worktrees` / `/worktrees:merge-worktrees` example →
-      `worktree-warden:...`. Add a short "Renamed from `worktrees`" note +
-      migration line for existing users.
-- [ ] Sweep for stragglers:
-      `grep -rn "worktrees:" --include=*.md --include=*.json` and a
-      brand-name pass `grep -rni "plugin.*worktrees\|worktrees.*plugin"`.
+- [x] `skills/check-worktrees/SKILL.md` — `allowed-tools:
+      Skill(worktree-warden:merge-worktrees)` and body refs
+      `/worktree-warden:merge-worktrees` updated.
+- [x] `skills/merge-worktrees/SKILL.md` — no `worktree-warden:` namespace refs needed.
+- [x] `README.md` — title/branding and every
+      `/worktree-warden:check-worktrees` / `/worktree-warden:merge-worktrees` example
+      updated. Added "Renamed from `worktrees`" migration note.
+- [x] Sweep for stragglers:
+      `grep -rn "worktree-warden:" --include=*.md --include=*.json` passes clean.
 
 **Repo move (host + GitHub)**
 

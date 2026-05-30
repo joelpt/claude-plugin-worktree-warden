@@ -1,4 +1,6 @@
-# worktrees
+# worktree-warden
+
+> Renamed from `worktrees` — update any slash commands you have saved to use the `worktree-warden:` prefix.
 
 Keeps substantive edits **inside git worktrees**: a `PreToolUse` gate blocks
 edits to a repo's main checkout (with a deliberate, time-boxed exception
@@ -41,11 +43,11 @@ worktrees of the repo your current session belongs to — never cross-repo.
   context and never asks the agent to act, so merging stays a deliberate,
   explicit user opt-in (you type the slash command). The hook never merges or
   mutates anything.
-- **`/worktrees:check-worktrees`** — renders a table of **every** linked worktree
+- **`/worktree-warden:check-worktrees`** — renders a table of **every** linked worktree
   with a `Ready?` verdict and a concise `Note` (state, commits ahead, last edit),
   then asks which to merge (All / None / a paged subset). Worktrees blocked by a
   live session are shown but never offered for merge.
-- **`/worktrees:merge-worktrees`** — lands the chosen worktrees into the default
+- **`/worktree-warden:merge-worktrees`** — lands the chosen worktrees into the default
   branch from the primary checkout by **rebase + fast-forward** (linear history, no
   merge commits): commits dirty trees (via `commit-commands:commitall`), snapshots a
   restore anchor, determines a land order (escalating advisor → thinking-suite → HITL
@@ -53,10 +55,10 @@ worktrees of the repo your current session belongs to — never cross-repo.
   runs the test suite, and on failure rolls back to the exact pre-land state. The
   deterministic git work lives in `worktree_engine.py`; the skill only fills the
   judgement gaps.
-- **`/worktrees:finish-worktree`** — lands the current worktree into the default
+- **`/worktree-warden:finish-worktree`** — lands the current worktree into the default
   branch and tears it down. Works whether the session arrived via `EnterWorktree`
   or started in the worktree directly (background jobs). Delegates to
-  `/worktrees:merge-worktrees` for all git mutation, re-entering the worktree on
+  `/worktree-warden:merge-worktrees` for all git mutation, re-entering the worktree on
   rollback if the session was relocated.
 
 ## Scripts

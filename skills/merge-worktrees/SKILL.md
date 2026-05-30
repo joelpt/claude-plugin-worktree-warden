@@ -97,7 +97,7 @@ For each branch in order:
 - `13` (conflict, rebase LEFT IN PROGRESS) → resolving edits worktree files while this
   session sits in the primary checkout, which this plugin's own PreToolUse gate blocks, so
   first open a scoped exception:
-  `python3 $GATE grant "merge-worktrees: resolve rebase conflict for <branch>"`. Then resolve
+  `python3 $GATE grant "worktree-warden/merge-worktrees — resolve rebase conflict for <branch>"`. Then resolve
   the listed `details.conflicts` in the worktree. High-confidence resolution → just do it.
   Low/medium (e.g. `foo(argA)`+`foo(argB)` → `foo(argA,argB)` + a combined test) → run the
   **step-3 escalation ladder**. Then `git -C <path> add <files>` and

@@ -38,7 +38,7 @@ Proceed with the chosen action after the user responds.
 
 Self-assess completion:
 
-- **Confident the task is done**: Commit any dirty files (via `/commit-commands:commitall`), then invoke `/worktrees:merge-worktrees` to land and tear down. No confirmation needed.
+- **Confident the task is done**: Commit any dirty files (via `/commit-commands:commitall`), then invoke `/worktree-warden:merge-worktrees` to land and tear down. No confirmation needed.
 - **Uncertain**: Use AskUserQuestion as in `ask` mode.
 - **Not done**: Report "task not yet complete" and stop.
 
@@ -54,7 +54,7 @@ Self-assess **all three criteria** before proceeding:
 2. **Tested** — run `just test` (or `npm test` / `pytest` / `cargo test` if Justfile absent) and confirm passing. If tests fail, report the failure and stop.
 3. **No non-trivial conflict with main** — check `git log --oneline main..HEAD` and `git diff --stat main`. Trivial changes (new files, isolated edits) are fine. If main was significantly refactored since the worktree branched, stop and explain.
 
-If all three hold: commit, invoke `/worktrees:merge-worktrees`, tear down.
+If all three hold: commit, invoke `/worktree-warden:merge-worktrees`, tear down.
 If any fails: report **which criterion** failed and why. Do **not** proceed.
 
 ## Step 4 — After committing/merging
@@ -65,4 +65,4 @@ Report the outcome:
 - Whether the worktree was removed
 - The new state of the default branch (tip SHA, brief log)
 
-If `/worktrees:merge-worktrees` encounters a conflict it cannot resolve automatically, it will pause and explain — follow its guidance.
+If `/worktree-warden:merge-worktrees` encounters a conflict it cannot resolve automatically, it will pause and explain — follow its guidance.

@@ -1,7 +1,7 @@
 ---
 name: check-worktrees
 description: List every linked git worktree of the current repo with a Ready? verdict (✅ ready / mergeable after commit, 🧹 empty or already-merged & prunable, ⏳ recently active so held back, ❌ blocked by a live session) and a concise Note, then offer to merge the actionable ones. Use on /check-worktrees, "show worktrees", "any stale worktrees?", or when the SessionStart hook flags mergeable worktrees.
-allowed-tools: Bash(python3 *) Skill(worktrees:merge-worktrees)
+allowed-tools: Bash(python3 *) Skill(worktree-warden:merge-worktrees)
 ---
 
 # /check-worktrees
@@ -58,7 +58,7 @@ Each entry has `path`, `branch`, `dirty`, `commit_count`, `behind_base`,
 `last_rel`, `mtime`, `session_*`, `recently_active`, and the readiness fields
 `category` (`ready` / `needs_commit` / `merged` / `prune` / `cooldown` /
 `blocked`), `note`, and `ready` (bool).
-Keep this list — `/worktrees:merge-worktrees` needs the exact `path` + `branch`
+Keep this list — `/worktree-warden:merge-worktrees` needs the exact `path` + `branch`
 of each chosen worktree.
 
 ### 3. Ask which to merge
@@ -71,7 +71,7 @@ never auto-offered.
 worktrees exist, state it in one line so the override stays discoverable, e.g.
 *"2 held back — `feat-x` (active <15m), `feat-y` (live session); name one to
 merge it anyway."* A held-back worktree is merged only when the user explicitly
-asks for it by name (then pass it straight to `/worktrees:merge-worktrees`,
+asks for it by name (then pass it straight to `/worktree-warden:merge-worktrees`,
 bypassing this offer). If **no** worktree is `ready`, surface that line and stop.
 
 `AskUserQuestion` — *"Merge worktrees before continuing?"* with options:
@@ -89,7 +89,7 @@ the set.
 
 ### 4. Hand off
 
-If the chosen set is non-empty, invoke **`/worktrees:merge-worktrees`**, passing
+If the chosen set is non-empty, invoke **`/worktree-warden:merge-worktrees`**, passing
 the chosen worktrees' `path` + `branch` (from step 2's JSON). If empty, stop.
 
 ## Notes
@@ -103,4 +103,4 @@ the chosen worktrees' `path` + `branch` (from step 2's JSON). If empty, stop.
   worktree. The gate lives only here and in the SessionStart count — never in
   the engine — so an explicit merge of a cooldown worktree still works.
 - This skill only lists and asks — all merging/pruning happens in
-  `/worktrees:merge-worktrees`, which is human-gated when confidence is low.
+  `/worktree-warden:merge-worktrees`, which is human-gated when confidence is low.
