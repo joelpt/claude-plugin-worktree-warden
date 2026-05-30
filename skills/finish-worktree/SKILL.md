@@ -2,6 +2,7 @@
 name: finish-worktree
 description: Land & teardown current worktree
 argument-hint: "[target-branch]"
+disable-model-invocation: true
 allowed-tools: Bash(git *) Bash(cd *) ExitWorktree EnterWorktree Skill(worktree-warden:merge-worktrees) Skill(worktree-warden:check-worktrees)
 ---
 

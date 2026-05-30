@@ -176,7 +176,8 @@ class SettingsTest(unittest.TestCase):
         self._prev_xdg = os.environ.get("XDG_CONFIG_HOME")
         os.environ["XDG_CONFIG_HOME"] = str(self._xdg)
         self.common_dir = os.path.realpath(str(self._git))
-        self.facts = _main_facts(str(base / "repo"), str(self._git))
+        self.repo_root = str(base / "repo")
+        self.facts = _main_facts(self.repo_root, str(self._git))
 
     def tearDown(self) -> None:
         if self._prev_xdg is None:
@@ -191,8 +192,9 @@ class SettingsTest(unittest.TestCase):
         path.write_text(json.dumps(data))
 
     def _write_project(self, data: dict[str, object]) -> None:
-        path = gate.project_config_path(self.common_dir)
+        path = gate.project_config_path(self.repo_root)
         assert path is not None
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data))
 
     def test_defaults(self) -> None:
@@ -298,7 +300,8 @@ class TeardownModeTest(unittest.TestCase):
         self._prev_xdg = os.environ.get("XDG_CONFIG_HOME")
         os.environ["XDG_CONFIG_HOME"] = str(self._xdg)
         self.common_dir = str(os.path.realpath(str(self._git)))
-        self.facts = _main_facts(str(base / "repo"), str(self._git))
+        self.repo_root = str(base / "repo")
+        self.facts = _main_facts(self.repo_root, str(self._git))
 
     def tearDown(self) -> None:
         if self._prev_xdg is None:
@@ -313,8 +316,9 @@ class TeardownModeTest(unittest.TestCase):
         path.write_text(json.dumps(data))
 
     def _write_project(self, data: dict[str, object]) -> None:
-        path = gate.project_config_path(self.common_dir)
+        path = gate.project_config_path(self.repo_root)
         assert path is not None
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data))
 
     def test_default_is_ask(self) -> None:

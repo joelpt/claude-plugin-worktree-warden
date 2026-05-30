@@ -11,8 +11,8 @@ Persistent settings live in a small JSON config at two scopes:
 
   * user    -- ``$XDG_CONFIG_HOME/worktree-gate/config.json`` (defaults to
               ``~/.config/worktree-gate/config.json``); applies to every repo.
-  * project -- ``<git-common-dir>/worktree-gate-config.json``; personal to this
-              clone (it lives inside ``.git`` and is never committed).
+  * project -- ``<repo-root>/.claude/settings.worktree-warden.json``; lives
+              alongside other Claude tooling config and can be committed.
 
 Each config may set ``enforce`` (bool), ``window_seconds`` (int), and
 ``startup_display`` (one of "mergeable"/"always"/"never"). A project value
@@ -40,7 +40,7 @@ STARTUP_DISPLAY_VALUES = ("mergeable", "always", "never")
 DEFAULT_STARTUP_DISPLAY = "always"
 
 GRANT_FILENAME = "worktree-gate-grant.json"
-PROJECT_CONFIG_FILENAME = "worktree-gate-config.json"
+PROJECT_CONFIG_RELPATH = Path(".claude") / "settings.worktree-warden.json"
 USER_CONFIG_BASENAME = "config.json"
 AUDIT_BASENAME = "audit.log"
 
@@ -57,7 +57,7 @@ class GitFacts:
         repo_root: Absolute path of the working tree's top level, or None.
         git_common_dir: Absolute path of the shared git dir, or None. Identical
             across the main checkout and all of its linked worktrees, so it is
-            the natural per-repo key for grant and project-config files.
+            the natural per-repo key for ephemeral files (grants, debounce state).
         in_linked_worktree: Whether cwd sits in a linked worktree rather than
             the main checkout.
     """
@@ -215,11 +215,11 @@ def user_config_path() -> Path:
     return user_config_dir() / USER_CONFIG_BASENAME
 
 
-def project_config_path(git_common_dir: str | None) -> Path | None:
+def project_config_path(repo_root: str | None) -> Path | None:
     """Return the project-scope config path, or None outside a repo."""
-    if not git_common_dir:
+    if not repo_root:
         return None
-    return Path(git_common_dir) / PROJECT_CONFIG_FILENAME
+    return Path(repo_root) / PROJECT_CONFIG_RELPATH
 
 
 def grant_path(git_common_dir: str | None) -> Path | None:
@@ -265,7 +265,7 @@ def resolve_settings(facts: GitFacts) -> Settings:
         The effective Settings.
     """
     user_cfg = _load_json(user_config_path())
-    proj_cfg = _load_json(project_config_path(facts.git_common_dir))
+    proj_cfg = _load_json(project_config_path(facts.repo_root))
 
     disabled_scope: str | None = None
     for scope, cfg in (("user", user_cfg), ("project", proj_cfg)):
@@ -305,7 +305,7 @@ def read_teardown_mode(facts: GitFacts) -> str:
         The effective teardown mode string.
     """
     user_cfg = _load_json(user_config_path())
-    proj_cfg = _load_json(project_config_path(facts.git_common_dir))
+    proj_cfg = _load_json(project_config_path(facts.repo_root))
     mode = DEFAULT_TEARDOWN_MODE
     for cfg in (user_cfg, proj_cfg):
         value = cfg.get("teardown_mode")
@@ -392,7 +392,7 @@ def _scope_config_path(args: argparse.Namespace, facts: GitFacts) -> Path | None
     """Resolve the config path for the scope selected by ``--user``."""
     if args.user:
         return user_config_path()
-    return project_config_path(facts.git_common_dir)
+    return project_config_path(facts.repo_root)
 
 
 def _update_config(path: Path, **changes: object) -> None:
@@ -555,7 +555,7 @@ def cmd_teardown_mode(args: argparse.Namespace) -> int:
 
     if not args.mode:
         user_cfg = _load_json(user_config_path())
-        proj_cfg = _load_json(project_config_path(facts.git_common_dir))
+        proj_cfg = _load_json(project_config_path(facts.repo_root))
         user_val = user_cfg.get("teardown_mode")
         proj_val = proj_cfg.get("teardown_mode")
         effective = read_teardown_mode(facts)

@@ -103,9 +103,9 @@ commands to proceed. Two ways forward:
 Persisted as small JSON config at two scopes; a **project** value overrides the
 **user** value key-by-key:
 
-- user — `${XDG_CONFIG_HOME:-~/.config}/worktree-gate/config.json` (all repos).
-- project — `<git-common-dir>/worktree-gate-config.json` (this clone only; lives
-  inside `.git`, never committed).
+- **user** — `${XDG_CONFIG_HOME:-~/.config}/worktree-gate/config.json` (all repos).
+- **project** — `<repo-root>/.claude/settings.worktree-warden.json` (this repo only;
+  committable — teams can share a project config).
 
 ```bash
 worktree_gate disable                    # turn the gate off for this repo
@@ -113,16 +113,30 @@ worktree_gate disable --user             # turn it off everywhere
 worktree_gate enable [--user]            # turn it back on
 worktree_gate set-window 30m             # tune the exception window (e.g. 900, 30s, 1h)
 worktree_gate set-startup-display never  # session-start banner: mergeable | always | never
+worktree_gate teardown-mode auto         # Stop hook behaviour: ask|auto|commit-only|always|never
+worktree_gate teardown-mode auto --user  # same, user scope (all repos)
 worktree_gate status                     # show effective settings + any active exception
 ```
 
-The `set-startup-display` mode controls the SessionStart banner (see the
-SessionStart hook above); like the other keys it is stored per scope, project
-overriding user.
+Settings are stored per scope (project overrides user); the grant token and
+debounce state live in `.git/` (ephemeral, never committed); the user config and
+an `audit.log` of grants/uses/blocks live under the user config dir.
 
-The grant token and project config live next to each other under the repo's
-git directory; the user config and an `audit.log` of grants/uses/blocks live
-under the user config dir.
+### Auto-teardown
+
+The **Stop hook** fires when a session ends while inside a linked worktree that
+has pending work. Its behaviour is governed by the `teardown_mode` setting:
+
+| Mode | Behaviour |
+|---|---|
+| `ask` (default) | Self-assess completion; if done, use `AskUserQuestion` to offer commit + merge + teardown. |
+| `auto` | Self-assess; if confidently done, commit + merge + teardown without confirmation. |
+| `commit-only` | Commit dirty files; do not merge or tear down. |
+| `always` | Verify task complete + tests pass + no major conflict with main; then commit + merge + teardown. |
+| `never` | Never trigger. |
+
+Set it at user scope (`--user`) to apply across all repos, or project scope
+(no flag) to override per-repo.
 
 ## Safety
 
