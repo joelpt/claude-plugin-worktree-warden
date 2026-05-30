@@ -1,6 +1,6 @@
 ---
 name: check-worktrees
-description: List and offer to merge this repo's worktrees
+description: List and merge repo worktrees
 allowed-tools: Bash(python3 *) Skill(worktree-warden:merge-worktrees)
 ---
 

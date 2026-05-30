@@ -1,6 +1,6 @@
 ---
 name: finish-worktree
-description: Land current worktree to main and tear it down
+description: Land & teardown current worktree
 argument-hint: "[target-branch]"
 allowed-tools: Bash(git *) Bash(cd *) ExitWorktree EnterWorktree Skill(worktree-warden:merge-worktrees) Skill(worktree-warden:check-worktrees)
 ---

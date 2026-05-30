@@ -1,6 +1,6 @@
 ---
 name: merge-worktrees
-description: Rebase+ff-merge chosen worktrees into main
+description: Rebase & merge worktrees to main
 allowed-tools: Bash(python3 *) Bash(git *) Skill(commit-commands:commitall) Skill(tao:thinkdeep) Skill(tao:chat) Skill(think) Skill(tao:consensus) Skill(tao:vet) Skill(tao:synthesize)
 ---
 
