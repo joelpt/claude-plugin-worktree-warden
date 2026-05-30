@@ -3,7 +3,7 @@ name: finish-worktree
 description: Land the current git worktree into the default branch and tear it down. Plugin replacement for /rmws — works whether the session arrived via EnterWorktree or started in the worktree directly (background jobs, /worktree-started sessions). Use on /finish-worktree, /rmws, "done with this worktree", "land this and clean up", "merge and remove this worktree", or "remove this worktree".
 disable-model-invocation: true
 argument-hint: "[target-branch]"
-allowed-tools: Bash(git *) ExitWorktree EnterWorktree Skill(worktrees:merge-worktrees) Skill(worktrees:check-worktrees)
+allowed-tools: Bash(git *) Bash(cd *) ExitWorktree EnterWorktree Skill(worktrees:merge-worktrees) Skill(worktrees:check-worktrees)
 ---
 
 ## Live context
@@ -25,10 +25,10 @@ Two session origins, one code path:
 - **EnterWorktree session** — `ExitWorktree(action:"keep")` succeeds, session moves to the
   primary checkout before the merge, and re-enters the worktree on rollback.
 - **Direct-start session** (background job, session started inside the worktree) —
-  `ExitWorktree` is a no-op. Session cwd stays in the worktree. The merge and all engine
-  calls use `--repo $PRIMARY` explicitly, so git correctness is unaffected. After a
-  successful teardown the session cwd points to a deleted directory; the user should
-  close/restart the session.
+  `ExitWorktree` is a no-op; fall back to `cd $PRIMARY` via Bash so the shell cwd moves
+  to the primary checkout regardless. The merge and all engine calls use `--repo $PRIMARY`
+  explicitly. The session UI may still display the old path, but shell operations run from
+  `$PRIMARY`.
 
 Does **not** commit first — `/merge-worktrees` commits dirty work via
 `/commit-commands:commitall` as its first step, so uncommitted work is captured in the
@@ -60,10 +60,11 @@ Record:
 Call **`ExitWorktree(action:"keep")`**:
 
 - **Succeeds** → `RELOCATED=true`. Session cwd is now the primary checkout.
-- **"No-op: there is no active EnterWorktree session"** → `RELOCATED=false`. Session cwd
-  stays in the worktree. Note to the user that after successful teardown their session cwd
-  will point to a deleted directory and they should close/restart. Continue — engine calls
-  use `--repo $PRIMARY` so git correctness is unaffected.
+- **"No-op: there is no active EnterWorktree session"** → fall back to
+  `Bash: cd $PRIMARY`. This moves the shell cwd to the primary checkout even without an
+  active EnterWorktree session. Set `RELOCATED=true`. Note to the user that the session UI
+  may still display the old worktree path, but all subsequent operations run from
+  `$PRIMARY`.
 
 ### 4. Delegate the land
 
@@ -80,14 +81,10 @@ tests → teardown, with confidence-gated conflict/rollback handling.
 ### 5. Handle the result
 
 - **Green** (worktree landed and pruned) → confirm worktree/branch are gone; report commits
-  landed and test result. If `RELOCATED=false`, remind the user their session cwd is now
-  stale.
+  landed and test result.
 - **Aborted / rolled back** → the engine's `undo` has restored the repo to exactly its
-  pre-land state.
-  - `RELOCATED=true` → call `EnterWorktree(path:$WORKTREE_PATH)` to return the session to
-    the intact worktree; report what happened + why, verbatim.
-  - `RELOCATED=false` → session is already in the intact worktree; report what happened +
-    why, verbatim.
+  pre-land state. Call `EnterWorktree(path:$WORKTREE_PATH)` to return the session to the
+  intact worktree; report what happened + why, verbatim.
 
 ## Hard rules
 

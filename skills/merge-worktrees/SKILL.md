@@ -42,9 +42,10 @@ Chosen worktrees as `path` + `branch` pairs (from `/check-worktrees`), **or** a 
 - Otherwise: confirm session cwd is the primary checkout
   (`git -C <cwd> rev-parse --git-dir` → `.git`). If inside a linked worktree, call
   `ExitWorktree(action:"keep")` first. If ExitWorktree returns
-  "No-op: there is no active EnterWorktree session", note it and use
-  `git worktree list` first entry as `REPO` — all engine calls take `--repo` explicitly so
-  session cwd doesn't affect correctness; teardown will leave the session cwd stale.
+  "No-op: there is no active EnterWorktree session", fall back to `cd $REPO` via Bash
+  (use `git worktree list` first entry as `REPO`) — this moves the shell cwd to the
+  primary checkout so subsequent Bash calls are rooted there; all engine calls take
+  `--repo` explicitly for belt-and-suspenders correctness.
 
 Resolve `TARGET` from `git -C $REPO symbolic-ref --quiet refs/remotes/origin/HEAD` (leaf),
 else `main`.
@@ -83,9 +84,9 @@ worktrees rebase onto earlier ones. Confidence-gated:
 
 Re-run `claude agents --json`. If the only session inside this worktree is **this** session,
 call `ExitWorktree(action:"keep")` and re-check (if ExitWorktree is a no-op — session
-started directly in the worktree — skip the re-check; engine calls use `--repo $REPO`
-explicitly so the session cwd inside the worktree doesn't block the land, and teardown will
-leave the cwd stale). If **another** session occupies it → skip + pause + explain.
+started directly in the worktree — fall back to `cd $REPO` via Bash, then skip the
+re-check; engine calls use `--repo $REPO` explicitly). If **another** session occupies it →
+skip + pause + explain.
 
 ## 5. Land in order
 
