@@ -1,6 +1,6 @@
 {
   "name": "worktrees",
-  "version": "2026.05.29.6",
+  "version": "2026.05.30.2",
   "description": "Enforces worktree-first editing via a PreToolUse gate that blocks main-checkout edits (with a deliberate, time-boxed, per-repo/global opt-out exception), surfaces a repo's mergeable git worktrees at session start, and lands chosen ones into the default branch by deterministic rebase + fast-forward with confidence-gated conflict handling and exact-state rollback. Repo-scoped — never looks cross-repo.",
   "author": {
     "name": "Joel Thornton"

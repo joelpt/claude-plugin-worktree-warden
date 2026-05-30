@@ -41,9 +41,11 @@ worktrees of the repo your current session belongs to — never cross-repo.
   runs the test suite, and on failure rolls back to the exact pre-land state. The
   deterministic git work lives in `worktree_engine.py`; the skill only fills the
   judgement gaps.
-- **`/rmws`** (separate personal skill) delegates here: it `ExitWorktree`s the
-  current worktree to the primary and calls `/worktrees:merge-worktrees --worktree
-  <it>`, re-entering the worktree if the land aborts.
+- **`/worktrees:finish-worktree`** — lands the current worktree into the default
+  branch and tears it down. Works whether the session arrived via `EnterWorktree`
+  or started in the worktree directly (background jobs). Delegates to
+  `/worktrees:merge-worktrees` for all git mutation, re-entering the worktree on
+  rollback if the session was relocated.
 
 ## Scripts
 

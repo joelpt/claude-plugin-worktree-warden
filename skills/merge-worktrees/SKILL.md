@@ -31,13 +31,23 @@ decisions). Repo-scoped: only ever this repo's worktrees.
 ## Inputs
 
 Chosen worktrees as `path` + `branch` pairs (from `/check-worktrees`), **or** a single
-`--worktree <path>` (from `/rmws`). If invoked bare, run
+`--worktree <path>` with `--repo <primary>` (from `/finish-worktree`). If invoked bare, run
 `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_worktrees.py --json` and do the
 `/check-worktrees` selection first.
 
-Confirm you are in the **primary checkout** (`git -C <cwd> rev-parse --git-dir` → `.git`).
-If inside a linked worktree, `ExitWorktree(action:"keep")` first. Resolve `TARGET` from
-`git -C $REPO symbolic-ref --quiet refs/remotes/origin/HEAD` (leaf), else `main`.
+**Establish `REPO` (primary checkout path):**
+
+- If `--repo <path>` was passed explicitly (from `/finish-worktree`): use it as `REPO` and
+  skip the session-cwd check — the session may legitimately still be inside the worktree.
+- Otherwise: confirm session cwd is the primary checkout
+  (`git -C <cwd> rev-parse --git-dir` → `.git`). If inside a linked worktree, call
+  `ExitWorktree(action:"keep")` first. If ExitWorktree returns
+  "No-op: there is no active EnterWorktree session", note it and use
+  `git worktree list` first entry as `REPO` — all engine calls take `--repo` explicitly so
+  session cwd doesn't affect correctness; teardown will leave the session cwd stale.
+
+Resolve `TARGET` from `git -C $REPO symbolic-ref --quiet refs/remotes/origin/HEAD` (leaf),
+else `main`.
 
 ## 1. Commit dirty worktrees (one at a time)
 
@@ -72,8 +82,10 @@ worktrees rebase onto earlier ones. Confidence-gated:
 ## 4. Race re-check (per worktree, just before its land)
 
 Re-run `claude agents --json`. If the only session inside this worktree is **this** session,
-`ExitWorktree(action:"keep")` and re-check. If **another** session occupies it → skip +
-pause + explain.
+call `ExitWorktree(action:"keep")` and re-check (if ExitWorktree is a no-op — session
+started directly in the worktree — skip the re-check; engine calls use `--repo $REPO`
+explicitly so the session cwd inside the worktree doesn't block the land, and teardown will
+leave the cwd stale). If **another** session occupies it → skip + pause + explain.
 
 ## 5. Land in order
 
