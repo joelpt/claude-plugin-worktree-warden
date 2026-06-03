@@ -369,9 +369,10 @@ def block_message(facts: GitFacts, file_path: str | None) -> str:
         "Choose one:\n"
         "  • Preferred — call EnterWorktree to isolate this work, then retry.\n"
         "  • If this edit is legitimately main-side (conflict resolution, "
-        "landing to main, or the user asked for it), open a timed exception:\n"
-        f'      {cli} grant "<why this must happen on main>"\n'
-        f"    then run `{cli} finished` as soon as the main-side work is done.\n"
+        "landing to main, or the user asked for it), open a timed exception by "
+        "invoking the worktree-warden:request-exception skill with an honest "
+        "one-line reason, then invoke the worktree-warden:finish-exception skill "
+        "as soon as the main-side work is done.\n"
         f"  • To stop enforcing here: {cli} disable   (add --user for global).\n"
     )
 
@@ -425,7 +426,8 @@ def cmd_grant(args: argparse.Namespace) -> int:
         f"Reason: {reason}\n"
         "IMPORTANT: this is a deliberate, time-boxed bypass. As soon as the "
         "main-side work is finished, end it early by running:\n"
-        f"    {cli_path()} finished"
+        f"    {cli_path()} finished\n"
+        "    (or, from Claude, invoke the worktree-warden:finish-exception skill)"
     )
     return 0
 

@@ -288,6 +288,41 @@ class GrantExpiryTest(unittest.TestCase):
         self.assertIsNone(gate.read_grant_expiry(self.common))
 
 
+class BlockMessageTest(unittest.TestCase):
+    """block_message content when an edit is blocked."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = os.path.realpath(self._tmp.name)
+        self.git_dir = os.path.join(self.root, ".git")
+        os.makedirs(self.git_dir, exist_ok=True)
+        self.facts = _main_facts(self.root, self.git_dir)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_names_request_exception_skill(self) -> None:
+        """block_message names the request-exception skill."""
+        msg = gate.block_message(self.facts, "/some/file.py")
+        self.assertIn("worktree-warden:request-exception", msg)
+
+    def test_names_finish_exception_skill(self) -> None:
+        """block_message names the finish-exception skill."""
+        msg = gate.block_message(self.facts, "/some/file.py")
+        self.assertIn("worktree-warden:finish-exception", msg)
+
+    def test_does_not_contain_raw_grant_invocation(self) -> None:
+        """block_message no longer prints the raw CLI grant invocation."""
+        msg = gate.block_message(self.facts, "/some/file.py")
+        self.assertNotIn('grant "<why', msg)
+
+    def test_works_without_file_path(self) -> None:
+        """block_message handles a None file_path gracefully."""
+        msg = gate.block_message(self.facts, None)
+        self.assertIn("worktree-warden:request-exception", msg)
+        self.assertIn("worktree-warden:finish-exception", msg)
+
+
 class TeardownModeTest(unittest.TestCase):
     """Teardown mode config read and CLI round-trip."""
 

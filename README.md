@@ -80,8 +80,8 @@ worktrees of the repo your current session belongs to — never cross-repo.
 
 ## Enforcement gate
 
-The gate is **on by default**. When it blocks a main-checkout edit it prints the
-commands to proceed. Two ways forward:
+The gate is **on by default**. When it blocks a main-checkout edit it prints
+guidance to proceed. Two ways forward:
 
 - **Isolate the work** (preferred): call `EnterWorktree`, then retry the edit.
 - **Open a timed exception** when the edit is *legitimately* main-side (conflict
@@ -97,6 +97,10 @@ commands to proceed. Two ways forward:
   An exception is a single deliberate, **logged**, self-expiring window
   (15 min by default); it covers a burst of related edits and then closes on its
   own. Closing it the moment the work is done (`finished`) is expected.
+
+When the gate blocks Claude, its guidance names the
+`worktree-warden:request-exception` and `worktree-warden:finish-exception` skills —
+thin wrappers around the same `grant` / `finished` commands shown above.
 
 ### Settings & opt-out
 
@@ -128,7 +132,7 @@ The **Stop hook** fires when a session ends while inside a linked worktree that
 has pending work. Its behaviour is governed by the `teardown_mode` setting:
 
 | Mode | Behaviour |
-|---|---|
+| --- | --- |
 | `ask` (default) | Self-assess completion; if done, use `AskUserQuestion` to offer commit + merge + teardown. |
 | `auto` | Self-assess; if confidently done, commit + merge + teardown without confirmation. |
 | `commit-only` | Commit dirty files; do not merge or tear down. |
