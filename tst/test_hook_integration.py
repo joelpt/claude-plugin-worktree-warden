@@ -132,5 +132,121 @@ class HookIntegrationTest(unittest.TestCase):
         self.assertEqual(self._hook(str(self.repo), self.target)[0], 2)
 
 
+class UnbornHeadTest(unittest.TestCase):
+    """A freshly-init'd repo with no commits cannot host a worktree."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.repo = base / "repo"
+        self.repo.mkdir()
+        self.xdg = base / "xdg"
+        subprocess.run(
+            ["git", "-C", str(self.repo), "init"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.target = str(self.repo / "README.md")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _env(self) -> dict[str, str]:
+        return {
+            **os.environ,
+            "XDG_CONFIG_HOME": str(self.xdg),
+            "CLAUDE_PLUGIN_ROOT": str(_ROOT),
+        }
+
+    def _hook(self, file_path: str) -> subprocess.CompletedProcess[str]:
+        payload = json.dumps(
+            {"tool_name": "Edit", "cwd": str(self.repo), "tool_input": {"file_path": file_path}}
+        )
+        return subprocess.run(
+            [sys.executable, str(_HOOK)],
+            input=payload,
+            capture_output=True,
+            text=True,
+            cwd=str(self.repo),
+            env=self._env(),
+        )
+
+    def test_unborn_head_edit_is_allowed_with_notice(self) -> None:
+        proc = self._hook(self.target)
+        self.assertEqual(proc.returncode, 0)
+        # Best-effort one-time notice rides the allow on stdout.
+        emitted = json.loads(proc.stdout)
+        self.assertEqual(
+            emitted["hookSpecificOutput"]["hookEventName"], "PreToolUse"
+        )
+        self.assertEqual(
+            emitted["hookSpecificOutput"]["permissionDecision"], "allow"
+        )
+        self.assertIn(
+            "commit", emitted["hookSpecificOutput"]["additionalContext"].lower()
+        )
+
+    def test_notice_is_one_time_per_repo(self) -> None:
+        self.assertEqual(self._hook(self.target).returncode, 0)
+        second = self._hook(self.target)
+        self.assertEqual(second.returncode, 0)
+        self.assertEqual(second.stdout.strip(), "")
+
+    def test_enforcement_resumes_after_first_commit(self) -> None:
+        self.assertEqual(self._hook(self.target).returncode, 0)
+        for args in (
+            ("config", "user.email", "t@t.test"),
+            ("config", "user.name", "Test"),
+            ("commit", "--allow-empty", "-m", "born"),
+        ):
+            subprocess.run(
+                ["git", "-C", str(self.repo), *args],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(self._hook(self.target).returncode, 2)
+
+    def _git(self, *args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_detached_head_is_still_enforced(self) -> None:
+        # A repo with history has commits on a ref, so it can host a worktree --
+        # a detached checkout must stay gated even though HEAD itself is bare.
+        self._git("config", "user.email", "t@t.test")
+        self._git("config", "user.name", "Test")
+        self._git("commit", "--allow-empty", "-m", "born")
+        self._git("checkout", "--detach", "HEAD")
+        self.assertEqual(self._hook(self.target).returncode, 2)
+
+    def test_orphan_branch_checkout_is_enforced(self) -> None:
+        # HEAD is unborn on the orphan branch, but the repo has commits on main,
+        # so a worktree IS possible -- the carve-out must not fire here.
+        self._git("config", "user.email", "t@t.test")
+        self._git("config", "user.name", "Test")
+        self._git("commit", "--allow-empty", "-m", "born")
+        self._git("checkout", "--orphan", "docs")
+        self.assertEqual(self._hook(self.target).returncode, 2)
+
+    def test_user_disable_suppresses_unborn_notice(self) -> None:
+        subprocess.run(
+            [sys.executable, str(_GATE), "disable", "--user"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=str(self.repo),
+            env=self._env(),
+        )
+        proc = self._hook(self.target)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout.strip(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

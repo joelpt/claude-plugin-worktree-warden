@@ -23,8 +23,11 @@ worktrees of the repo your current session belongs to — never cross-repo.
   permission mode (it blocks via **exit code 2**, *before* the permission layer,
   so `bypassPermissions` does not slip past it). It auto-allows — no action
   needed — when cwd is a linked worktree, the file is outside the checkout
-  (cross-repo / `~/.claude`), the path is inside `.git/`, or cwd is not a git
-  repo. It **fails open**: any unexpected error allows the edit, so a bug can
+  (cross-repo / `~/.claude`), the path is inside `.git/`, cwd is not a git
+  repo, or the repo has **no commits yet** (an unborn-HEAD repo cannot host a
+  worktree, so bootstrap edits land main-side until the first commit, with a
+  one-time notice; enforcement resumes automatically once HEAD is born). It
+  **fails open**: any unexpected error allows the edit, so a bug can
   never brick editing. On by default; opt out per-repo or globally. See
   [Enforcement gate](#enforcement-gate).
 - **SessionStart hook** — on `startup`/`resume`, only when cwd is the repo's

@@ -140,6 +140,27 @@ class DecideTest(unittest.TestCase):
         self.assertTrue(d.allow)
         self.assertTrue(d.log_grant_use)
 
+    def test_unborn_head_allows_without_grant(self) -> None:
+        # A repo with no commits cannot host a worktree (nothing to branch
+        # from), so the gate steps aside; enforcement resumes once HEAD is born.
+        facts = gate.GitFacts(
+            is_repo=True,
+            repo_root=self.root,
+            git_common_dir=os.path.realpath(self.git_dir),
+            in_linked_worktree=False,
+            head_unborn=True,
+        )
+        d = gate.decide(
+            file_path=self.target,
+            facts=facts,
+            now=1000.0,
+            disabled_scope=None,
+            grant_expires_at=None,
+        )
+        self.assertTrue(d.allow)
+        self.assertIn("unborn", d.reason)
+        self.assertFalse(d.log_grant_use)
+
 
 class DurationTest(unittest.TestCase):
     """Duration parsing and clamping."""
@@ -286,6 +307,24 @@ class GrantExpiryTest(unittest.TestCase):
         assert path is not None
         path.write_text("garbage")
         self.assertIsNone(gate.read_grant_expiry(self.common))
+
+
+class UnbornNoticeTest(unittest.TestCase):
+    """One-time unborn-HEAD notice claim."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.common = self._tmp.name
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_outside_repo_never_claims(self) -> None:
+        self.assertFalse(gate.claim_unborn_notice(None))
+
+    def test_claims_exactly_once(self) -> None:
+        self.assertTrue(gate.claim_unborn_notice(self.common))
+        self.assertFalse(gate.claim_unborn_notice(self.common))
 
 
 class BlockMessageTest(unittest.TestCase):

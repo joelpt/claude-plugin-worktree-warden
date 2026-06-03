@@ -40,6 +40,7 @@ STARTUP_DISPLAY_VALUES = ("mergeable", "always", "never")
 DEFAULT_STARTUP_DISPLAY = "always"
 
 GRANT_FILENAME = "worktree-gate-grant.json"
+UNBORN_NOTICE_FILENAME = "worktree-gate-unborn-notice"
 PROJECT_CONFIG_RELPATH = Path(".claude") / "settings.worktree-warden.json"
 USER_CONFIG_BASENAME = "config.json"
 AUDIT_BASENAME = "audit.log"
@@ -60,12 +61,20 @@ class GitFacts:
             the natural per-repo key for ephemeral files (grants, debounce state).
         in_linked_worktree: Whether cwd sits in a linked worktree rather than
             the main checkout.
+        head_unborn: Whether the repo has no commits on any ref yet. Such a repo
+            cannot host a worktree -- there is nothing to branch from -- so the
+            gate steps aside until the first commit. Detected only on the main
+            checkout; defaults False everywhere detection did not positively
+            confirm it (fail-closed). Named for the common case (a fresh repo's
+            unborn HEAD); the precise predicate is "zero commits anywhere", which
+            keeps orphan-branch checkouts enforced.
     """
 
     is_repo: bool
     repo_root: str | None
     git_common_dir: str | None
     in_linked_worktree: bool
+    head_unborn: bool = False
 
 
 @dataclass(frozen=True)
@@ -144,12 +153,34 @@ def git_facts(cwd: str) -> GitFacts:
     toplevel, git_dir, common_dir = lines
     git_dir_abs = os.path.realpath(os.path.join(cwd, git_dir))
     common_abs = os.path.realpath(os.path.join(cwd, common_dir))
+    in_linked_worktree = git_dir_abs != common_abs
     return GitFacts(
         is_repo=True,
         repo_root=os.path.realpath(toplevel),
         git_common_dir=common_abs,
-        in_linked_worktree=git_dir_abs != common_abs,
+        in_linked_worktree=in_linked_worktree,
+        head_unborn=_repo_has_no_commits(cwd) if not in_linked_worktree else False,
     )
+
+
+def _repo_has_no_commits(cwd: str) -> bool:
+    """Return True only when no ref in the repo resolves to a commit.
+
+    "Cannot host a worktree" is the real predicate behind the carve-out, and it
+    holds exactly when the whole repo has zero commits -- not merely when the
+    *current* branch is unborn. ``rev-list -n1 --all`` distinguishes the two: it
+    exits 0 with empty output only for a truly commitless repo, and prints a sha
+    when history exists on *any* ref. That keeps an orphan-branch checkout
+    (``git switch --orphan`` on a repo with history, where the current HEAD is
+    unborn but other branches carry commits) correctly enforced.
+
+    Fail-closed: a positive signal (rc 0 *and* empty stdout) is required, so a
+    broken or missing git -- which ``run_git`` reports as ``(1, "")`` -- reads as
+    "has commits" and enforcement stands. Consulted only on the main checkout (a
+    linked worktree always shares the main checkout's history).
+    """
+    rc, out = run_git(["rev-list", "-n", "1", "--all"], cwd)
+    return rc == 0 and out == ""
 
 
 def _is_within(path: str, root: str) -> bool:
@@ -169,9 +200,10 @@ def decide(
 
     The order is deliberate. The opt-out is checked first so the escape hatch
     works even if later logic would misbehave. Non-repo, linked-worktree,
-    outside-the-checkout, and inside-.git edits are always allowed -- they are
-    never the case worktrees exist to isolate. Only edits to the main
-    checkout's own files are gated, and an unexpired exception lifts that gate.
+    unborn-HEAD, outside-the-checkout, and inside-.git edits are always allowed
+    -- none is the case worktrees exist to isolate (an unborn-HEAD repo cannot
+    even host a worktree). Only edits to the main checkout's own files are
+    gated, and an unexpired exception lifts that gate.
 
     Args:
         file_path: Absolute or relative path the tool intends to write, if any.
@@ -189,6 +221,8 @@ def decide(
         return Decision(True, "not inside a git repository")
     if facts.in_linked_worktree:
         return Decision(True, "already inside a linked worktree")
+    if facts.head_unborn:
+        return Decision(True, "repository has no commits yet (unborn HEAD)")
     if file_path is None:
         return Decision(True, "no file path to evaluate")
 
@@ -375,6 +409,45 @@ def block_message(facts: GitFacts, file_path: str | None) -> str:
         "as soon as the main-side work is done.\n"
         f"  • To stop enforcing here: {cli} disable   (add --user for global).\n"
     )
+
+
+def unborn_notice_message() -> str:
+    """One-time advisory shown when an edit lands on an unborn-HEAD repo."""
+    return (
+        "🌳 Worktree gate is dormant: this repository has no commits yet, so "
+        "it cannot host a worktree (nothing to branch from) -- edits to the "
+        "main checkout are allowed for now. Enforcement resumes automatically "
+        "once you make the first commit, after which substantive edits go "
+        "through a worktree as usual."
+    )
+
+
+def unborn_notice_path(git_common_dir: str | None) -> Path | None:
+    """Return the one-time unborn-notice sentinel path, or None outside a repo."""
+    if not git_common_dir:
+        return None
+    return Path(git_common_dir) / UNBORN_NOTICE_FILENAME
+
+
+def claim_unborn_notice(git_common_dir: str | None) -> bool:
+    """Atomically claim the one-time unborn notice for this repo.
+
+    Returns True exactly once per repo -- the first caller to create the
+    sentinel. Best-effort: any failure returns False so a notice is skipped
+    rather than risking the allow that the caller has already decided on.
+    """
+    path = unborn_notice_path(git_common_dir)
+    if path is None:
+        return False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("x"):  # O_EXCL: succeeds only for the first claimant
+            pass
+    except FileExistsError:
+        return False
+    except Exception:
+        return False
+    return True
 
 
 def log_event(action: str, reason: str, file_path: str | None) -> None:

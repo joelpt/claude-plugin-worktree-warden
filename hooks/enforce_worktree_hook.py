@@ -36,6 +36,35 @@ if str(_SCRIPTS_DIR) not in sys.path:
 import worktree_gate as gate  # noqa: E402  -- sibling module, path bootstrapped above
 
 
+def _emit_unborn_notice(facts: gate.GitFacts, file_path: str | None) -> None:
+    """Surface the one-time unborn-HEAD advisory on the allowed edit.
+
+    Best-effort: the edit is already allowed via exit 0, so this only adds
+    context. It rides ``hookSpecificOutput.additionalContext`` -- which may be
+    dropped under ``bypassPermissions`` (unverified) -- but its failure mode is
+    benign (the model just misses a reassurance line), unlike the block path,
+    which must use exit 2. Fires once per repo via an atomic sentinel claim.
+    """
+    try:
+        if not gate.claim_unborn_notice(facts.git_common_dir):
+            return
+        gate.log_event("unborn", "edit allowed: repository has no commits yet", file_path)
+        sys.stdout.write(
+            json.dumps(
+                {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                        "additionalContext": gate.unborn_notice_message(),
+                    }
+                }
+            )
+            + "\n"
+        )
+    except Exception:
+        pass
+
+
 def main() -> int:
     """Evaluate the pending Edit/Write and block it when the gate says so."""
     try:
@@ -69,6 +98,11 @@ def main() -> int:
                 gate.log_event("use", decision.reason, file_path)
             elif settings.disabled_scope == "project":
                 gate.log_event("project-disabled", "edit allowed: project config disabled enforcement", file_path)
+            elif settings.disabled_scope is None and facts.head_unborn:
+                # Only when enforcement is actually live -- under a user-scope
+                # disable the gate stays off after the first commit too, so the
+                # "enforcement resumes" notice would be false.
+                _emit_unborn_notice(facts, file_path)
             return 0
 
         gate.log_event("block", decision.reason, file_path)
