@@ -40,10 +40,13 @@ def _emit_unborn_notice(facts: gate.GitFacts, file_path: str | None) -> None:
     """Surface the one-time unborn-HEAD advisory on the allowed edit.
 
     Best-effort: the edit is already allowed via exit 0, so this only adds
-    context. It rides ``hookSpecificOutput.additionalContext`` -- which may be
-    dropped under ``bypassPermissions`` (unverified) -- but its failure mode is
-    benign (the model just misses a reassurance line), unlike the block path,
-    which must use exit 2. Fires once per repo via an atomic sentinel claim.
+    context. It rides ``hookSpecificOutput.additionalContext``, which the harness
+    injects as a ``hook_additional_context`` attachment even under
+    ``bypassPermissions`` (verified live on Claude Code 2.1.161 -- only the
+    permission *adjudication* is skipped under bypass, not context injection).
+    Kept best-effort regardless: its failure mode is benign (the model just
+    misses a reassurance line), unlike the block path, which must use exit 2.
+    Fires once per repo via an atomic sentinel claim.
     """
     try:
         if not gate.claim_unborn_notice(facts.git_common_dir):
