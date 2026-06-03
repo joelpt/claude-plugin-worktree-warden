@@ -3,8 +3,6 @@ name: request-exception
 user-invocable: false
 ---
 
-# request-exception
-
 Open a short, time-boxed exception so the current main-checkout edit can proceed.
 
 Only legitimate when the edit is genuinely main-side — conflict resolution,
