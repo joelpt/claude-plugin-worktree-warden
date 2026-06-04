@@ -1,8 +1,7 @@
 ---
 name: finish-worktree
-description: Land & teardown current worktree
+description: Land the current linked worktree into its default branch and tear it down. Use when wrapping up work from inside a worktree — the user signals done/finished, or the session is winding down. For landing worktrees from the primary checkout, use check-worktrees instead.
 argument-hint: "[target-branch]"
-disable-model-invocation: true
 allowed-tools: Bash(git *) Bash(cd *) ExitWorktree EnterWorktree Skill(worktree-warden:merge-worktrees) Skill(worktree-warden:check-worktrees)
 ---
 
