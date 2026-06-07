@@ -53,6 +53,9 @@ Record:
 - `PRIMARY` — first path from `git worktree list` (the main checkout).
 - `TARGET` — `$ARGUMENTS` if provided, else resolve from
   `git symbolic-ref --quiet refs/remotes/origin/HEAD` (leaf), else `main`.
+- `COMMIT_COUNT` — run `git rev-list --count $TARGET..HEAD` (while still in the worktree).
+  This count is needed for the recap in step 6; capture it now because the branch ref is
+  deleted after teardown.
 
 ### 3. Relocate if possible
 
@@ -79,11 +82,59 @@ tests → teardown, with confidence-gated conflict/rollback handling.
 
 ### 5. Handle the result
 
-- **Green** (worktree landed and pruned) → confirm worktree/branch are gone; report commits
-  landed and test result.
+- **Green** (worktree landed and pruned) → confirm worktree/branch are gone; proceed to
+  step 6.
 - **Aborted / rolled back** → the engine's `undo` has restored the repo to exactly its
   pre-land state. Call `EnterWorktree(path:$WORKTREE_PATH)` to return the session to the
-  intact worktree; report what happened + why, verbatim.
+  intact worktree; report what happened + why, verbatim. Do not produce a recap.
+
+### 6. Extended recap (green path only)
+
+The user was not watching the work that happened in this worktree. Write a prose narrative
+— **target 500–1200 words** — that brings them fully up to speed, as if handing off from
+one engineer to another.
+
+**Gather the raw data first:**
+
+```bash
+# All commits that landed, newest-first, with full stats
+git -C $PRIMARY log --stat \
+  --format="%ncommit %h  (%ai)%n%s%n%b" \
+  -$COMMIT_COUNT
+
+# One-line summary of overall file changes across all landed commits
+git -C $PRIMARY diff HEAD~$COMMIT_COUNT HEAD --stat
+```
+
+If `COMMIT_COUNT` is 0 for some reason (engine reported already-merged), describe the
+branch as having had no new commits to land and skip the detail sections below.
+
+**Narrative structure** — write flowing prose in each section, not bullet lists:
+
+**What this branch was about** (1–2 paragraphs): Synthesize the branch name and commit
+messages into a plain-English description of the goal. What problem was being solved, what
+feature was being added, or what was being cleaned up? Someone who knew nothing about the
+task should come away with a clear mental model of the work's purpose.
+
+**What changed** (2–4 paragraphs): Walk through the commits chronologically, grouped by
+logical theme when there are multiple. For each meaningful commit (or group), explain what
+was actually changed and why — not just which files, but what the change *does*. Reference
+specific files and directories when it helps orient the reader (e.g. "the gate logic in
+`hooks/worktree_gate.py`"), but don't enumerate every file changed in each commit; that's
+what `git log --stat` is for. Focus on the intent behind the changes.
+
+**Anything notable** (0–2 paragraphs, omit if nothing notable): Any conflicts resolved,
+tricky design decisions visible from commit messages, tests added or fixed, refactors
+performed, or edge cases handled. If the commit history is clean and unremarkable, skip
+this section rather than padding it.
+
+**How it landed** (1 short paragraph): State that the branch has been rebased and merged
+into `$TARGET`, the worktree torn down, and tests passed. Mention how many commits landed.
+This is the one factual "outcome" paragraph — keep it brief.
+
+**Tone:** Informative and conversational, like a knowledgeable colleague writing a Slack
+summary. No bullet lists in the main narrative. Prose only. Don't start with "Here is a
+recap" or any meta-announcement — open directly with the substance.
 
 ## Hard rules
 
