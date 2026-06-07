@@ -90,51 +90,62 @@ tests → teardown, with confidence-gated conflict/rollback handling.
 
 ### 6. Extended recap (green path only)
 
-The user was not watching the work that happened in this worktree. Write a prose narrative
-— **target 500–1200 words** — that brings them fully up to speed, as if handing off from
-one engineer to another.
+The user was not watching the work that happened in this worktree. Write a recap —
+**target 100–1000 words** — that brings them fully up to speed. Prose and bullet points
+are both welcome; use whichever fits the content (bullets for lists of changes, prose for
+context and explanation).
 
 **Gather the raw data first:**
 
 ```bash
-# All commits that landed, newest-first, with full stats
+# All commits that landed, with full stats
 git -C $PRIMARY log --stat \
   --format="%ncommit %h  (%ai)%n%s%n%b" \
   -$COMMIT_COUNT
 
-# One-line summary of overall file changes across all landed commits
+# Overall file-change summary across all landed commits
 git -C $PRIMARY diff HEAD~$COMMIT_COUNT HEAD --stat
 ```
 
-If `COMMIT_COUNT` is 0 for some reason (engine reported already-merged), describe the
-branch as having had no new commits to land and skip the detail sections below.
+If `COMMIT_COUNT` is 0 (engine reported already-merged), note that the branch had no new
+commits to land and skip the detail sections.
 
-**Narrative structure** — write flowing prose in each section, not bullet lists:
+**Visual vocabulary** — apply these consistently so the user can scan at a glance:
 
-**What this branch was about** (1–2 paragraphs): Synthesize the branch name and commit
-messages into a plain-English description of the goal. What problem was being solved, what
-feature was being added, or what was being cleaned up? Someone who knew nothing about the
-task should come away with a clear mental model of the work's purpose.
+| Signal | Meaning |
+|--------|---------|
+| 🎯 | Branch goal / what this was for |
+| ✨ | New capability or feature added |
+| 🔧 | Bug fix or correction |
+| ♻️ | Refactor or cleanup (no behavior change) |
+| 🧪 | Test changes |
+| 📚 | Docs or config-only changes |
+| ⚠️ | Conflict resolved, edge case, or notable risk |
+| 💡 | Non-obvious design decision |
+| 🚀 | Landing outcome line |
+| `` `code span` `` | File paths, function names, config keys, branch names |
+| **bold** | Commit subjects and key terms |
+| _italic_ | Supporting context, rationale, caveats |
 
-**What changed** (2–4 paragraphs): Walk through the commits chronologically, grouped by
-logical theme when there are multiple. For each meaningful commit (or group), explain what
-was actually changed and why — not just which files, but what the change *does*. Reference
-specific files and directories when it helps orient the reader (e.g. "the gate logic in
-`hooks/worktree_gate.py`"), but don't enumerate every file changed in each commit; that's
-what `git log --stat` is for. Focus on the intent behind the changes.
+**Structure** (omit any section that would be empty):
 
-**Anything notable** (0–2 paragraphs, omit if nothing notable): Any conflicts resolved,
-tricky design decisions visible from commit messages, tests added or fixed, refactors
-performed, or edge cases handled. If the commit history is clean and unremarkable, skip
-this section rather than padding it.
+**🎯 Goal** — One or two sentences: what problem was being solved or what was being
+added. Written for someone with zero context on the task.
 
-**How it landed** (1 short paragraph): State that the branch has been rebased and merged
-into `$TARGET`, the worktree torn down, and tests passed. Mention how many commits landed.
-This is the one factual "outcome" paragraph — keep it brief.
+**What changed** — Walk the commits chronologically. Lead each change with the
+appropriate emoji (✨ / 🔧 / ♻️ / 🧪 / 📚), the **commit subject in bold**, then a
+sentence or two (or a short bullet list) explaining what the change actually does and why.
+Reference `file paths` inline where it helps orient the reader. Don't enumerate every
+file; focus on intent.
 
-**Tone:** Informative and conversational, like a knowledgeable colleague writing a Slack
-summary. No bullet lists in the main narrative. Prose only. Don't start with "Here is a
-recap" or any meta-announcement — open directly with the substance.
+**⚠️ Notable** _(omit if nothing notable)_ — Conflicts resolved, tricky decisions,
+edge cases handled, or anything that would surprise a reader of the diff.
+
+**🚀 Landed** — One line: N commit(s) rebased onto `$TARGET`, worktree torn down,
+tests passed (or the test outcome if different).
+
+**Tone:** Knowledgeable colleague handing off work. Don't open with "Here is a recap"
+or any meta-announcement — start directly with 🎯.
 
 ## Hard rules
 
