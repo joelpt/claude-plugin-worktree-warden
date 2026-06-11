@@ -118,7 +118,11 @@ class PreflightTest(unittest.TestCase):
         shutil.rmtree(str(self.wt_clean))
         out = engine.cmd_preflight(str(self.repo), ["feat-clean"])
         self.assertEqual(out.code, engine.EXIT_GIT_ERROR)
-        self.assertIn("inaccessible", out.message)
+        self.assertEqual(out.status, "stale_worktree")
+        self.assertIn("missing", out.message)
+        self.assertIn("git worktree add", out.message)
+        assert isinstance(out.details, dict)
+        self.assertIn("recovery", out.details)
 
     def test_branch_without_worktree_is_clean_with_no_path(self) -> None:
         """A branch that has no linked worktree appears with path=None, clean=True."""
@@ -159,3 +163,90 @@ class PreflightTest(unittest.TestCase):
         self.assertIn("worktrees", data["details"])
         self.assertEqual(len(data["details"]["worktrees"]), 2)
         self.assertIn("target", data["details"])
+
+
+class FinishPreflightTest(unittest.TestCase):
+    """cmd_finish_preflight captures primary/target/branch/commit_count in one call."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmp.name)
+        self.repo = self.base / "repo"
+        self.repo.mkdir()
+        _git("init", "-b", "main", cwd=self.repo)
+        _git("config", "user.email", "t@t.test", cwd=self.repo)
+        _git("config", "user.name", "Test", cwd=self.repo)
+        (self.repo / "seed.txt").write_text("seed\n")
+        _git("add", "seed.txt", cwd=self.repo)
+        _git("commit", "-m", "seed", cwd=self.repo)
+
+        self.wt = self.base / "wt-feat"
+        _git("worktree", "add", "-b", "feat", str(self.wt), cwd=self.repo)
+        (self.wt / "work.txt").write_text("work\n")
+        _git("add", "work.txt", cwd=self.wt)
+        _git("commit", "-m", "feat work", cwd=self.wt)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_resolves_primary_target_branch_commit_count(self) -> None:
+        """Returns primary checkout, default target, current branch, and commit count."""
+        out = engine.cmd_finish_preflight(str(self.wt))
+        self.assertEqual(out.code, engine.EXIT_OK)
+        assert isinstance(out.details, dict)
+        self.assertEqual(out.details["branch"], "feat")
+        self.assertEqual(out.details["target"], "main")
+        self.assertEqual(out.details["commit_count"], 1)
+        self.assertEqual(out.details["primary"], str(self.repo.resolve()))
+
+    def test_target_override_used_for_commit_count(self) -> None:
+        """When --target is supplied, commit_count is computed against the override."""
+        _git(
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/other",
+            cwd=self.repo,
+        )
+        out = engine.cmd_finish_preflight(str(self.wt), target_override="main")
+        self.assertEqual(out.code, engine.EXIT_OK)
+        assert isinstance(out.details, dict)
+        self.assertEqual(out.details["target"], "main")
+        self.assertEqual(out.details["commit_count"], 1)
+
+    def test_target_falls_back_to_main_without_origin_head(self) -> None:
+        """Without origin/HEAD, target defaults to 'main'."""
+        out = engine.cmd_finish_preflight(str(self.wt))
+        assert isinstance(out.details, dict)
+        self.assertEqual(out.details["target"], "main")
+
+    def test_target_resolved_from_origin_head(self) -> None:
+        """When origin/HEAD points to trunk, target is 'trunk'."""
+        _git("branch", "trunk", cwd=self.repo)
+        _git(
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/trunk",
+            cwd=self.repo,
+        )
+        out = engine.cmd_finish_preflight(str(self.wt))
+        assert isinstance(out.details, dict)
+        self.assertEqual(out.details["target"], "trunk")
+
+    def test_cli_outputs_valid_json(self) -> None:
+        """CLI finish-preflight exits 0 and emits JSON with required keys."""
+        engine_path = Path(__file__).resolve().parent.parent / "scripts" / "worktree_engine.py"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(engine_path),
+                "finish-preflight",
+                "--worktree",
+                str(self.wt),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 0)
+        data = json.loads(proc.stdout)
+        for key in ("primary", "target", "branch", "commit_count"):
+            self.assertIn(key, data["details"])

@@ -15,6 +15,11 @@ exits with the contract code below):
                    clean/dirty status for each branch's worktree. Replaces two+
                    model round-trips (symbolic-ref + per-worktree status checks)
                    with a single call.
+  finish-preflight capture all identity data for /finish-worktree (primary,
+                   target, branch, commit_count) in one call, replacing three
+                   sequential model-issued git commands. Accepts optional
+                   --target to override symbolic-ref and keep commit_count
+                   consistent when the user passes a non-default target.
   land             preflight + rebase <branch> onto <target> (in the worktree)
                    + ff-merge into <target> (in the primary). On conflict the
                    rebase is LEFT IN PROGRESS for the caller to resolve.
@@ -44,6 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -414,11 +420,27 @@ def cmd_preflight(repo: str, branches: list[str]) -> Outcome:
             try:
                 dirty_files = _non_noise_dirty(path)
             except OSError as exc:
+                if not os.path.isdir(path):
+                    recovery = (
+                        f"git worktree prune && git worktree add"
+                        f" {shlex.quote(path)} {shlex.quote(branch)}"
+                    )
+                    return Outcome(
+                        EXIT_GIT_ERROR,
+                        "stale_worktree",
+                        f"Worktree directory for '{branch}' is missing: {path}\n"
+                        f"Run: {recovery}",
+                        target=target,
+                        details={
+                            "branch": branch,
+                            "path": path,
+                            "recovery": recovery,
+                        },
+                    )
                 return Outcome(
                     EXIT_GIT_ERROR,
                     "git_error",
-                    f"Worktree path {path!r} for branch '{branch}' is inaccessible"
-                    f" (stale registration?): {exc}",
+                    f"Worktree path {path!r} for branch '{branch}' is inaccessible: {exc}",
                     target=target,
                 )
         else:
@@ -441,6 +463,64 @@ def cmd_preflight(repo: str, branches: list[str]) -> Outcome:
         details={"target": target, "worktrees": [dict(w) for w in worktrees]},
     )
     return out
+
+
+def cmd_finish_preflight(worktree: str, target_override: str | None = None) -> Outcome:
+    """Capture all identity data for /finish-worktree in one engine call.
+
+    Replaces three sequential model-issued git calls (``git worktree list`` →
+    PRIMARY, ``git symbolic-ref`` → TARGET, ``git rev-list --count`` →
+    COMMIT_COUNT) with a single scripted call.  Accepts an optional
+    ``target_override`` so ``commit_count`` is computed against the same target
+    that will be used for the recap—critical when the user passes a non-default
+    target via ``$ARGUMENTS`` in ``/finish-worktree``.
+
+    Args:
+        worktree: Absolute path of the linked worktree being finished.
+        target_override: If provided, skip symbolic-ref lookup and use this
+            branch as TARGET.  Pass when the user supplies a non-default target
+            via ``$ARGUMENTS`` so that ``commit_count`` stays consistent.
+
+    Returns:
+        Outcome with ``details``: ``primary``, ``target``, ``branch``,
+        ``commit_count``.
+    """
+    try:
+        worktree = os.path.realpath(worktree)
+        primary = _primary_worktree(worktree)
+        branch = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=worktree)
+        if target_override:
+            target = target_override
+        else:
+            rc, ref_out, _ = _git_rc(
+                ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], cwd=worktree
+            )
+            target = (
+                ref_out[len(_ORIGIN_HEAD_PREFIX):]
+                if rc == 0 and ref_out.startswith(_ORIGIN_HEAD_PREFIX)
+                else "main"
+            )
+        commit_count = int(
+            _git(["rev-list", "--count", f"{target}..HEAD"], cwd=worktree) or "0"
+        )
+    except (GitError, ValueError) as exc:
+        return Outcome(EXIT_GIT_ERROR, "git_error", str(exc))
+
+    return Outcome(
+        EXIT_OK,
+        "finish_preflight",
+        f"branch={branch}, primary={primary}, target={target}, commit_count={commit_count}",
+        target=target,
+        branch=branch,
+        primary=primary,
+        worktree=worktree,
+        details={
+            "primary": primary,
+            "target": target,
+            "branch": branch,
+            "commit_count": commit_count,
+        },
+    )
 
 
 def _git_common_dir(repo: str) -> str:
@@ -688,6 +768,18 @@ def main(argv: list[str] | None = None) -> int:
     p_pre = sub.add_parser("preflight")
     p_pre.add_argument("--branches", default="", help="Comma-separated branch names.")
 
+    p_fp = sub.add_parser("finish-preflight")
+    p_fp.add_argument(
+        "--worktree",
+        default=os.getcwd(),
+        help="Linked worktree path (default: cwd).",
+    )
+    p_fp.add_argument(
+        "--target",
+        default=None,
+        help="Override default branch (skips symbolic-ref lookup).",
+    )
+
     p_undo = sub.add_parser("undo")
     p_undo.add_argument("--snapshot", required=True, help="Path to the snapshot JSON.")
 
@@ -702,6 +794,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "preflight":
             branches = [b for b in args.branches.split(",") if b]
             return cmd_preflight(repo, branches).emit()
+        if args.cmd == "finish-preflight":
+            return cmd_finish_preflight(args.worktree, args.target).emit()
         if args.cmd == "land":
             return cmd_land(args.worktree, args.branch, args.target, repo).emit()
         if args.cmd == "rebase-continue":

@@ -12,6 +12,10 @@ allowed-tools: Bash(git *) Bash(cd *) ExitWorktree EnterWorktree Skill(worktree-
 - Current branch: !`git rev-parse --abbrev-ref HEAD 2>/dev/null`
 - Worktrees: !`git worktree list 2>/dev/null`
 
+## Engine
+
+`ENGINE=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_engine.py`
+
 ## What /finish-worktree does
 
 Lands **this linked worktree** into `$ARGUMENTS` (default: the repo's default branch) and
@@ -41,21 +45,28 @@ snapshot before any rebase.
 - **`git-dir` is `.git`** (cwd is the primary checkout, not a linked worktree) → this is not
   what `/finish-worktree` lands. Punt to **`/worktree-warden:check-worktrees`** (it surfaces the
   repo's mergeable worktrees and offers to land any). Do not proceed to step 2.
+- **Current branch is `HEAD`** (detached HEAD state) → stop and report; there is no
+  branch to land.
 - **Inside a linked worktree but already on the target branch** → stop (misconfiguration;
   nothing to land).
 - **Otherwise** (inside a linked worktree on a non-target branch) → proceed.
 
 ### 2. Capture identity
 
-Record:
-- `WORKTREE_PATH` — absolute toplevel from Live context.
-- `BRANCH` — current branch from Live context.
-- `PRIMARY` — first path from `git worktree list` (the main checkout).
-- `TARGET` — `$ARGUMENTS` if provided, else resolve from
-  `git symbolic-ref --quiet refs/remotes/origin/HEAD` (leaf), else `main`.
-- `COMMIT_COUNT` — run `git rev-list --count $TARGET..HEAD` (while still in the worktree).
-  This count is needed for the recap in step 6; capture it now because the branch ref is
-  deleted after teardown.
+`WORKTREE_PATH` and `BRANCH` are available from Live context above.
+Capture `PRIMARY`, `TARGET`, and `COMMIT_COUNT` with one engine call:
+
+```bash
+python3 $ENGINE finish-preflight --worktree $WORKTREE_PATH [--target $ARGUMENTS]
+```
+
+Pass `--target $ARGUMENTS` only when `$ARGUMENTS` was provided — this ensures
+`commit_count` is computed against the same target used for the recap.
+From `details`: `primary` → `PRIMARY`, `target` → `TARGET`,
+`commit_count` → `COMMIT_COUNT`. `BRANCH` is confirmed by `details.branch`.
+
+`COMMIT_COUNT` is needed for the recap in step 6; capture it now because the branch
+ref is deleted after teardown.
 
 ### 3. Relocate if possible
 
