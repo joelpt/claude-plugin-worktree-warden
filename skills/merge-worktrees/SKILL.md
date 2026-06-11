@@ -61,7 +61,7 @@ This single call gives you everything steps 0–1 need; proceed directly to step
 ## 1. Commit dirty worktrees (one at a time)
 
 For each entry in `details.worktrees` where `clean == false`: show `dirty_files` from
-preflight and `git -C <path> diff --stat`; `AskUserQuestion` "commit these in `<branch>`?".
+preflight and `git -C <path> diff HEAD --stat`; `AskUserQuestion` "commit these in `<branch>`?".
 
 - **Yes** → `EnterWorktree(path:<path>)` → `/commit-commands:commitall` (fix review /
   pre-commit issues as normal) → `ExitWorktree(action:"keep")`.
