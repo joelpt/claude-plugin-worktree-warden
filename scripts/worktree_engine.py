@@ -11,6 +11,10 @@ undo so a post-land abort can restore the repo to exactly its pre-land state.
 Subcommands (each prints one JSON object on stdout, a summary on stderr, and
 exits with the contract code below):
 
+  preflight        resolve TARGET (symbolic-ref → 'main' fallback) and report
+                   clean/dirty status for each branch's worktree. Replaces two+
+                   model round-trips (symbolic-ref + per-worktree status checks)
+                   with a single call.
   land             preflight + rebase <branch> onto <target> (in the worktree)
                    + ff-merge into <target> (in the primary). On conflict the
                    rebase is LEFT IN PROGRESS for the caller to resolve.
@@ -44,6 +48,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TypedDict
 
 EXIT_OK = 0
 EXIT_NOT_APPLICABLE = 10
@@ -338,6 +343,106 @@ def cmd_rebase_continue(worktree: str, branch: str, target: str, repo: str) -> O
     return _ff_merge(branch, target, repo, base)
 
 
+class WorktreeStatus(TypedDict):
+    """Per-branch status entry returned by cmd_preflight."""
+
+    branch: str
+    path: str | None
+    clean: bool
+    dirty_files: list[str]
+
+
+def _worktrees_by_branch(repo: str) -> dict[str, str]:
+    """Return a mapping of short branch name to realpath for every linked worktree.
+
+    Runs ``git worktree list --porcelain`` once and builds the full map, so
+    callers that need to resolve multiple branches avoid N separate subprocess
+    calls.
+
+    Args:
+        repo: Primary checkout path.
+
+    Returns:
+        Dict mapping each linked worktree's branch name to its realpath.
+        The primary worktree and detached-HEAD worktrees are excluded.
+    """
+    mapping: dict[str, str] = {}
+    current: str | None = None
+    for line in _git(["worktree", "list", "--porcelain"], cwd=repo).splitlines():
+        if line.startswith("worktree "):
+            current = os.path.realpath(line[len("worktree "):])
+        elif line.startswith("branch ") and current is not None:
+            ref = line[len("branch "):]
+            if ref.startswith("refs/heads/"):
+                mapping[ref[len("refs/heads/"):]] = current
+    return mapping
+
+
+_ORIGIN_HEAD_PREFIX = "refs/remotes/origin/"
+
+
+def cmd_preflight(repo: str, branches: list[str]) -> Outcome:
+    """Resolve the default branch and report cleanliness for each worktree.
+
+    Combines the two model round-trips that merge-worktrees previously issued
+    separately (``git symbolic-ref`` + per-worktree ``git status``) into one
+    engine call. Returns everything the skill needs before the dirty-commit HITL
+    step and snapshot.
+
+    Args:
+        repo: Primary checkout path.
+        branches: Branch names to inspect.
+
+    Returns:
+        Outcome with ``details["target"]`` (resolved default branch) and
+        ``details["worktrees"]`` (list of WorktreeStatus entries).
+    """
+    rc, ref_out, _ = _git_rc(
+        ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], cwd=repo
+    )
+    target = (
+        ref_out[len(_ORIGIN_HEAD_PREFIX):]
+        if rc == 0 and ref_out.startswith(_ORIGIN_HEAD_PREFIX)
+        else "main"
+    )
+
+    branch_to_path = _worktrees_by_branch(repo)
+    worktrees: list[WorktreeStatus] = []
+    for branch in branches:
+        path = branch_to_path.get(branch)
+        if path is not None:
+            try:
+                dirty_files = _non_noise_dirty(path)
+            except OSError as exc:
+                return Outcome(
+                    EXIT_GIT_ERROR,
+                    "git_error",
+                    f"Worktree path {path!r} for branch '{branch}' is inaccessible"
+                    f" (stale registration?): {exc}",
+                    target=target,
+                )
+        else:
+            dirty_files = []
+        worktrees.append(
+            WorktreeStatus(
+                branch=branch,
+                path=path,
+                clean=not dirty_files,
+                dirty_files=dirty_files,
+            )
+        )
+
+    dirty_count = sum(1 for w in worktrees if not w["clean"])
+    out = Outcome(
+        EXIT_OK,
+        "preflight",
+        f"TARGET={target}; {len(worktrees)} worktree(s), {dirty_count} dirty.",
+        target=target,
+        details={"target": target, "worktrees": [dict(w) for w in worktrees]},
+    )
+    return out
+
+
 def _git_common_dir(repo: str) -> str:
     """Absolute path of the repo's shared git dir (stable across worktrees)."""
     cd = _git(["rev-parse", "--git-common-dir"], cwd=repo)
@@ -580,6 +685,9 @@ def main(argv: list[str] | None = None) -> int:
     p_snap.add_argument("--branches", default="", help="Comma-separated branch names.")
     p_snap.add_argument("--out", default=None, help="Snapshot JSON path (default: under git dir).")
 
+    p_pre = sub.add_parser("preflight")
+    p_pre.add_argument("--branches", default="", help="Comma-separated branch names.")
+
     p_undo = sub.add_parser("undo")
     p_undo.add_argument("--snapshot", required=True, help="Path to the snapshot JSON.")
 
@@ -591,6 +699,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     repo = args.repo
     try:
+        if args.cmd == "preflight":
+            branches = [b for b in args.branches.split(",") if b]
+            return cmd_preflight(repo, branches).emit()
         if args.cmd == "land":
             return cmd_land(args.worktree, args.branch, args.target, repo).emit()
         if args.cmd == "rebase-continue":

@@ -14,9 +14,10 @@ decisions). Repo-scoped: only ever this repo's worktrees.
 
 `ENGINE=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_engine.py`,
 `GATE=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_gate.py`, `REPO=<primary checkout path>`,
-`TARGET=<default branch>`. Engine exit codes: `0` ok · `10` n/a (already merged / on target)
-· `11` worktree dirty · `12` primary unsafe · `13` rebase conflict (LEFT IN PROGRESS) ·
-`14` ff-merge failed · `15` git error · `17` core.bare corruption.
+`TARGET` and cleanliness resolved by **preflight** (see below). Engine exit codes: `0` ok
+· `10` n/a (already merged / on target) · `11` worktree dirty · `12` primary unsafe
+· `13` rebase conflict (LEFT IN PROGRESS) · `14` ff-merge failed · `15` git error
+· `17` core.bare corruption.
 
 **Safety contract:**
 
@@ -47,13 +48,20 @@ Chosen worktrees as `path` + `branch` pairs (from `/check-worktrees`), **or** a 
   primary checkout so subsequent Bash calls are rooted there; all engine calls take
   `--repo` explicitly for belt-and-suspenders correctness.
 
-Resolve `TARGET` from `git -C $REPO symbolic-ref --quiet refs/remotes/origin/HEAD` (leaf),
-else `main`.
+**Once `REPO` is known, run preflight immediately** (replaces the separate `symbolic-ref`
+call and per-worktree `git status` checks with one tool call):
+
+```bash
+python3 $ENGINE --repo $REPO preflight --branches <b1,b2,…>
+```
+
+Read `details.target` → `TARGET`. Read `details.worktrees` → `[{branch, path, clean, dirty_files}]`.
+This single call gives you everything steps 0–1 need; proceed directly to step 1.
 
 ## 1. Commit dirty worktrees (one at a time)
 
-For each chosen worktree that is dirty: show `git -C <path> status` + `diff --stat`;
-`AskUserQuestion` "commit these in `<branch>`?".
+For each entry in `details.worktrees` where `clean == false`: show `dirty_files` from
+preflight and `git -C <path> diff --stat`; `AskUserQuestion` "commit these in `<branch>`?".
 
 - **Yes** → `EnterWorktree(path:<path>)` → `/commit-commands:commitall` (fix review /
   pre-commit issues as normal) → `ExitWorktree(action:"keep")`.
@@ -109,9 +117,15 @@ For each branch in order:
 
 ## 6. Verify + test (ALWAYS, after all lands)
 
-`git -C $REPO log --oneline -n 20` and `git -C $REPO status --porcelain` (expect clean +
-expected commits). Then run the suite: Justfile `test` (`just test`) → `npm test` (if
-`package.json`) → `pytest` (if Python) → `cargo test` (if Cargo) → else ask.
+Run both git checks in a single call, then the test suite:
+
+```bash
+git -C $REPO log --oneline -n 20 ; echo '---' ; git -C $REPO status --porcelain
+```
+
+Expect: clean status + expected commits visible. Then run the suite: Justfile `test`
+(`just test`) → `npm test` (if `package.json`) → `pytest` (if Python) → `cargo test`
+(if Cargo) → else ask.
 
 - **Pass** → step 7.
 - **Verify wrong, or unexpected test failures:**
