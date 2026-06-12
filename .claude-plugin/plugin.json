@@ -1,6 +1,6 @@
 {
   "name": "worktree-warden",
-  "version": "2026.06.12.3",
+  "version": "2026.06.12.4",
   "description": "Enforces worktree-first editing via a PreToolUse gate that blocks main-checkout edits (with a deliberate, time-boxed, per-repo/global opt-out exception), blocks destruction of any dirty or un-landed worktree/branch (raw git worktree remove, rm -rf, git branch -D, ExitWorktree remove), surfaces a repo's git worktrees at session start (configurable), and lands chosen ones into the default branch by deterministic rebase + fast-forward with confidence-gated conflict handling and exact-state rollback. Repo-scoped \u2014 never looks cross-repo.",
   "author": {
     "name": "Joel Thornton"

@@ -296,6 +296,19 @@ def main() -> int:
         if _should_debounce(state, commit_count):
             return 0
 
+    # Non-destructively snapshot uncommitted work to a bundle before nudging.
+    # The destruction gate cannot see the harness's native worktree cleanup, so
+    # this is the backstop that keeps dirty WIP recoverable if the directory is
+    # later removed by something the gate never intercepts. Best-effort, rate
+    # limited by the same debounce above; surfaced later via `recover`.
+    if dirty:
+        try:
+            import worktree_wip  # noqa: PLC0415
+
+            worktree_wip.capture_wip(cwd)
+        except Exception:
+            pass
+
     branch = _current_branch(cwd)
 
     reason = _build_reason(mode, branch, commit_count, base_ref, dirty)

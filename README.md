@@ -88,6 +88,9 @@ worktrees of the repo your current session belongs to — never cross-repo.
   (`git worktree remove`, `rm -rf`, `git branch -d/-D`) and rules block/allow by
   checking the target worktree/branch is clean **and** landed. Imported by
   `hooks/guard_destruction_hook.py`.
+- `scripts/worktree_wip.py` — non-destructive WIP capture: snapshots a worktree's
+  tracked + untracked uncommitted content (via a temporary index) into a git
+  bundle outside all refs. Called by the Stop hook; surfaced by engine `recover`.
 - `scripts/check_worktrees.py` — async, stdlib-only detector/renderer that lists
   every linked worktree and classifies each one's readiness. Shared by the hook
   and the skill (table + `--json`). Flags: `--cwd <path>`, `--json`.
@@ -171,6 +174,15 @@ has pending work. Its behaviour is governed by the `teardown_mode` setting:
 
 Set it at user scope (`--user`) to apply across all repos, or project scope
 (no flag) to override per-repo.
+
+Whenever the Stop hook fires on a worktree with **uncommitted** changes, it also
+captures that work non-destructively first: tracked modifications and untracked
+files are snapshotted (via a temporary index — the working tree and real index
+are untouched) into a **git bundle** under `<git-common-dir>/worktree-warden/wip/`.
+Bundles live outside all refs (invisible to `git log`/`git branch`), so if the
+worktree directory is later removed by something the destruction gate can't see
+(e.g. the harness's own background-isolation cleanup), the WIP is still
+recoverable. `recover` lists the bundles; `recover --gc-days N` expires old ones.
 
 ## Safety
 
