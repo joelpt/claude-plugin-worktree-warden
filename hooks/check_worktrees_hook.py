@@ -205,11 +205,37 @@ def main() -> int:
     if mode == "never" and not enforcement_active and disabled_scope != "project":
         return 0
 
+    # Force-quit backstop + external-removal detection. Both are best-effort and
+    # independent of the banner: capture WIP of any dirty worktree a prior
+    # force-quit stranded (before it can be removed uncaptured), then diff the
+    # worktree population against last session to surface removals warden did not
+    # itself perform. Failures here must never affect the rest of the hook.
+    removal_advisory = ""
+    try:
+        import worktree_wip  # noqa: PLC0415
+        import worktree_population  # noqa: PLC0415
+
+        worktree_wip.capture_dirty_orphans(cwd)
+        removal_advisory = worktree_population.format_advisory(
+            worktree_population.reconcile(cwd)
+        )
+    except Exception:
+        removal_advisory = ""
+
     output: dict[str, str] = {}
     if mode != "never":
         banner = build_banner(gather(cwd), mode)
         if banner:
             output["systemMessage"] = banner
+
+    # An external-removal advisory is high-priority — surface it above the banner,
+    # and independently of startup_display (the user must see a silent loss even
+    # in "never" mode).
+    if removal_advisory:
+        existing = output.get("systemMessage", "")
+        output["systemMessage"] = (
+            removal_advisory + ("\n\n" + existing if existing else "")
+        )
 
     if enforcement_active:
         output["additionalInformation"] = _ENFORCEMENT_MSG

@@ -74,6 +74,14 @@ class CaptureWipTest(unittest.TestCase):
         self.assertNotIn("warden wip", _git("log", "--all", "--oneline", cwd=self.repo))
         self.assertNotIn("warden", _git("branch", "-a", cwd=self.repo))
 
+    def test_capture_dirty_orphans_only_captures_dirty(self) -> None:
+        # The single worktree is clean → nothing captured.
+        self.assertEqual(wip.capture_dirty_orphans(str(self.repo)), [])
+        (self.wt / "scratch.txt").write_text("dirty\n")
+        bundles = wip.capture_dirty_orphans(str(self.repo))
+        self.assertEqual(len(bundles), 1)
+        self.assertTrue(Path(bundles[0]).exists())
+
 
 if __name__ == "__main__":
     unittest.main()

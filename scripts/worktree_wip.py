@@ -133,3 +133,37 @@ def capture_wip(cwd: str) -> str | None:
     finally:
         # Drop the transient staging ref so nothing lingers in the ref namespace.
         _git(["update-ref", "-d", wip_ref], cwd)
+
+
+def capture_dirty_orphans(repo: str) -> list[str]:
+    """Capture WIP for every dirty LINKED worktree of ``repo``.
+
+    Called at SessionStart so a worktree a *force-quit* left dirty — its session
+    gone without ever firing a Stop hook — gets its uncommitted work bundled
+    before anything can remove the directory. This is the backstop the
+    graceful-Stop capture cannot provide. Best-effort throughout.
+
+    Args:
+        repo: Primary checkout path.
+
+    Returns:
+        The bundle paths created (empty when nothing was dirty or on error).
+    """
+    rc, out = _git(["worktree", "list", "--porcelain"], repo)
+    if rc != 0:
+        return []
+    bundles: list[str] = []
+    first = True
+    for block in out.split("\n\n"):
+        if first:  # primary checkout
+            first = False
+            continue
+        for line in block.splitlines():
+            if line.startswith("worktree "):
+                path = line[len("worktree ") :]
+                if os.path.isdir(path):
+                    bundle = capture_wip(path)
+                    if bundle:
+                        bundles.append(bundle)
+                break
+    return bundles

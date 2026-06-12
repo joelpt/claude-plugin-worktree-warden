@@ -90,7 +90,12 @@ worktrees of the repo your current session belongs to — never cross-repo.
   `hooks/guard_destruction_hook.py`.
 - `scripts/worktree_wip.py` — non-destructive WIP capture: snapshots a worktree's
   tracked + untracked uncommitted content (via a temporary index) into a git
-  bundle outside all refs. Called by the Stop hook; surfaced by engine `recover`.
+  bundle outside all refs. Called by the Stop hook and (for dirty orphans) at
+  SessionStart; surfaced by engine `recover`.
+- `scripts/worktree_population.py` — cross-session worktree-population tracking:
+  records each linked worktree's branch/head/dirty state per session and diffs
+  against the prior snapshot to flag external removals warden's audit log does
+  not account for. Driven by the SessionStart hook.
 - `scripts/check_worktrees.py` — async, stdlib-only detector/renderer that lists
   every linked worktree and classifies each one's readiness. Shared by the hook
   and the skill (table + `--json`). Flags: `--cwd <path>`, `--json`.
@@ -134,6 +139,18 @@ guidance to proceed. Two ways forward:
 When the gate blocks Claude, its guidance names the
 `worktree-warden:request-exception` and `worktree-warden:finish-exception` skills —
 thin wrappers around the same `grant` / `finished` commands shown above.
+
+At SessionStart the hook also runs two best-effort safety passes (independent of
+the banner). First it **captures the WIP of any dirty worktree** it finds — the
+backstop for a *force-quit*, which kills the session before its Stop hook can
+capture (graceful-Stop capture cannot help there). Second it **snapshots the
+repo's worktree population** and diffs it against the previous session: a
+worktree that was present last time, is gone now, still held content (dirty or
+unlanded commits), and that warden's own audit log does **not** account for is
+surfaced as an **external removal** — named, with its last-known SHA and a
+recovery command. That is what turns "a worktree mysteriously vanished" into "X
+was removed by something other than warden between session A and B; recover it
+with this command."
 
 ### Settings & opt-out
 
