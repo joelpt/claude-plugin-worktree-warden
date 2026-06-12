@@ -30,6 +30,19 @@ worktrees of the repo your current session belongs to — never cross-repo.
   **fails open**: any unexpected error allows the edit, so a bug can
   never brick editing. On by default; opt out per-repo or globally. See
   [Enforcement gate](#enforcement-gate).
+- **PreToolUse destruction gate** (`Bash|ExitWorktree`) — hard-blocks any
+  command that would throw away a worktree whose content is **dirty or not yet
+  landed** in the default branch: a raw `git worktree remove [--force]`,
+  `rm -rf <worktree>`, `git branch -d/-D <branch>`, or an `ExitWorktree` remove.
+  The merge/teardown engine is already guarded, but commands issued directly
+  through the Bash tool bypass it — this closes that hole so a worktree can never
+  be destroyed with un-landed or uncommitted work in it, regardless of which
+  agent issues the command. The check is deterministic (clean **and** an ancestor
+  of the default branch → allowed; anything else → exit-2 refusal with the
+  command to land first). Blocks under every permission mode; **fails open** on
+  any surprise (it only refuses when it can *prove* content is at risk). The
+  engine's own internal git calls do not pass through Bash, so the gate never
+  fights the engine.
 - **SessionStart hook** — on `startup`/`resume`, only when cwd is the repo's
   **main** worktree, surfaces the repo's linked worktrees as a user-facing
   `systemMessage` banner: a category breakdown (mergeable / ⏳ cooldown / ❌
@@ -70,6 +83,11 @@ worktrees of the repo your current session belongs to — never cross-repo.
   `worktree-gate` CLI (`grant`, `finished`, `disable`, `enable`, `set-window`,
   `set-startup-display`, `status`). The PreToolUse hook imports its policy; the
   CLI manages exceptions and persistent settings.
+- `scripts/worktree_destruction.py` — pure, testable core of the destruction
+  gate: parses a (possibly compound) shell command for destructive intent
+  (`git worktree remove`, `rm -rf`, `git branch -d/-D`) and rules block/allow by
+  checking the target worktree/branch is clean **and** landed. Imported by
+  `hooks/guard_destruction_hook.py`.
 - `scripts/check_worktrees.py` — async, stdlib-only detector/renderer that lists
   every linked worktree and classifies each one's readiness. Shared by the hook
   and the skill (table + `--json`). Flags: `--cwd <path>`, `--json`.

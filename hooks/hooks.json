@@ -6,6 +6,12 @@
         "hooks": [
           { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/enforce_worktree_hook.py", "timeout": 10 }
         ]
+      },
+      {
+        "matcher": "Bash|ExitWorktree",
+        "hooks": [
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/guard_destruction_hook.py", "timeout": 10 }
+        ]
       }
     ],
     "SessionStart": [
