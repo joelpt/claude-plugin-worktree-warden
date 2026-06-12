@@ -9,6 +9,7 @@ clean checkout that already holds every file.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import tempfile
 import unittest
@@ -121,6 +122,27 @@ class ExactStateRollbackTest(unittest.TestCase):
         self.snap_file.write_text("{not json")
         code = engine.cmd_undo(str(self.repo), str(self.snap_file)).emit()
         self.assertEqual(code, engine.EXIT_GIT_ERROR)
+
+    def test_teardown_writes_audit_line_with_branch_tip(self) -> None:
+        self._commit_in_wt()
+        _git("merge", "--ff-only", "feat", cwd=self.repo)  # land it
+        tip = _git("rev-parse", "feat", cwd=self.repo)
+        outcome = engine.cmd_teardown("feat", "main", str(self.repo), False)
+        engine._audit(str(self.repo), "teardown", outcome)
+        self.assertEqual(outcome.status, "teardown_complete")
+
+        audit = self.repo / ".git" / "worktree-warden" / "audit.log"
+        self.assertTrue(audit.exists())
+        record = json.loads(audit.read_text().splitlines()[-1])
+        self.assertEqual(record["action"], "teardown")
+        self.assertEqual(record["branch"], "feat")
+        self.assertEqual(record["details"]["branch_tip"], tip)
+        self.assertTrue(record["details"]["branch_deleted"])
+
+    def _commit_in_wt(self) -> None:
+        (self.wt / "extra.txt").write_text("more\n")
+        _git("add", "extra.txt", cwd=self.wt)
+        _git("commit", "-m", "extra", cwd=self.wt)
 
 
 if __name__ == "__main__":

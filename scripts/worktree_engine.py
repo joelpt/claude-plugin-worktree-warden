@@ -52,6 +52,7 @@ import os
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TypedDict
@@ -626,6 +627,20 @@ def cmd_undo(repo: str, snapshot_path: str) -> Outcome:
             out.message = f"Anchor '{sha}' does not resolve to a commit; refusing undo (nothing changed)."
             return out
 
+    # Capture what the scoped `reset --hard` is about to overwrite, BEFORE it
+    # runs. git's reflog already records these (the real recovery path), but
+    # recording them in the audit makes a stale-snapshot mistake — undo run
+    # against a snapshot taken before later commits — diagnosable from one log,
+    # not a reflog spelunk. Best-effort; never blocks the undo.
+    pre_undo: dict[str, str] = {}
+    rc_pre, cur_target, _ = _git_rc(["rev-parse", "HEAD"], cwd=primary)
+    if rc_pre == 0:
+        pre_undo[target] = cur_target
+    for branch in branches:
+        rc_br, br_sha, _ = _git_rc(["rev-parse", branch], cwd=repo)
+        if rc_br == 0:
+            pre_undo[branch] = br_sha
+
     restored: list[str] = []
     failed: list[str] = []
 
@@ -675,10 +690,10 @@ def cmd_undo(repo: str, snapshot_path: str) -> Outcome:
             f"Undo PARTIAL — repo may be in an intermediate state. "
             f"Restored: {restored}. FAILED: {failed}."
         )
-        out.details = {"restored": restored, "failed": failed}
+        out.details = {"restored": restored, "failed": failed, "pre_undo": pre_undo}
         return out
     out.message = f"Restored to snapshot: {', '.join(restored)}."
-    out.details = {"restored": restored}
+    out.details = {"restored": restored, "pre_undo": pre_undo}
     return out
 
 
@@ -725,6 +740,13 @@ def cmd_teardown(branch: str, target: str, repo: str, dry_run: bool) -> Outcome:
         base.status, base.message = "dry_run", f"DRY RUN: would tear down '{branch}'."
         return base
 
+    # Captured before deletion so the audit trail records exactly which commit
+    # the torn-down branch pointed at (recoverable via reflog / it is in target).
+    # Non-raising: a capture hiccup must not abort the teardown's structured path.
+    _, branch_tip, _ = (
+        _git_rc(["rev-parse", branch], cwd=repo) if branch_exists else (0, "", "")
+    )
+
     if wt_path is not None:
         _neutralize_noise(wt_path)
         rc, _, err = _git_rc(["worktree", "remove", wt_path], cwd=primary)
@@ -741,8 +763,47 @@ def cmd_teardown(branch: str, target: str, repo: str, dry_run: bool) -> Outcome:
     _git_rc(["worktree", "prune"], cwd=primary)
     base.status = "teardown_complete"
     base.message = f"Tore down '{branch}'" + (f" (worktree {wt_path})" if wt_path else "") + "."
-    base.details = {"worktree_removed": wt_path is not None, "branch_deleted": branch_exists}
+    base.details = {
+        "worktree_removed": wt_path is not None,
+        "branch_deleted": branch_exists,
+        "branch_tip": branch_tip,
+    }
     return base
+
+
+def _audit(repo: str, action: str, outcome: Outcome) -> None:
+    """Append a forensic JSON line for an engine mutation; never raises.
+
+    Written under the shared git dir (``<git-common-dir>/worktree-warden/
+    audit.log``) so the trail lives with the repo and survives teardown. This is
+    what makes a "mysteriously vanished worktree" diagnosable: every land /
+    teardown / undo / snapshot records the action, status, branch, target,
+    worktree path, and key SHAs with a UTC timestamp. Best-effort — auditing
+    must never block or fail the operation it records.
+
+    Args:
+        repo: Primary checkout path.
+        action: The engine subcommand that ran (e.g. ``"teardown"``).
+        outcome: The Outcome the subcommand produced.
+    """
+    try:
+        common = _git_common_dir(repo)
+        log_dir = Path(common) / "worktree-warden"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "action": action,
+            "status": outcome.status,
+            "code": outcome.code,
+            "branch": outcome.branch,
+            "target": outcome.target,
+            "worktree": outcome.worktree,
+            "details": outcome.details,
+        }
+        with (log_dir / "audit.log").open("a") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except Exception:
+        return
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -797,16 +858,27 @@ def main(argv: list[str] | None = None) -> int:
         if args.cmd == "finish-preflight":
             return cmd_finish_preflight(args.worktree, args.target).emit()
         if args.cmd == "land":
-            return cmd_land(args.worktree, args.branch, args.target, repo).emit()
+            outcome = cmd_land(args.worktree, args.branch, args.target, repo)
+            _audit(repo, "land", outcome)
+            return outcome.emit()
         if args.cmd == "rebase-continue":
-            return cmd_rebase_continue(args.worktree, args.branch, args.target, repo).emit()
+            outcome = cmd_rebase_continue(args.worktree, args.branch, args.target, repo)
+            _audit(repo, "rebase-continue", outcome)
+            return outcome.emit()
         if args.cmd == "snapshot":
             branches = [b for b in args.branches.split(",") if b]
-            return cmd_snapshot(repo, args.target, branches, args.out).emit()
+            outcome = cmd_snapshot(repo, args.target, branches, args.out)
+            _audit(repo, "snapshot", outcome)
+            return outcome.emit()
         if args.cmd == "undo":
-            return cmd_undo(repo, args.snapshot).emit()
+            outcome = cmd_undo(repo, args.snapshot)
+            _audit(repo, "undo", outcome)
+            return outcome.emit()
         if args.cmd == "teardown":
-            return cmd_teardown(args.branch, args.target, repo, args.dry_run).emit()
+            outcome = cmd_teardown(args.branch, args.target, repo, args.dry_run)
+            if not args.dry_run:
+                _audit(repo, "teardown", outcome)
+            return outcome.emit()
     except GitError as exc:
         return Outcome(EXIT_GIT_ERROR, "git_error", str(exc)).emit()
     return EXIT_GIT_ERROR
