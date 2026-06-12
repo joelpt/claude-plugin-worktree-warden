@@ -20,6 +20,7 @@ def _wt(
     behind: int = 0,
     session: bool = False,
     recently_active: bool = False,
+    unreadable: bool = False,
 ) -> cw.Worktree:
     """Build a Worktree fixture with only the readiness-relevant fields set."""
     return cw.Worktree(
@@ -31,6 +32,7 @@ def _wt(
         behind=behind,
         session_status="running" if session else "",
         recently_active=recently_active,
+        unreadable=unreadable,
     )
 
 
@@ -43,6 +45,18 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(wt.ready_emoji, "✅")
         self.assertEqual(wt.ready_note, "ready to merge")
         self.assertTrue(wt.is_mergeable)
+
+    def test_unreadable_is_unknown_never_prune(self) -> None:
+        # A failed git query defaults dirty=False, commit_count=0 — which would
+        # otherwise be PRUNE. Unreadable must override that to UNKNOWN.
+        wt = _wt(unreadable=True)
+        self.assertEqual(wt.readiness, cw.Readiness.UNKNOWN)
+        self.assertFalse(wt.is_mergeable)
+        self.assertEqual(wt.ready_note, "state unreadable")
+
+    def test_live_session_outranks_unreadable(self) -> None:
+        wt = _wt(unreadable=True, session=True)
+        self.assertEqual(wt.readiness, cw.Readiness.BLOCKED)
 
     def test_dirty_can_merge_after_commit(self) -> None:
         wt = _wt(dirty=True, commit_count=0)

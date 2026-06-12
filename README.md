@@ -101,7 +101,12 @@ worktrees of the repo your current session belongs to — never cross-repo.
   JSON line to `<git-common-dir>/worktree-warden/audit.log` — recording the
   action, branch, target, worktree path, and key SHAs (the torn-down branch tip,
   the pre-`undo` reset SHAs) — so a vanished worktree is diagnosable and its last
-  commit recoverable, not a mystery.
+  commit recoverable, not a mystery. The `recover` subcommand scans for stranded
+  (`prunable`) worktrees whose branch still holds unlanded commits, and for WIP
+  capture bundles, printing the exact restore command for each (`--gc-days N`
+  expires old bundles). `check_worktrees` now reports a worktree whose git state
+  could not be read as **UNKNOWN** rather than silently classifying it prunable —
+  a flaky `git status` under load can no longer make real work look disposable.
 
 ## Enforcement gate
 

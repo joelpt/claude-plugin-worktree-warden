@@ -48,6 +48,7 @@ class Readiness(str, Enum):
     PRUNE = "prune"  # clean, HEAD == base tip — nothing here, just prune
     COOLDOWN = "cooldown"  # active within the recent window — hold off (overridable)
     BLOCKED = "blocked"  # a live claude session sits inside it
+    UNKNOWN = "unknown"  # git state could not be read — never auto-prune
 
 
 _EMOJI: dict[Readiness, str] = {
@@ -57,6 +58,7 @@ _EMOJI: dict[Readiness, str] = {
     Readiness.PRUNE: "🧹",
     Readiness.COOLDOWN: "⏳",
     Readiness.BLOCKED: "❌",
+    Readiness.UNKNOWN: "❓",
 }
 
 _NOTE: dict[Readiness, str] = {
@@ -66,6 +68,7 @@ _NOTE: dict[Readiness, str] = {
     Readiness.PRUNE: "empty, can be pruned",
     Readiness.COOLDOWN: "active <15m ago",
     Readiness.BLOCKED: "live session",
+    Readiness.UNKNOWN: "state unreadable",
 }
 
 
@@ -89,6 +92,7 @@ class Worktree:
     session_kind: str = ""
     session_name: str = ""
     recently_active: bool = False  # edited or had transcript activity within the window
+    unreadable: bool = False  # a git state query failed — do not trust dirty/commit_count
 
     @property
     def has_session(self) -> bool:
@@ -106,9 +110,19 @@ class Worktree:
         HEAD already in base's chain; `behind > 0` means real history that base
         has moved past (merged), while `behind == 0` means HEAD sits exactly on
         base (empty).
+
+        When a git state query failed (`unreadable`), the dirty/commit_count
+        fields are not trustworthy — a failed `git status` defaults `dirty` to
+        False, which would otherwise misclassify a worktree with real work as
+        PRUNE under exactly the system-stress conditions that make git flaky.
+        Such a worktree is reported UNKNOWN and never offered for auto-merge or
+        pruning; a live session still takes precedence (BLOCKED is the safe call
+        regardless of unreadable git state).
         """
         if self.has_session:
             return Readiness.BLOCKED
+        if self.unreadable:
+            return Readiness.UNKNOWN
         if self.recently_active:
             return Readiness.COOLDOWN
         if self.dirty:
@@ -133,12 +147,17 @@ class Worktree:
     def is_mergeable(self) -> bool:
         """True iff this worktree is *offerable* for auto-merge.
 
-        That means neither blocked by a live session nor on the recent-activity
-        cooldown. Git state may still permit an explicit merge of a cooldown
-        worktree — this gate only governs what is offered/counted automatically,
-        never the engine, so an explicit user request can still land one.
+        That means not blocked by a live session, not on the recent-activity
+        cooldown, and not in an unreadable state. Git state may still permit an
+        explicit merge of a cooldown worktree — this gate only governs what is
+        offered/counted automatically, never the engine, so an explicit user
+        request can still land one.
         """
-        return self.readiness not in (Readiness.BLOCKED, Readiness.COOLDOWN)
+        return self.readiness not in (
+            Readiness.BLOCKED,
+            Readiness.COOLDOWN,
+            Readiness.UNKNOWN,
+        )
 
 
 async def run_git(args: list[str], cwd: str) -> tuple[int, str]:
@@ -334,9 +353,15 @@ async def fill_state(wt: Worktree, base: str, cwd: str) -> None:
     behind_t = run_git(
         ["-C", wt.path, "rev-list", "--count", f"HEAD..{base}"], cwd
     )
-    (_, status), (_, log), (_, last), (brc, behind) = await asyncio.gather(
+    (src, status), (lrc, log), (_, last), (brc, behind) = await asyncio.gather(
         status_t, log_t, last_t, behind_t
     )
+    # A failed status/log query makes dirty/commit_count untrustworthy: an empty
+    # `status` from a *failure* is indistinguishable from a genuinely clean tree,
+    # and defaulting to "clean + 0 commits" would misclassify a worktree holding
+    # real work as prunable — precisely under the system stress that makes git
+    # flaky. Mark it unreadable so readiness reports UNKNOWN, never PRUNE.
+    wt.unreadable = src != 0 or lrc != 0
     wt.dirty = bool(status.strip())
     wt.commits = [ln for ln in log.splitlines() if ln.strip()]
     wt.commit_count = len(wt.commits)
@@ -510,6 +535,7 @@ def to_json(worktrees: list[Worktree]) -> str:
             "session_kind": wt.session_kind,
             "session_name": wt.session_name,
             "recently_active": wt.recently_active,
+            "unreadable": wt.unreadable,
             "category": wt.readiness.value,
             "note": wt.ready_note,
             "ready": wt.is_mergeable,

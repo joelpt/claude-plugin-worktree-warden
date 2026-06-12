@@ -32,6 +32,10 @@ exits with the contract code below):
                    `git reset --hard`) and recreate any torn-down worktree on its
                    branch.
   teardown         idempotent worktree removal + branch -d + prune (post-land).
+  recover          read-only scan for recoverable content: stranded (prunable)
+                   worktrees whose branch holds commits not yet landed, plus WIP
+                   capture bundles, each with the exact restore command. With
+                   --gc-days N, deletes WIP bundles older than N days.
 
 Exit codes:
   0   ok
@@ -806,6 +810,135 @@ def _audit(repo: str, action: str, outcome: Outcome) -> None:
         return
 
 
+def _prunable_worktrees(repo: str) -> list[dict[str, str]]:
+    """Linked worktrees git has marked ``prunable`` (their directory is gone).
+
+    Returns one dict per prunable entry with ``path``, ``branch`` (short name or
+    ""), and ``head`` SHA. These are the stranded worktrees — directory removed
+    out from under git — whose committed work survives under the branch ref and
+    is recoverable by re-adding the worktree.
+    """
+    out = _git(["worktree", "list", "--porcelain"], cwd=repo)
+    blocks = out.split("\n\n")
+    stranded: list[dict[str, str]] = []
+    for block in blocks:
+        path = branch = head = ""
+        prunable = False
+        for line in block.splitlines():
+            if line.startswith("worktree "):
+                path = line[len("worktree ") :]
+            elif line.startswith("branch "):
+                branch = line[len("branch ") :].removeprefix("refs/heads/")
+            elif line.startswith("HEAD "):
+                head = line[len("HEAD ") :]
+            elif line.startswith("prunable"):
+                prunable = True
+        if prunable and path:
+            stranded.append({"path": path, "branch": branch, "head": head})
+    return stranded
+
+
+class WipBundle(TypedDict):
+    """A captured WIP bundle file on disk."""
+
+    path: str
+    size: int
+    mtime: float
+
+
+def _wip_bundles(repo: str) -> list[WipBundle]:
+    """List WIP capture bundles under ``<git-common-dir>/worktree-warden/wip``."""
+    try:
+        wip_dir = Path(_git_common_dir(repo)) / "worktree-warden" / "wip"
+        if not wip_dir.is_dir():
+            return []
+        bundles: list[WipBundle] = []
+        for f in sorted(wip_dir.glob("*.bundle")):
+            st = f.stat()
+            bundles.append(
+                WipBundle(path=str(f), size=st.st_size, mtime=st.st_mtime)
+            )
+        return bundles
+    except (OSError, GitError):
+        # GitError from _git_common_dir is best-effort here, like OSError: a WIP
+        # listing failure must not break cmd_recover's Outcome contract.
+        return []
+
+
+def cmd_recover(repo: str, target: str, gc_days: float | None) -> Outcome:
+    """Surface recoverable content: stranded worktrees + WIP capture bundles.
+
+    Read-only by default. Lists every ``prunable`` worktree (directory gone,
+    branch ref alive) — flagging which still hold commits not landed in
+    ``target`` — and every WIP bundle, each with the exact command to restore it.
+    With ``gc_days`` set, deletes WIP bundles older than that many days (the only
+    mutation; stranded worktrees and branch refs are never touched here).
+
+    Args:
+        repo: Primary checkout path.
+        target: Default branch, for the landed/unlanded determination.
+        gc_days: If set, delete WIP bundles older than this age in days.
+
+    Returns:
+        Outcome whose ``details`` carries ``stranded`` (list), ``bundles``
+        (list), and ``gc_removed`` (list of deleted bundle paths).
+    """
+    base = Outcome(EXIT_OK, "recover", "", target=target)
+    try:
+        stranded_raw = _prunable_worktrees(repo)
+    except GitError as exc:
+        return Outcome(EXIT_GIT_ERROR, "git_error", str(exc), target=target)
+
+    qrepo = shlex.quote(repo)
+    stranded: list[dict[str, object]] = []
+    for wt in stranded_raw:
+        branch, head = wt["branch"], wt["head"]
+        qpath = shlex.quote(wt["path"])
+        # `prune` first: a prunable worktree's admin record is still registered,
+        # so a bare `worktree add` fails ("missing but already registered").
+        prune = f"git -C {qrepo} worktree prune && "
+        if branch and _branch_exists(branch, repo):
+            unlanded = not _is_ancestor(branch, target, repo)
+            recovery = f"{prune}git -C {qrepo} worktree add {qpath} {shlex.quote(branch)}"
+        elif head:
+            # Detached HEAD: the commits live only at this SHA with no branch ref,
+            # so re-add detached to keep them reachable (and recoverable).
+            unlanded = not _is_ancestor(head, target, repo)
+            recovery = f"{prune}git -C {qrepo} worktree add --detach {qpath} {shlex.quote(head)}"
+        else:
+            unlanded = False
+            recovery = ""
+        stranded.append({**wt, "unlanded": unlanded, "recovery": recovery})
+
+    bundles = _wip_bundles(repo)
+    gc_removed: list[str] = []
+    if gc_days is not None:
+        cutoff = time.time() - gc_days * 86400
+        for b in bundles:
+            if float(b["mtime"]) < cutoff:
+                try:
+                    Path(str(b["path"])).unlink()
+                    gc_removed.append(str(b["path"]))
+                except OSError:
+                    pass
+        bundles = [b for b in bundles if str(b["path"]) not in gc_removed]
+
+    unlanded_n = sum(1 for s in stranded if s["unlanded"])
+    base.status = "recover"
+    base.message = (
+        f"{len(stranded)} stranded worktree(s) ({unlanded_n} with unlanded "
+        f"commits), {len(bundles)} WIP bundle(s)"
+        + (f", {len(gc_removed)} bundle(s) gc'd" if gc_days is not None else "")
+        + "."
+    )
+    base.details = {
+        "stranded": stranded,
+        "bundles": bundles,
+        "gc_removed": gc_removed,
+    }
+    return base
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="worktree_engine.py")
     parser.add_argument("--repo", default=os.getcwd(), help="Primary checkout (default: cwd).")
@@ -849,6 +982,15 @@ def main(argv: list[str] | None = None) -> int:
     p_td.add_argument("--target", default="main")
     p_td.add_argument("--dry-run", action="store_true")
 
+    p_rec = sub.add_parser("recover")
+    p_rec.add_argument("--target", default="main")
+    p_rec.add_argument(
+        "--gc-days",
+        type=float,
+        default=None,
+        help="Delete WIP bundles older than this many days (the only mutation).",
+    )
+
     args = parser.parse_args(argv)
     repo = args.repo
     try:
@@ -878,6 +1020,11 @@ def main(argv: list[str] | None = None) -> int:
             outcome = cmd_teardown(args.branch, args.target, repo, args.dry_run)
             if not args.dry_run:
                 _audit(repo, "teardown", outcome)
+            return outcome.emit()
+        if args.cmd == "recover":
+            outcome = cmd_recover(repo, args.target, args.gc_days)
+            if args.gc_days is not None:
+                _audit(repo, "recover-gc", outcome)
             return outcome.emit()
     except GitError as exc:
         return Outcome(EXIT_GIT_ERROR, "git_error", str(exc)).emit()
