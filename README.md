@@ -140,17 +140,37 @@ When the gate blocks Claude, its guidance names the
 `worktree-warden:request-exception` and `worktree-warden:finish-exception` skills —
 thin wrappers around the same `grant` / `finished` commands shown above.
 
-At SessionStart the hook also runs two best-effort safety passes (independent of
-the banner). First it **captures the WIP of any dirty worktree** it finds — the
-backstop for a *force-quit*, which kills the session before its Stop hook can
-capture (graceful-Stop capture cannot help there). Second it **snapshots the
-repo's worktree population** and diffs it against the previous session: a
-worktree that was present last time, is gone now, still held content (dirty or
-unlanded commits), and that warden's own audit log does **not** account for is
-surfaced as an **external removal** — named, with its last-known SHA and a
-recovery command. That is what turns "a worktree mysteriously vanished" into "X
-was removed by something other than warden between session A and B; recover it
+At SessionStart the hook also runs three best-effort safety passes (independent of
+the banner). First it **checks for gate-load-error**: if either the PreToolUse edit
+gate or the destruction gate failed to import their modules, a high-priority advisory
+is surfaced (visible even when `startup_display` is `"never"`), warning that the gate
+is OPEN and restoration requires fixing the plugin installation. Second it **captures
+the WIP of any dirty worktree** it finds — the backstop for a *force-quit*, which
+kills the session before its Stop hook can capture (graceful-Stop capture cannot help
+there). Third it **snapshots the repo's worktree population** and diffs it against
+the previous session: a worktree that was present last time, is gone now, still held
+content (dirty or unlanded commits), and that warden's own audit log does **not**
+account for is surfaced as an **external removal** — named, with its last-known SHA
+and a recovery command. That is what turns "a worktree mysteriously vanished" into
+"X was removed by something other than warden between session A and B; recover it
 with this command."
+
+#### Gate load failure (fail-open loudly)
+
+The **PreToolUse edit gate** and **destruction gate** each wrap their module imports
+in try/except: if `worktree_gate` or `worktree_destruction` fail to import (due to a
+syntax error, broken dependency, or misplaced installation), the hook:
+
+- Writes a diagnostic to stderr immediately, naming the module that failed and its error.
+- Drops a **sentinel file** at `<git-common-dir>/worktree-warden/gate-load-error`,
+  recording a timestamp and the module name.
+- Exits 0 deliberately (documented fail-open), allowing the edit or operation.
+
+The **SessionStart hook** detects the sentinel and surfaces a high-priority advisory
+(see example above). This ensures a plugin deployment error is never silent — every
+user sees the diagnostic immediately when they start a session. The fix is to
+restore the plugin installation (e.g. re-run `npm install` or verify the Python
+path), then retry the session.
 
 ### Settings & opt-out
 

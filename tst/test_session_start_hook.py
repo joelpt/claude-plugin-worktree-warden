@@ -15,6 +15,8 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import tempfile
+from pathlib import Path
 from unittest import TestCase, mock
 
 import check_worktrees as cw
@@ -201,3 +203,64 @@ class MainEmitTest(TestCase):
         self.assertEqual(rc, 0)
         emitted = json.loads(out)
         self.assertIn("⚠️", emitted["systemMessage"])
+
+
+class GateLoadErrorSentinelTest(TestCase):
+    """main() surfaces gate-load-error sentinel as a high-priority advisory."""
+
+    def _run_main_patched(
+        self,
+        *,
+        load_error_advisory: str,
+        mode: str = "never",
+        enforcement: bool = False,
+        worktrees: list[cw.Worktree] | None = None,
+    ) -> tuple[int, str]:
+        """Drive main() with _read_load_error_advisory stubbed to return a fixed value."""
+        payload = json.dumps({"source": "startup", "cwd": "/repo"})
+        with (
+            mock.patch.object(hook, "is_main_worktree", return_value=True),
+            mock.patch.object(
+                hook, "get_gate_state", return_value=(mode, enforcement, None)
+            ),
+            mock.patch.object(hook, "gather", return_value=worktrees or []),
+            mock.patch.object(hook, "_read_load_error_advisory", return_value=load_error_advisory),
+            mock.patch("sys.stdin", io.StringIO(payload)),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            rc = hook.main()
+        return rc, out.getvalue()
+
+    def test_gate_load_error_advisory_prepended_to_system_message(self) -> None:
+        advisory = "⚠️ gate-load-error: worktree_gate failed to import"
+        rc, out = self._run_main_patched(load_error_advisory=advisory, mode="never")
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.strip(), "Expected output when sentinel advisory present")
+        emitted = json.loads(out)
+        self.assertIn("systemMessage", emitted)
+        self.assertIn("gate-load-error", emitted["systemMessage"])
+
+    def test_gate_load_error_advisory_absent_when_no_sentinel(self) -> None:
+        rc, out = self._run_main_patched(load_error_advisory="", mode="never")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "")
+
+    def test_gate_load_error_advisory_absent_when_git_common_dir_none(self) -> None:
+        advisory = hook._read_load_error_advisory(None)
+        self.assertEqual(advisory, "")
+
+    def test_read_load_error_advisory_returns_string_when_sentinel_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            warden_dir = Path(tmpdir) / "worktree-warden"
+            warden_dir.mkdir()
+            (warden_dir / "gate-load-error").write_text("2026-01-01T00:00:00Z enforce_worktree_hook\n")
+            advisory = hook._read_load_error_advisory(tmpdir)
+            self.assertTrue(advisory, "Expected non-empty advisory string")
+            self.assertIn("gate-load-error", advisory)
+
+    def test_read_load_error_advisory_returns_empty_when_no_sentinel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            warden_dir = Path(tmpdir) / "worktree-warden"
+            warden_dir.mkdir()
+            advisory = hook._read_load_error_advisory(tmpdir)
+            self.assertEqual(advisory, "")
