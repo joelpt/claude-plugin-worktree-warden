@@ -39,6 +39,54 @@ if TYPE_CHECKING:
 
 ALLOWED_SOURCES = {"startup", "resume"}
 
+_GATE_LOAD_ERROR_ADVISORY = (
+    "⚠️  gate-load-error: worktree-warden hooks failed to import their gate module "
+    "at last startup — the worktree gate and destruction gate are OPEN "
+    "(all edits and destructive operations are allowed). "
+    "Fix the plugin installation to restore protection. "
+    "Sentinel: <git-common-dir>/worktree-warden/gate-load-error"
+)
+
+
+def _read_load_error_advisory(git_common_dir: str | None) -> str:
+    """Return a high-priority advisory string if the gate-load-error sentinel exists.
+
+    Args:
+        git_common_dir: Absolute path to the git common directory, or None.
+
+    Returns:
+        Non-empty advisory string when the sentinel is present, empty string otherwise.
+        Never raises.
+    """
+    if not git_common_dir:
+        return ""
+    try:
+        sentinel = Path(git_common_dir) / "worktree-warden" / "gate-load-error"
+        if sentinel.exists():
+            return _GATE_LOAD_ERROR_ADVISORY
+        return ""
+    except Exception:
+        return ""
+
+
+def _get_git_common_dir(cwd: str) -> str | None:
+    """Return the git common dir for cwd, or None on any error."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return None
+        common = proc.stdout.strip()
+        if not os.path.isabs(common):
+            common = str(Path(cwd) / common)
+        return common
+    except Exception:
+        return None
+
 
 def read_stdin() -> dict[str, object]:
     try:
@@ -202,7 +250,12 @@ def main() -> int:
         return 0
 
     mode, enforcement_active, disabled_scope = get_gate_state(cwd)
-    if mode == "never" and not enforcement_active and disabled_scope != "project":
+
+    # Gate-load-error is the highest-priority advisory: the hooks are not running.
+    # Check it before the early-exit so it surfaces even in "never" mode.
+    load_error_advisory = _read_load_error_advisory(_get_git_common_dir(cwd))
+
+    if mode == "never" and not enforcement_active and disabled_scope != "project" and not load_error_advisory:
         return 0
 
     # Force-quit backstop + external-removal detection. Both are best-effort and
@@ -235,6 +288,14 @@ def main() -> int:
         existing = output.get("systemMessage", "")
         output["systemMessage"] = (
             removal_advisory + ("\n\n" + existing if existing else "")
+        )
+
+    # Gate-load-error is the highest-priority advisory — prepend above all other
+    # content, and surface it even when startup_display is "never".
+    if load_error_advisory:
+        existing = output.get("systemMessage", "")
+        output["systemMessage"] = (
+            load_error_advisory + ("\n\n" + existing if existing else "")
         )
 
     if enforcement_active:

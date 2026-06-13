@@ -18,8 +18,10 @@ The nuclear option remains disabling the plugin.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -33,7 +35,45 @@ _SCRIPTS_DIR = (
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
-import worktree_gate as gate  # noqa: E402  -- sibling module, path bootstrapped above
+try:
+    import worktree_gate as gate  # noqa: E402  -- sibling module, path bootstrapped above
+
+    _IMPORT_ERROR: ImportError | None = None
+except (ImportError, Exception) as _exc:
+    _IMPORT_ERROR = _exc if isinstance(_exc, ImportError) else ImportError(str(_exc))
+
+
+def _drop_load_error_sentinel(_scripts_dir_for_import: Path, cwd: str | None) -> None:
+    """Write a stderr diagnostic and drop the gate-load-error sentinel file.
+
+    Self-contained stdlib-only: worktree_gate is unavailable at this call site,
+    so the git-common-dir must be resolved via subprocess.  Never raises.
+    """
+    module_name = "worktree_gate"
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    sys.stderr.write(
+        f"worktree-warden: failed to import {module_name} from {_scripts_dir_for_import} — "
+        f"gate is OPEN (all edits allowed). Fix the plugin installation to restore protection.\n"
+        f"Error: {_IMPORT_ERROR}\n"
+    )
+    try:
+        effective_cwd = cwd or os.getcwd()
+        proc = subprocess.run(
+            ["git", "-C", effective_cwd, "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if proc.returncode != 0:
+            return
+        git_common_dir = proc.stdout.strip()
+        if not os.path.isabs(git_common_dir):
+            git_common_dir = str(Path(effective_cwd) / git_common_dir)
+        sentinel = Path(git_common_dir) / "worktree-warden" / "gate-load-error"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text(f"{ts} {module_name}\n")
+    except Exception:
+        pass
 
 
 def _emit_unborn_notice(facts: gate.GitFacts, file_path: str | None) -> None:
@@ -70,6 +110,15 @@ def _emit_unborn_notice(facts: gate.GitFacts, file_path: str | None) -> None:
 
 def main() -> int:
     """Evaluate the pending Edit/Write and block it when the gate says so."""
+    if _IMPORT_ERROR is not None:
+        try:
+            payload = json.load(sys.stdin)
+        except Exception:
+            payload = {}
+        cwd = payload.get("cwd") if isinstance(payload, dict) else None
+        _drop_load_error_sentinel(_SCRIPTS_DIR, cwd)
+        return 0
+
     try:
         payload = json.load(sys.stdin)
     except Exception:
