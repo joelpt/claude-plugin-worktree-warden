@@ -4,9 +4,10 @@
 Runs the real ``enforce_worktree_hook.py`` (fed the Claude Code stdin contract)
 and the ``worktree_gate.py`` CLI as subprocesses against a throwaway git repo,
 asserting the full enforcement lifecycle: block, grant, allow, finished, block,
-the linked-worktree allow path, and the disable/enable round-trip. Isolated via
-a temp repo and a temp ``XDG_CONFIG_HOME`` so it never touches the real gate
-config or audit log.
+the linked-worktree allow path, and the disable/enable round-trip. Then exercises
+the ``worktree_lock.py`` CLI: acquire, block a second owner, release, reacquire,
+force-unlock. Isolated via a temp repo and a temp ``XDG_CONFIG_HOME`` so it never
+touches the real gate config or audit log.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent
 _HOOK = _ROOT / "hooks" / "enforce_worktree_hook.py"
 _GATE = _ROOT / "scripts" / "worktree_gate.py"
+_LOCK = _ROOT / "scripts" / "worktree_lock.py"
 
 
 class _Smoke:
@@ -93,6 +95,18 @@ def _cli(repo: Path, env: Mapping[str, str], *args: str) -> str:
     return proc.stdout
 
 
+def _lock(repo: Path, env: Mapping[str, str], *args: str) -> tuple[int, str]:
+    """Run the lock CLI in repo and return its exit code and stdout."""
+    proc = subprocess.run(
+        [sys.executable, str(_LOCK), *args],
+        capture_output=True,
+        text=True,
+        cwd=str(repo),
+        env=env,
+    )
+    return proc.returncode, proc.stdout
+
+
 def _seed_repo(repo: Path) -> None:
     """Create a minimal committed git repo at repo."""
     repo.mkdir()
@@ -145,6 +159,19 @@ def main() -> int:
         smoke.check("disable lifts the gate", _run_hook(repo, env)[0] == 0)
         _cli(repo, env, "enable")
         smoke.check("enable restores the gate", _run_hook(repo, env)[0] == 2)
+
+        rc_a, _ = _lock(repo, env, "acquire-main", "--repo", str(repo), "--owner", "S1", "smoke")
+        smoke.check("lock acquire-main succeeds (exit 0)", rc_a == 0)
+        rc_b, out_b = _lock(repo, env, "acquire-main", "--repo", str(repo), "--owner", "S2", "x")
+        smoke.check("second owner blocked (exit 1, names holder)", rc_b == 1 and "S1" in out_b)
+        rc_s, out_s = _lock(repo, env, "status", "--repo", str(repo))
+        smoke.check("status reports the active lock", rc_s == 0 and "S1" in out_s)
+        _lock(repo, env, "release-main", "--repo", str(repo), "--owner", "S1")
+        rc_c, _ = _lock(repo, env, "acquire-main", "--repo", str(repo), "--owner", "S2", "again")
+        smoke.check("lock acquirable after release", rc_c == 0)
+        _lock(repo, env, "force-unlock", "--repo", str(repo))
+        _, out_st = _lock(repo, env, "status", "--repo", str(repo))
+        smoke.check("force-unlock clears the lock", "no active locks" in out_st)
 
     if smoke.failures:
         print(f"SMOKE FAIL ({len(smoke.failures)})")

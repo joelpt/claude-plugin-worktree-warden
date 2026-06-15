@@ -27,6 +27,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -223,7 +224,15 @@ def _git_common_dir(cwd: str) -> Path | None:
 
 
 def _gate_modules_importable() -> bool:
-    """Return True iff both PreToolUse gate modules import cleanly right now."""
+    """Return True iff both PreToolUse gate modules import cleanly right now.
+
+    Mirrors exactly the modules the edit/destruction hooks import at top level
+    (which is what drops the gate-load-error sentinel): ``worktree_gate`` and
+    ``worktree_destruction``. It deliberately excludes ``worktree_lock`` -- those
+    safety gates do not depend on it, so a broken lock module must not keep this
+    self-heal from clearing a genuinely-fixed gate error (that would be the very
+    false-persistent-alarm this self-heal exists to avoid).
+    """
     import importlib  # noqa: PLC0415
 
     try:
@@ -232,6 +241,40 @@ def _gate_modules_importable() -> bool:
     except Exception:
         return False
     return True
+
+
+def lock_advisory(cwd: str) -> str | None:
+    """Surface this repo's active/stale worktree-warden locks, or None if quiet.
+
+    Best-effort awareness at SessionStart: an active main-target lock means a
+    merge/bumpall is running in another session; a stale one is the residue of a
+    force-killed holder and is shown with the exact ``force-unlock`` command.
+
+    Args:
+        cwd: Session working directory, used to locate the repo's lock store.
+
+    Returns:
+        The advisory text, or None when there is nothing to report.
+    """
+    common = _git_common_dir(cwd)
+    if common is None:
+        return None
+    try:
+        import worktree_lock  # noqa: PLC0415
+    except Exception:
+        # The lock module is a coordination aid, not a safety gate, so a broken
+        # import does NOT disable the edit/destruction gates (they don't import
+        # it) -- but it does silently drop merge/bumpall serialization, so say so
+        # loudly here, decoupled from the gate-load-error path.
+        return (
+            "⚠️  worktree-warden: the lock module failed to import — merges and "
+            "/bumpall will NOT be serialized across sessions until it is fixed "
+            "(scripts/worktree_lock.py). The safety gates are unaffected."
+        )
+    try:
+        return worktree_lock.session_advisory(str(common), time.time())
+    except Exception:
+        return None
 
 
 def gate_load_error_advisory(cwd: str) -> str | None:
@@ -296,12 +339,21 @@ def main() -> int:
     except Exception:
         advisory = ""
 
+    # Also resolved before the display-mode early return: a stale lock is
+    # actionable (force-unlock) and must surface even when banners are off.
+    lock_note = ""
+    try:
+        lock_note = lock_advisory(cwd) or ""
+    except Exception:
+        lock_note = ""
+
     mode, enforcement_active, disabled_scope = get_gate_state(cwd)
     if (
         mode == "never"
         and not enforcement_active
         and disabled_scope != "project"
         and not advisory
+        and not lock_note
     ):
         return 0
 
@@ -327,6 +379,12 @@ def main() -> int:
         banner = build_banner(gather(cwd), mode)
         if banner:
             output["systemMessage"] = banner
+
+    # Lock awareness sits just above the routine worktree banner, below the more
+    # urgent removal / project-disabled / gate-load notices prepended after it.
+    if lock_note:
+        existing = output.get("systemMessage", "")
+        output["systemMessage"] = lock_note + ("\n\n" + existing if existing else "")
 
     # An external-removal advisory is high-priority — surface it above the banner,
     # and independently of startup_display (the user must see a silent loss even

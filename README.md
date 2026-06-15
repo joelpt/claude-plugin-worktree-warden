@@ -115,6 +115,13 @@ worktrees of the repo your current session belongs to — never cross-repo.
   expires old bundles). `check_worktrees` now reports a worktree whose git state
   could not be read as **UNKNOWN** rather than silently classifying it prunable —
   a flaky `git status` under load can no longer make real work look disposable.
+- `scripts/worktree_lock.py` — cooperative, advisory **concurrency lock** plus the
+  `worktree-lock` CLI (`acquire-main`, `release-main`, `refresh-main`, `status`,
+  `force-unlock [--all]`). Serializes multi-step operations git can't (the
+  multi-process merge above all): one lock per `realpath(worktree-toplevel)` in
+  `<git-common-dir>/worktree-warden/locks.json`, owner = session id, each
+  check-and-set guarded by a short-lived `flock`. Used by `/merge-worktrees`,
+  `/bumpall`, and the engine; surfaced at SessionStart. See *Concurrency lock* below.
 
 ## Enforcement gate
 
@@ -222,6 +229,38 @@ Bundles live outside all refs (invisible to `git log`/`git branch`), so if the
 worktree directory is later removed by something the destruction gate can't see
 (e.g. the harness's own background-isolation cleanup), the WIP is still
 recoverable. `recover` lists the bundles; `recover --gc-days N` expires old ones.
+
+## Concurrency lock (serialize merges / main edits)
+
+Git has no "lock this branch for a span of work" primitive — only transient single-operation
+locks (`index.lock`, `refs/heads/<b>.lock`). worktree-warden adds a cooperative advisory lock
+for the **multi-step** operations git leaves unguarded, because running many concurrent
+sessions/agents otherwise lets two merges (or a merge and a direct main edit) interleave on
+the default branch — and the merge is itself many separate engine processes, not one.
+
+- **One key per worktree.** A lock is keyed by `realpath(worktree-toplevel)`. The main
+  checkout is itself a worktree, so its toplevel is the shared "main-target" key: two
+  `/merge-worktrees` (or `/finish-worktree`) runs, and a merge racing a direct main edit, all
+  contend on it; work in *different* worktrees never contends.
+- **Owner = session id** (`$CLAUDE_CODE_SESSION_ID`), so a lock is re-entrant for its holder.
+- **Crash-safe staleness.** The `flock` is held only for each tiny check-and-set, never across
+  the merge — a force-killed holder leaves no flock behind, only a record whose sliding lease
+  lapses after a generous window. The deterministic escape is one command (also shown at
+  SessionStart when a lock looks stale):
+
+  ```bash
+  worktree_lock status --repo <path>          # who holds what, and whether it's stale
+  worktree_lock force-unlock --repo <path>    # clear a stale lock from a dead session
+  ```
+
+- **Fail-open and decoupled.** Any lock-subsystem error proceeds *without* a lock. The
+  edit/destruction gates do **not** depend on this module, so a lock bug can never disable
+  enforcement; a broken lock module is surfaced loudly at SessionStart instead.
+- **What uses it:** `/merge-worktrees` acquires the main-target lock for the whole land and
+  releases it at every terminal exit (the engine renews the lease per subcommand); `/bumpall`
+  takes it per repo and reports `SKIPPED (locked)` rather than racing another session.
+
+This is distinct from native `git worktree lock` (an anti-prune marker for removable media).
 
 ## Safety
 

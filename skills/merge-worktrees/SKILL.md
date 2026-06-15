@@ -13,7 +13,8 @@ subcommand; you only fill the judgement gaps (conflict resolution, ordering, tes
 decisions). Repo-scoped: only ever this repo's worktrees.
 
 `ENGINE=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_engine.py`,
-`GATE=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_gate.py`, `REPO=<primary checkout path>`,
+`GATE=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_gate.py`,
+`LOCK=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_lock.py`, `REPO=<primary checkout path>`,
 `TARGET` and cleanliness resolved by **preflight** (see below). Engine exit codes: `0` ok
 · `10` n/a (already merged / on target) · `11` worktree dirty · `12` primary unsafe
 · `13` rebase conflict (LEFT IN PROGRESS) · `14` ff-merge failed · `15` git error
@@ -27,6 +28,9 @@ decisions). Repo-scoped: only ever this repo's worktrees.
   and only safe because we commit everything and snapshot *after* the last commit (no
   uncommitted tracked work exists; `--hard` never touches untracked files). Mid-rebase
   conflicts use the engine's own abort, never a reset.
+- **Serialized to one merge at a time.** Step 0 takes a main-target lock so a second merge —
+  or a session editing `main` directly — cannot interleave on `$TARGET`. It must be released
+  at every terminal exit (see step 0's release discipline).
 - Respect the active project's CLAUDE.md (e.g. TACO SSH-approval gates).
 
 ## Inputs
@@ -56,7 +60,40 @@ python3 $ENGINE --repo $REPO preflight --branches <b1,b2,…>
 ```
 
 Read `details.target` → `TARGET`. Read `details.worktrees` → `[{branch, path, clean, dirty_files}]`.
-This single call gives you everything steps 0–1 need; proceed directly to step 1.
+This single call gives you everything steps 0–1 need; proceed directly to step 0.
+
+## 0. Acquire the merge lock (serialize against other merges / main edits)
+
+Before any commit, snapshot, or land, take the main-target lock so a second merge — or a
+session editing `main` directly — cannot interleave on `$TARGET`:
+
+```bash
+python3 $LOCK --repo $REPO acquire-main "merge-worktrees: landing <b1,b2,…> into $TARGET"
+```
+
+- **exit 0 (`LOCK ACQUIRED`/`REFRESHED`)** → proceed to step 1. The lock is yours; every
+  engine call below renews its lease automatically.
+- **exit 1 (`LOCK BLOCKED`)** → another session holds it. **Pause** and `AskUserQuestion`,
+  surfacing the holder + how long ago it was active (from the command output): options are
+  *wait and retry*, or *force-unlock* only if you are certain that session is dead
+  (`python3 $LOCK --repo $REPO force-unlock`). Never force-unlock unprompted.
+- **`⚠️ … proceeding WITHOUT a lock`** (fail-open: no session id, not a repo) → the lock
+  subsystem stepped aside; continue, but the cross-session guard is off for this run.
+- **A Python traceback / any output that is not one of the above** → the lock module itself
+  is broken. Treat it as fail-open: proceed WITHOUT the lock and note it; never read a crash
+  as `LOCK BLOCKED`.
+
+**Release discipline — the lock MUST be released at every terminal exit of this skill:**
+after successful teardown (step 7), after an `undo`+abandon (step 6 b.3/b.4), after the
+3-failed-rounds post-mortem (step 6), and on any hard-stop refusal you report (step 5 codes
+`11`/`12`/`14`/`15`/`17`). The command is always:
+
+```bash
+python3 $LOCK --repo $REPO release-main
+```
+
+A forgotten lock self-expires after its lease and SessionStart surfaces it with the
+force-unlock command — but release explicitly; don't lean on the backstop.
 
 ## 1. Commit dirty worktrees (one at a time)
 
@@ -88,13 +125,14 @@ worktrees rebase onto earlier ones. Confidence-gated:
   `AskUserQuestion` explaining the conundrum in plain terms (summarize; no internal
   step/option names), recommend a path with rationale. The clear case skips all of this.
 
-## 4. Race re-check (per worktree, just before its land)
+## 4. Be in the primary checkout before landing
 
-Re-run `claude agents --json`. If the only session inside this worktree is **this** session,
-call `ExitWorktree(action:"keep")` and re-check (if ExitWorktree is a no-op — session
-started directly in the worktree — fall back to `cd $REPO` via Bash, then skip the
-re-check; engine calls use `--repo $REPO` explicitly). If **another** session occupies it →
-skip + pause + explain.
+The step-0 main-target lock already guarantees no other session is merging to `$TARGET` or
+editing `main` while this runs, so the old per-worktree `claude agents --json` re-check is
+gone (it was unreliable anyway — `claude agents` lists only background sessions). All that
+remains is to ensure the session cwd is the primary checkout: if still inside a linked
+worktree, `ExitWorktree(action:"keep")`, or `cd $REPO` via Bash if that is a no-op. Engine
+calls pass `--repo $REPO` explicitly regardless.
 
 ## 5. Land in order
 
@@ -113,7 +151,8 @@ For each branch in order:
   loop on repeated `13`. When the branch lands (`0`) or you stop, close it:
   `python3 $GATE finished`.
 - `10` → already merged; skip to teardown for it. `11`/`12`/`14`/`15`/`17` → stop, report
-  `message` verbatim (these are preflight/safety refusals, not things to force).
+  `message` verbatim (these are preflight/safety refusals, not things to force), **then
+  release the lock** (`python3 $LOCK --repo $REPO release-main`).
 
 ## 6. Verify + test (ALWAYS, after all lands)
 
@@ -141,12 +180,20 @@ Expect: clean status + expected commits visible. Then run the suite: Justfile `t
     <snap.snapshot_file>` (the snapshot file persists under the git dir, so undo can recreate
     the torn-down worktrees even after step 7). After 3 failed rounds: stop + post-mortem
     (what was tried / what happened / best explanation / next steps).
+    **On abandon (b.3/b.4), release the merge lock** (`python3 $LOCK --repo $REPO release-main`)
+    once you finish the undo/handoff.
 
 ## 7. Teardown (only on green: verify clean AND tests pass)
 
 For each successfully landed worktree:
 `python3 $ENGINE --repo $REPO teardown --branch <branch> --target $TARGET`
 `0` = pruned/no-op; non-zero = refused (report verbatim, never force).
+
+Then **release the merge lock** — the operation is done:
+
+```bash
+python3 $LOCK --repo $REPO release-main
+```
 
 ## 8. Summary
 

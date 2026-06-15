@@ -939,6 +939,38 @@ def cmd_recover(repo: str, target: str, gc_days: float | None) -> Outcome:
     return base
 
 
+def _refresh_main_lease(repo: str) -> None:
+    """Best-effort renew this session's main-target lock lease (never raises).
+
+    The merge skill acquires the main-target lock once and holds it for the whole
+    operation, but each engine subcommand is a separate process, so the lease
+    would otherwise only be renewed at acquire time. Renewing it on entry to each
+    mutating step keeps a long merge's lease alive across steps. The gaps between
+    steps (conflict resolution, ``just test``, HITL pauses) are deliberately not
+    covered here -- the generous lease window and ``force-unlock`` are the
+    backstops. Everything is lazy and guarded: a missing/broken lock module, an
+    absent session id, or any IO error simply skips the refresh so the engine
+    (and the merge) is never broken by the lock subsystem.
+
+    Args:
+        repo: The primary checkout path (the main-target key).
+    """
+    try:
+        import worktree_lock  # noqa: PLC0415  -- lazy + guarded (fail-open)
+
+        owner = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        if not owner:
+            return
+        facts = worktree_lock.main_facts(repo)  # keys on the primary, like acquire
+        if facts.is_repo and facts.git_common_dir is not None:
+            worktree_lock.refresh(facts, owner, time.time())
+    except Exception:
+        pass
+
+
+_LEASE_REFRESH_CMDS = frozenset({"land", "rebase-continue", "snapshot", "teardown", "undo"})
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="worktree_engine.py")
     parser.add_argument("--repo", default=os.getcwd(), help="Primary checkout (default: cwd).")
@@ -993,6 +1025,8 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     repo = args.repo
+    if args.cmd in _LEASE_REFRESH_CMDS:
+        _refresh_main_lease(repo)
     try:
         if args.cmd == "preflight":
             branches = [b for b in args.branches.split(",") if b]

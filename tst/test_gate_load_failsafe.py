@@ -192,5 +192,66 @@ class SessionStartSurfacingTest(_TempPluginRepo):
             self.assertNotIn("FAILED TO LOAD", proc.stdout)
 
 
+class LockModuleDecouplingTest(_TempPluginRepo):
+    """A broken ``worktree_lock`` must NOT disable the safety gates (Phase 1).
+
+    The lock is a coordination aid the edit/destruction hooks do not import, so a
+    broken lock module must leave those gates fully functional and drop no
+    gate-load-error sentinel -- the opposite of failing the gate open.
+    """
+
+    def test_broken_lock_leaves_edit_gate_blocking(self) -> None:
+        self._copy_real_script("worktree_gate.py")
+        self._break_script("worktree_lock.py")
+        hook = self._copy_hook("enforce_worktree_hook.py")
+        proc = self._run(
+            hook,
+            {
+                "tool_name": "Edit",
+                "cwd": str(self.repo),
+                "tool_input": {"file_path": str(self.repo / "src" / "x.py")},
+            },
+        )
+        self.assertEqual(proc.returncode, 2)  # main-checkout edit still BLOCKED
+        self.assertIn("Worktree gate", proc.stderr)
+        self.assertFalse(self.sentinel.exists())  # gate modules fine → no sentinel
+
+    def test_broken_lock_leaves_destruction_guard_evaluating(self) -> None:
+        self._copy_real_script("worktree_gate.py")
+        self._copy_real_script("worktree_destruction.py")
+        self._break_script("worktree_lock.py")
+        hook = self._copy_hook("guard_destruction_hook.py")
+        proc = self._run(
+            hook,
+            {
+                "tool_name": "Bash",
+                "cwd": str(self.repo),
+                "tool_input": {"command": "rm -rf /tmp/not-a-worktree-xyz"},
+            },
+        )
+        self.assertEqual(proc.returncode, 0)  # ran to a verdict, no import crash
+        self.assertFalse(self.sentinel.exists())
+
+
+class LockLoadAdvisoryTest(_TempPluginRepo):
+    """SessionStart surfaces a broken lock module, decoupled from the gate path."""
+
+    def test_session_start_surfaces_broken_lock_module(self) -> None:
+        for name in (
+            "worktree_gate.py",
+            "check_worktrees.py",
+            "worktree_wip.py",
+            "worktree_population.py",
+        ):
+            self._copy_real_script(name)
+        self._break_script("worktree_lock.py")
+        hook = self._copy_hook("check_worktrees_hook.py")
+        proc = self._run(hook, {"source": "startup", "cwd": str(self.repo)})
+        self.assertEqual(proc.returncode, 0)
+        out = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        self.assertIn("lock module failed to import", out.get("systemMessage", ""))
+        self.assertFalse(self.sentinel.exists())  # gates fine → no gate sentinel
+
+
 if __name__ == "__main__":
     unittest.main()

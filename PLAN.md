@@ -22,6 +22,7 @@ The verdict that frames every milestone: **the philosophy and the core mechanism
 - **The destruction gate is a speedbump for naive agent commands, not a security boundary.** It cannot see `bash -c`, `xargs`, command substitution, or scripts — by design. Native `git worktree lock` plus the WIP-bundle/audit backstops are the real safety net. The README must say so.
 - **Deterministic git in the engine; judgment only in the skill.** The engine is pure, testable, and exact-state-reversible; the skill fills only the judgement gaps (land order, confidence-gated conflict HITL).
 - **Repo-scoped, always.** The plugin only ever inspects and acts on worktrees of the repo the current session belongs to.
+- **Concurrency is serialized cooperatively, not by git.** Git has no branch-span lock; multi-step operations (above all the multi-process merge) are serialized by a cooperative advisory lock keyed by `realpath(worktree-toplevel)`. The lock is a *coordination aid, not a safety gate*: it fails open and is deliberately **decoupled** from the edit/destruction gates' import path, so a lock bug can never disable enforcement (the opposite would expand the gate's blast radius).
 
 ## Milestone roadmap (design intent)
 
@@ -57,6 +58,18 @@ Low-risk hardening one-liners, honest scoping, and operational hygiene.
 - **Depends on:** M3.
 - **Exit criteria:** README honestly scopes the destruction gate; remaining one-line correctness/hardening fixes land; operational and doc hygiene items are closed.
 - **Epics:** Polish and documentation.
+
+## Concurrency serialization (cooperative advisory lock)
+
+Distinct from native `git worktree lock` (an anti-prune marker — see M2 / lost-worktrees):
+this is cross-session **operation** serialization, added because the user runs many concurrent
+sessions/agents and git only locks single index/ref updates, not multi-step operations.
+
+- **Model:** one lock per `realpath(worktree-toplevel)` in `<git-common-dir>/worktree-warden/locks.json`; owner = session id; every check-and-set guarded by a short-lived `flock` on a sibling mutex (held only for the read-modify-write, **never** across the merge). The main checkout is itself a worktree, so its toplevel unifies "two merges", "merge vs. direct main edit", and (Phase 2) "two sessions in one worktree" into one key; different worktrees use different keys and never contend.
+- **Staleness without a liveness signal:** a force-killed holder leaves no flock behind (only a record), so the store never wedges; the record's sliding lease lapses after a generous window, and a one-step `force-unlock` (surfaced at SessionStart) is the deterministic human escape. No pid/heartbeat games — a paused session is indistinguishable from a dead one to a short-lived hook.
+- **Fail-open + decoupled:** any lock-subsystem error proceeds *without* a lock; the edit/destruction gates do not import the lock module, and a broken lock module is surfaced loudly at SessionStart yet never drops the gate-load sentinel.
+- **Phase 1 (done):** main-target serialization — `/merge-worktrees` (and `/finish-worktree` via it) acquire/refresh/release; the engine renews the lease on each mutating subcommand; `/bumpall` takes the lock per repo (skip-on-blocked); SessionStart surfaces active/stale locks. Replaces the unreliable `claude agents --json` race re-check in `/merge-worktrees` step 4.
+- **Phase 2 (designed, deferred):** per-worktree *occupancy* locking enforced on Edit/Write (then, last, git-write Bash), behind a config flag. **Gated** on first confirming that out-of-process subagents do not edit one shared worktree under *distinct* session ids — otherwise occupancy-locking would false-block legitimate work. (Git already prevents the *corruption* a git-write lock would target via index/ref locks, so that slice is lowest-value / highest-false-positive and comes last.)
 
 ## Empirically-settled findings (evidence, not opinion)
 
