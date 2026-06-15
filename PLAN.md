@@ -61,7 +61,7 @@ Low-risk hardening one-liners, honest scoping, and operational hygiene.
 ## Empirically-settled findings (evidence, not opinion)
 
 - **Squash-merge teardown deadlock is real.** A multi-commit branch squash-merged into the target is a non-ancestor of it, and `git cherry` prints `+` for every commit, so *both* guard paths (destruction gate via `git cherry`, engine teardown via `--is-ancestor`) block teardown permanently. A single-commit branch squashes cleanly. Hence the escape hatch rather than a heuristic.
-- **Import-time fail-open is silent total disablement.** PreToolUse blocks only on exit 2; Python's default exit 1 on `ImportError` is treated as allow, so a bad import turns the gate off everywhere with no signal.
+- **Import-time fail-open is silent total disablement.** PreToolUse blocks only on exit 2; Python's default exit 1 on `ImportError` is treated as allow, so a bad import turns the gate off everywhere with no signal. *Mitigated (#19): each PreToolUse hook wraps its gate-module import in try/except and, on failure, writes a stderr diagnostic plus a durable sentinel at `<git-common-dir>/worktree-warden/gate-load-error` before deliberately exiting 0; the SessionStart banner surfaces that sentinel and self-heals it once the module imports cleanly again.*
 - **Per-Bash latency is a non-issue.** Destructive git calls are gated behind cheap pure-string parsing; non-matching commands cost microseconds.
 
 ## Lessons / context

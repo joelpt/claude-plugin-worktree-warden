@@ -41,6 +41,7 @@ ALLOWED_SOURCES = {"startup", "resume"}
 
 
 def read_stdin() -> dict[str, object]:
+    """Read and parse JSON from stdin, returning an empty dict on any error."""
     try:
         return json.load(sys.stdin)
     except Exception:
@@ -48,7 +49,7 @@ def read_stdin() -> dict[str, object]:
 
 
 def is_main_worktree(cwd: str) -> bool:
-    """True iff cwd is the main (non-linked) worktree of its git repo."""
+    """Return True iff cwd is the main (non-linked) worktree of its git repo."""
     try:
         proc = subprocess.run(
             ["git", "-C", cwd, "rev-parse", "--git-dir", "--git-common-dir"],
@@ -153,7 +154,7 @@ def build_banner(worktrees: list[cw.Worktree], mode: str) -> str | None:
 
 
 def _summary(total: int, n_merge: int, n_cool: int, n_block: int) -> str:
-    """One-line header: total worktrees with a per-category breakdown."""
+    """Return a one-line header: total worktrees with a per-category breakdown."""
     noun = "worktree" if total == 1 else "worktrees"
     parts: list[str] = []
     if n_merge:
@@ -167,7 +168,7 @@ def _summary(total: int, n_merge: int, n_cool: int, n_block: int) -> str:
 
 
 def _recommendation(n_merge: int, n_cool: int, n_block: int, cooldown_min: int) -> str:
-    """Per-category lines describing what acting on each kind would do."""
+    """Return per-category lines describing what acting on each kind would do."""
     lines: list[str] = []
     if n_merge:
         them = "it" if n_merge == 1 else "them"
@@ -190,6 +191,92 @@ def _recommendation(n_merge: int, n_cool: int, n_block: int, cooldown_min: int) 
     return "\n".join(lines)
 
 
+GATE_LOAD_ERROR_RELPATH = Path("worktree-warden") / "gate-load-error"
+
+
+def _git_common_dir(cwd: str) -> Path | None:
+    """Resolve cwd's shared git dir via subprocess, or None outside a repo.
+
+    Deliberately uses its own ``git rev-parse`` rather than
+    ``worktree_gate.git_facts`` -- the gate-load-error sentinel exists precisely
+    when ``worktree_gate`` may be the broken module, so it cannot be relied on to
+    locate the very sentinel that records its own failure.
+
+    Args:
+        cwd: Working directory used to locate the repository.
+
+    Returns:
+        The realpath of the shared git dir, or None on any error.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    return Path(os.path.realpath(os.path.join(cwd, proc.stdout.strip())))
+
+
+def _gate_modules_importable() -> bool:
+    """Return True iff both PreToolUse gate modules import cleanly right now."""
+    import importlib  # noqa: PLC0415
+
+    try:
+        importlib.import_module("worktree_gate")
+        importlib.import_module("worktree_destruction")
+    except Exception:
+        return False
+    return True
+
+
+def gate_load_error_advisory(cwd: str) -> str | None:
+    """Surface a gate-load-error sentinel, self-healing when the gate loads again.
+
+    A PreToolUse hook drops the sentinel when its gate module fails to import,
+    because exit 1 on that crash reads as *allow* -- the gate silently fails
+    open. This is the loud half: the SessionStart banner reports it. When the
+    modules import cleanly again the sentinel is stale, so it is cleared and
+    nothing is shown (self-heal); a permanent warning after a fixed bug would
+    make the feature worse than silence.
+
+    Args:
+        cwd: Session working directory, used to locate the repo's sentinel.
+
+    Returns:
+        The advisory to prepend to the banner, or None when there is nothing to
+        show (no sentinel, outside a repo, or the gate now loads cleanly).
+    """
+    common = _git_common_dir(cwd)
+    if common is None:
+        return None
+    sentinel = common / GATE_LOAD_ERROR_RELPATH
+    if not sentinel.exists():
+        return None
+    if _gate_modules_importable():
+        try:
+            sentinel.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return None
+    try:
+        detail = sentinel.read_text().splitlines()[0].strip()
+    except Exception:
+        detail = ""
+    return (
+        "⛔ worktree-warden gate FAILED TO LOAD and is failing OPEN -- direct "
+        "main-checkout edits and unsafe destructions are NOT being blocked. A "
+        "PreToolUse hook could not import its gate module"
+        + (f" ({detail})" if detail else "")
+        + ". Fix the import error in the plugin's scripts/, then restart the "
+        "session to clear this warning."
+    )
+
+
 def main() -> int:
     """Run the SessionStart hook."""
     payload = read_stdin()
@@ -201,8 +288,21 @@ def main() -> int:
     if not is_main_worktree(cwd):
         return 0
 
+    # Resolved before the display-mode early return: a gate that failed to load
+    # is failing OPEN, which the user must see regardless of startup_display.
+    advisory = ""
+    try:
+        advisory = gate_load_error_advisory(cwd) or ""
+    except Exception:
+        advisory = ""
+
     mode, enforcement_active, disabled_scope = get_gate_state(cwd)
-    if mode == "never" and not enforcement_active and disabled_scope != "project":
+    if (
+        mode == "never"
+        and not enforcement_active
+        and disabled_scope != "project"
+        and not advisory
+    ):
         return 0
 
     # Force-quit backstop + external-removal detection. Both are best-effort and
@@ -255,6 +355,14 @@ def main() -> int:
             wg.log_event("project-disabled-notice", "SessionStart: project config disabled enforcement", None)
         except Exception:
             pass
+
+    # Highest priority of all: a failing-open gate. Prepend last so it sits at
+    # the very top of the banner, above the removal and project-disabled notices.
+    if advisory:
+        existing = output.get("systemMessage", "")
+        output["systemMessage"] = (
+            advisory + ("\n\n" + existing if existing else "")
+        )
 
     if output:
         print(json.dumps(output))

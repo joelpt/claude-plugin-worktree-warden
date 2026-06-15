@@ -15,6 +15,8 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import tempfile
+from pathlib import Path
 from unittest import TestCase, mock
 
 import check_worktrees as cw
@@ -201,3 +203,80 @@ class MainEmitTest(TestCase):
         self.assertEqual(rc, 0)
         emitted = json.loads(out)
         self.assertIn("⚠️", emitted["systemMessage"])
+
+
+class GateLoadErrorAdvisoryTest(TestCase):
+    """main() surfaces a gate-load-error advisory as the highest-priority banner."""
+
+    def _run_main_patched(
+        self,
+        *,
+        advisory: str | None,
+        mode: str = "never",
+        enforcement: bool = False,
+        worktrees: list[cw.Worktree] | None = None,
+    ) -> tuple[int, str]:
+        """Drive main() with gate_load_error_advisory stubbed to a fixed return value."""
+        payload = json.dumps({"source": "startup", "cwd": "/repo"})
+        with (
+            mock.patch.object(hook, "is_main_worktree", return_value=True),
+            mock.patch.object(hook, "get_gate_state", return_value=(mode, enforcement, None)),
+            mock.patch.object(hook, "gather", return_value=worktrees or []),
+            mock.patch.object(hook, "gate_load_error_advisory", return_value=advisory),
+            mock.patch("sys.stdin", io.StringIO(payload)),
+            contextlib.redirect_stdout(io.StringIO()) as out,
+        ):
+            rc = hook.main()
+        return rc, out.getvalue()
+
+    def test_advisory_prepended_to_system_message(self) -> None:
+        advisory = "⛔ worktree-warden gate FAILED TO LOAD and is failing OPEN"
+        rc, out = self._run_main_patched(advisory=advisory, mode="never")
+        self.assertEqual(rc, 0)
+        self.assertTrue(out.strip(), "Expected output when sentinel advisory present")
+        emitted = json.loads(out)
+        self.assertIn("systemMessage", emitted)
+        self.assertIn("FAILED TO LOAD", emitted["systemMessage"])
+
+    def test_advisory_absent_when_none_returned(self) -> None:
+        rc, out = self._run_main_patched(advisory=None, mode="never")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.strip(), "")
+
+    def test_advisory_absent_outside_git_repo(self) -> None:
+        with mock.patch.object(hook, "_git_common_dir", return_value=None):
+            result = hook.gate_load_error_advisory("/not/a/repo")
+        self.assertIsNone(result)
+
+    def test_advisory_returned_when_sentinel_present_and_gate_broken(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            warden_dir = Path(tmpdir) / "worktree-warden"
+            warden_dir.mkdir()
+            (warden_dir / "gate-load-error").write_text("2026-01-01T00:00:00Z\tworktree_gate\tboom\n")
+            with (
+                mock.patch.object(hook, "_git_common_dir", return_value=Path(tmpdir)),
+                mock.patch.object(hook, "_gate_modules_importable", return_value=False),
+            ):
+                result = hook.gate_load_error_advisory("/some/cwd")
+        self.assertIsNotNone(result)
+        self.assertIn("FAILED TO LOAD", result or "")
+
+    def test_advisory_none_when_sentinel_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch.object(hook, "_git_common_dir", return_value=Path(tmpdir)):
+                result = hook.gate_load_error_advisory("/some/cwd")
+        self.assertIsNone(result)
+
+    def test_self_heals_when_gate_modules_importable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            warden_dir = Path(tmpdir) / "worktree-warden"
+            warden_dir.mkdir()
+            sentinel = warden_dir / "gate-load-error"
+            sentinel.write_text("2026-01-01T00:00:00Z\tworktree_gate\tboom\n")
+            with (
+                mock.patch.object(hook, "_git_common_dir", return_value=Path(tmpdir)),
+                mock.patch.object(hook, "_gate_modules_importable", return_value=True),
+            ):
+                result = hook.gate_load_error_advisory("/some/cwd")
+        self.assertIsNone(result)
+        self.assertFalse(sentinel.exists(), "Sentinel should have been removed on self-heal")
