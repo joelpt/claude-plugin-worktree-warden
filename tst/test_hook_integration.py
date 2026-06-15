@@ -17,6 +17,7 @@ from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 _HOOK = _ROOT / "hooks" / "enforce_worktree_hook.py"
+_GUARD_HOOK = _ROOT / "hooks" / "guard_destruction_hook.py"
 _GATE = _ROOT / "scripts" / "worktree_gate.py"
 
 
@@ -246,6 +247,102 @@ class UnbornHeadTest(unittest.TestCase):
         proc = self._hook(self.target)
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout.strip(), "")
+
+
+class ImportFailureTest(unittest.TestCase):
+    """Simulated import failure: hooks must exit 0, write stderr, drop sentinel."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.repo = base / "repo"
+        self.repo.mkdir()
+        self._git("init")
+        self._git("config", "user.email", "t@t.test")
+        self._git("config", "user.name", "Test")
+        (self.repo / "seed.txt").write_text("seed\n")
+        self._git("add", "seed.txt")
+        self._git("commit", "-m", "seed")
+        # empty_scripts has no worktree_gate.py, forcing ImportError
+        self.empty_scripts = base / "empty_scripts"
+        self.empty_scripts.mkdir()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _git(self, *args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    def _env_broken(self) -> dict[str, str]:
+        """Environment pointing CLAUDE_PLUGIN_ROOT at a dir with no scripts."""
+        env = {**os.environ}
+        # Override CLAUDE_PLUGIN_ROOT so _SCRIPTS_DIR resolves to empty_scripts
+        # which has no worktree_gate.py or worktree_destruction.py.
+        fake_root = self._tmp.name + "/fake_root"
+        Path(fake_root).mkdir(exist_ok=True)
+        Path(fake_root, "scripts").mkdir(exist_ok=True)
+        env["CLAUDE_PLUGIN_ROOT"] = fake_root
+        return env
+
+    def _git_common_dir(self) -> Path:
+        """Return the git common dir for the test repo."""
+        proc = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "--git-common-dir"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        common = proc.stdout.strip()
+        if not os.path.isabs(common):
+            common = str(self.repo / common)
+        return Path(common)
+
+    def _run_hook(self, hook_path: Path, payload: dict[str, object]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, str(hook_path)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            cwd=str(self.repo),
+            env=self._env_broken(),
+        )
+
+    def test_enforce_hook_import_failure_exits_0(self) -> None:
+        payload = {"tool_name": "Edit", "cwd": str(self.repo), "tool_input": {"file_path": str(self.repo / "x.py")}}
+        proc = self._run_hook(_HOOK, payload)
+        self.assertEqual(proc.returncode, 0, f"Expected exit 0 on import failure, got {proc.returncode}. stderr: {proc.stderr}")
+
+    def test_enforce_hook_import_failure_writes_stderr(self) -> None:
+        payload = {"tool_name": "Edit", "cwd": str(self.repo), "tool_input": {"file_path": str(self.repo / "x.py")}}
+        proc = self._run_hook(_HOOK, payload)
+        self.assertTrue(proc.stderr.strip(), "Expected diagnostic on stderr, got none")
+
+    def test_enforce_hook_import_failure_drops_sentinel(self) -> None:
+        payload = {"tool_name": "Edit", "cwd": str(self.repo), "tool_input": {"file_path": str(self.repo / "x.py")}}
+        self._run_hook(_HOOK, payload)
+        sentinel = self._git_common_dir() / "worktree-warden" / "gate-load-error"
+        self.assertTrue(sentinel.exists(), f"Expected sentinel at {sentinel}")
+
+    def test_guard_hook_import_failure_exits_0(self) -> None:
+        payload = {"tool_name": "Bash", "cwd": str(self.repo), "tool_input": {"command": "git worktree remove --force /tmp/wt"}}
+        proc = self._run_hook(_GUARD_HOOK, payload)
+        self.assertEqual(proc.returncode, 0, f"Expected exit 0 on import failure, got {proc.returncode}. stderr: {proc.stderr}")
+
+    def test_guard_hook_import_failure_writes_stderr(self) -> None:
+        payload = {"tool_name": "Bash", "cwd": str(self.repo), "tool_input": {"command": "git worktree remove --force /tmp/wt"}}
+        proc = self._run_hook(_GUARD_HOOK, payload)
+        self.assertTrue(proc.stderr.strip(), "Expected diagnostic on stderr, got none")
+
+    def test_guard_hook_import_failure_drops_sentinel(self) -> None:
+        payload = {"tool_name": "Bash", "cwd": str(self.repo), "tool_input": {"command": "git worktree remove --force /tmp/wt"}}
+        self._run_hook(_GUARD_HOOK, payload)
+        sentinel = self._git_common_dir() / "worktree-warden" / "gate-load-error"
+        self.assertTrue(sentinel.exists(), f"Expected sentinel at {sentinel}")
 
 
 if __name__ == "__main__":
