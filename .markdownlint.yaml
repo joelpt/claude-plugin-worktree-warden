@@ -3,3 +3,12 @@ MD013: false
 MD024: false
 MD030: false
 MD031: false
+
+# Disable table column style enforcement
+#
+# Reason: MD060 (markdownlint v0.40.0+) flags padded table pipes
+# (`| a | b |`) against a "compact" style and vice versa. Tables here use
+# the readable padded style deliberately; the rule yields only false flags.
+#
+# Details: https://github.com/DavidAnson/markdownlint/blob/main/doc/Rules.md#md060---table-column-style
+MD060: false
