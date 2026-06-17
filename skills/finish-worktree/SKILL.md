@@ -2,7 +2,7 @@
 name: finish-worktree
 description: Land the current linked worktree into its default branch and tear it down. Use when wrapping up work from inside a worktree — the user signals done/finished, or the session is winding down. For landing worktrees from the primary checkout, use check-worktrees instead.
 argument-hint: "[target-branch]"
-allowed-tools: Bash(git *) Bash(cd *) ExitWorktree EnterWorktree Skill(worktree-warden:merge-worktrees) Skill(worktree-warden:check-worktrees)
+allowed-tools: Bash(python3 *) Bash(git *) Bash(cd *) ExitWorktree EnterWorktree Skill(worktree-warden:merge-worktrees) Skill(worktree-warden:check-worktrees) Skill(commit-commands:commitall)
 ---
 
 ## Live context
@@ -19,23 +19,23 @@ allowed-tools: Bash(git *) Bash(cd *) ExitWorktree EnterWorktree Skill(worktree-
 ## What /finish-worktree does
 
 Lands **this linked worktree** into `$ARGUMENTS` (default: the repo's default branch) and
-tears it down — by delegating to the worktrees plugin's `/worktree-warden:merge-worktrees` engine
-(rebase + ff-merge, post-land tests, exact-state rollback on failure). Handles the one thing
-the engine can't: relocating the session out of the worktree before teardown.
+tears it down. The happy path is a **single** `worktree_engine.py finish` call (lock →
+snapshot → rebase + ff-merge → test gate → teardown → release); non-trivial cases (conflict,
+test failure, dirty, multiple worktrees) fall back to `/worktree-warden:merge-worktrees` for
+its confidence-gated judgment. This skill handles the one thing `finish` can't: relocating
+the session out of the worktree first (a subprocess can't `cd` its parent).
 
 Two session origins, one code path:
 
 - **EnterWorktree session** — `ExitWorktree(action:"keep")` succeeds, session moves to the
-  primary checkout before the merge, and re-enters the worktree on rollback.
+  primary checkout before the land.
 - **Direct-start session** (background job, session started inside the worktree) —
-  `ExitWorktree` is a no-op; fall back to `cd $PRIMARY` via Bash so the shell cwd moves
-  to the primary checkout regardless. The merge and all engine calls use `--repo $PRIMARY`
-  explicitly. The session UI may still display the old path, but shell operations run from
-  `$PRIMARY`.
+  `ExitWorktree` is a no-op; fall back to `cd $PRIMARY` via Bash. All engine calls take
+  `--repo $PRIMARY` explicitly. The session UI may still display the old path, but shell
+  operations run from `$PRIMARY`.
 
-Does **not** commit first — `/merge-worktrees` commits dirty work via
-`/commit-commands:commitall` as its first step, so uncommitted work is captured in the
-snapshot before any rebase.
+A **dirty** worktree is not auto-committed: `finish` refuses it (exit 11) and step 5 commits
+via `/commit-commands:commitall` before retrying.
 
 ## Procedure
 
@@ -79,25 +79,47 @@ Call **`ExitWorktree(action:"keep")`**:
   may still display the old worktree path, but all subsequent operations run from
   `$PRIMARY`.
 
-### 4. Delegate the land
+### 4. Land via the one-shot `finish` command
 
-Invoke **`/worktree-warden:merge-worktrees`** passing:
-- `--worktree $WORKTREE_PATH`
-- `--branch $BRANCH`
-- `--repo $PRIMARY` (explicit; merge-worktrees uses this for all engine calls and skips its
-  own session-cwd primary check when this is provided)
-- `--target $TARGET` if non-default
+The straightforward case (clean worktree, no conflicts, tests pass) is a **single command**:
+`finish` acquires the main-target lock, snapshots, rebases + ff-merges, runs the test gate,
+tears down, and releases the lock — all internally. No more hand-chaining lock + snapshot +
+land + teardown.
 
-It runs the full flow: commit-if-dirty → snapshot → order → rebase + ff-merge → verify +
-tests → teardown, with confidence-gated conflict/rollback handling.
+First resolve the project's test command (first that applies): Justfile `test` → `just test`;
+else `npm test` (if `package.json`); else `pytest` (if Python); else `cargo test` (if Cargo);
+else none.
 
-### 5. Handle the result
+```bash
+python3 $ENGINE --repo $PRIMARY finish --worktree $WORKTREE_PATH --branch $BRANCH \
+  --target $TARGET --test-cmd "<resolved test command>"
+```
 
-- **Green** (worktree landed and pruned) → confirm worktree/branch are gone; proceed to
-  step 6.
-- **Aborted / rolled back** → the engine's `undo` has restored the repo to exactly its
-  pre-land state. Call `EnterWorktree(path:$WORKTREE_PATH)` to return the session to the
-  intact worktree; report what happened + why, verbatim. Do not produce a recap.
+Use `--skip-tests` in place of `--test-cmd` only when the repo has no test setup (or a
+docs/config-only landing the user is fine to land ungated). The lock owner is your session id
+automatically. `finish` is a subprocess and **cannot** relocate you out of the worktree —
+that is why step 3 already moved you to `$PRIMARY`.
+
+### 5. Handle the result (by exit code)
+
+- **0 `finished`** → landed + tested + torn down. Confirm worktree/branch are gone; go to step 6.
+- **10** (already merged) → `finish` tore it down anyway; go to step 6 (no new commits to recap).
+- **13 `rebase_conflict`** → the rebase is LEFT IN PROGRESS and the **lock is still held by you**.
+  Hand off to **`/worktree-warden:merge-worktrees`** (`--worktree $WORKTREE_PATH --branch $BRANCH
+  --repo $PRIMARY --target $TARGET`) for its confidence-gated conflict ladder; it re-acquires your
+  same-session lock re-entrantly and releases at the end.
+- **18 `tests_failed`** → the branch IS landed but tests failed; state is **PRESERVED** (not
+  rolled back) and the **lock is still held by you**. `details.snapshot_file` is the undo anchor.
+  Hand off to **`/worktree-warden:merge-worktrees`**'s step-6 rollback ladder (fix-forward / `undo`
+  / abandon / ask). Do NOT auto-`undo`.
+- **11 `dirty_worktree`** → commit first: `EnterWorktree(path:$WORKTREE_PATH)` →
+  `/commit-commands:commitall` → `ExitWorktree(action:"keep")` (or `cd $PRIMARY`), then re-run step 4.
+- **16 `lock_blocked`** → another session is merging to `$TARGET`; pause and report the holder
+  (from the message). Retry when it frees, or force-unlock if you are certain it is dead.
+- **12 / 14 / 15 / 17** → preflight/safety refusals; report `message` verbatim and stop.
+
+Multiple worktrees or deliberate land ordering still go through **`/worktree-warden:merge-worktrees`**
+directly — `finish` is the single-worktree fast path.
 
 ### 6. Extended recap (green path only)
 

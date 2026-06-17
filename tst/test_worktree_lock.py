@@ -149,6 +149,17 @@ class _TempRepo(unittest.TestCase):
 class StoreOpsTest(_TempRepo):
     """Flock-guarded store I/O over the real .git/worktree-warden/locks.json."""
 
+    def test_repo_arg_works_in_either_position(self) -> None:
+        # `acquire-main --repo X` (subcommand-first) AND `--repo X acquire-main`
+        # (engine-style, top-level-first) must both work -- the latter is the order
+        # the merge skill documents and the one that previously errored.
+        after = self._cli("acquire-main", "--repo", str(self.repo), "--owner", "A", "x")
+        self.assertEqual(after.returncode, 0, after.stderr)
+        self._cli("force-unlock", "--repo", str(self.repo), "--all")
+        before = self._cli("--repo", str(self.repo), "acquire-main", "--owner", "B", "y")
+        self.assertEqual(before.returncode, 0, before.stderr)
+        self.assertIn("ACQUIRED", before.stdout)
+
     def test_acquire_then_status_then_release(self) -> None:
         got = self._cli("acquire-main", "--repo", str(self.repo), "--owner", "A", "landing")
         self.assertEqual(got.returncode, 0, got.stderr)

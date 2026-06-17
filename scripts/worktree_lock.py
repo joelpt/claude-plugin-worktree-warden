@@ -794,13 +794,24 @@ def _cli_prefix() -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Construct the worktree-lock argument parser."""
+    """Construct the worktree-lock argument parser.
+
+    ``--repo``/``--owner`` are accepted in EITHER position -- before the
+    subcommand (``--repo X acquire-main``, matching ``worktree_engine.py``'s
+    convention) or after it (``acquire-main --repo X``). The top-level options
+    carry the real defaults; the per-subcommand copies use ``SUPPRESS`` so that
+    omitting them after the subcommand does not clobber a value given before it.
+    """
     parser = argparse.ArgumentParser(prog="worktree-lock")
+    parser.add_argument("--repo", default=None, help="repo/worktree path (default: cwd)")
+    parser.add_argument(
+        "--owner", default=None, help="session id (default: $CLAUDE_CODE_SESSION_ID)"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     def _common(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--repo", help="repo/worktree path (default: cwd)")
-        p.add_argument("--owner", help="session id (default: $CLAUDE_CODE_SESSION_ID)")
+        p.add_argument("--repo", default=argparse.SUPPRESS, help="repo/worktree path")
+        p.add_argument("--owner", default=argparse.SUPPRESS, help="session id")
 
     acquire_p = sub.add_parser("acquire-main", help="acquire the main-target lock")
     _common(acquire_p)

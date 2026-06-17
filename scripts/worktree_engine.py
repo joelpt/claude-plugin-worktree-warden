@@ -36,6 +36,12 @@ exits with the contract code below):
                    worktrees whose branch holds commits not yet landed, plus WIP
                    capture bundles, each with the exact restore command. With
                    --gc-days N, deletes WIP bundles older than N days.
+  finish           ONE-SHOT happy path for a single clean worktree: acquire the
+                   main-target lock + snapshot + land + run --test-cmd (or
+                   --skip-tests) + teardown + release, all internally. Bails
+                   cleanly on anything non-trivial (conflict/test-fail keep the
+                   lock + state for the caller; dirty/unsafe land nothing). Never
+                   auto-rolls-back. Caller must already be in the primary checkout.
 
 Exit codes:
   0   ok
@@ -45,7 +51,9 @@ Exit codes:
   13  rebase conflict (LEFT IN PROGRESS — resolve then rebase-continue)
   14  fast-forward merge failed
   15  git / internal error
+  16  finish: main-target lock held by another session
   17  core.bare corruption detected
+  18  finish: post-land tests failed (state PRESERVED, not rolled back)
 """
 
 from __future__ import annotations
@@ -68,7 +76,9 @@ EXIT_PRIMARY_UNSAFE = 12
 EXIT_REBASE_CONFLICT = 13
 EXIT_MERGE_FAILED = 14
 EXIT_GIT_ERROR = 15
+EXIT_LOCK_BLOCKED = 16
 EXIT_CORE_BARE = 17
+EXIT_TESTS_FAILED = 18
 
 # Harness-regenerated file; discarding it is user-authorized (mirrors rmws.py).
 NOISE_PATH = ".claude/settings.local.json"
@@ -939,6 +949,224 @@ def cmd_recover(repo: str, target: str, gc_days: float | None) -> Outcome:
     return base
 
 
+def _acquire_main_lock(repo: str, owner: str, reason: str) -> tuple[bool, Outcome | None]:
+    """Acquire the main-target lock for ``finish``. Lazy + guarded (fail-open).
+
+    Args:
+        repo: Primary checkout path (the main-target key).
+        owner: Session id taking the lock.
+        reason: Human-readable purpose, surfaced if another session is blocked.
+
+    Returns:
+        ``(held, blocked)``: ``(True, None)`` acquired; ``(False, Outcome)`` blocked
+        by another live session (the caller returns the Outcome); ``(False, None)``
+        the lock subsystem stepped aside (no session id / broken module / IO error)
+        -- proceed WITHOUT a lock, like the rest of the plugin's gates.
+    """
+    if not owner:
+        return False, None
+    try:
+        import worktree_lock  # noqa: PLC0415  -- lazy + guarded (fail-open)
+
+        facts = worktree_lock.main_facts(repo)
+        if not facts.is_repo or facts.git_common_dir is None or facts.repo_root is None:
+            return False, None
+        decision = worktree_lock.acquire(facts, owner, "merge", reason, time.time())
+        if decision.outcome == "blocked" and decision.blocker is not None:
+            blocker = decision.blocker
+            return False, Outcome(
+                EXIT_LOCK_BLOCKED,
+                "lock_blocked",
+                f"Main-target lock held by session {blocker.owner} ({blocker.kind}); "
+                "not landing. Wait for it, or force-unlock if it is dead.",
+                details={"holder": blocker.owner, "kind": blocker.kind, "reason": blocker.reason},
+            )
+        return True, None
+    except Exception:
+        return False, None
+
+
+def _release_main_lock(repo: str, owner: str) -> None:
+    """Best-effort release of the main-target lock (never raises)."""
+    if not owner:
+        return
+    try:
+        import worktree_lock  # noqa: PLC0415
+
+        facts = worktree_lock.main_facts(repo)
+        if facts.is_repo and facts.git_common_dir is not None:
+            worktree_lock.release(facts, owner)
+    except Exception:
+        pass
+
+
+def _run_tests(test_cmd: str, cwd: str) -> tuple[bool, str]:
+    """Run the caller-supplied test command in ``cwd``; return (passed, output-tail).
+
+    ``test_cmd`` is a shell string (e.g. ``just test``) supplied by the trusted
+    caller and run with ``shell=True``. Returns pass/fail plus a trailing slice of
+    combined stdout+stderr for the result message.
+
+    Args:
+        test_cmd: Shell command to run as the post-land verification gate.
+        cwd: Directory to run it in (the primary checkout).
+
+    Returns:
+        ``(passed, tail)`` where ``passed`` is exit-code-zero and ``tail`` is the
+        last ~800 chars of combined output.
+    """
+    try:
+        proc = subprocess.run(
+            test_cmd, shell=True, cwd=cwd, capture_output=True, text=True, timeout=3600
+        )
+    except Exception as exc:
+        return False, f"could not run tests: {exc!r}"
+    return proc.returncode == 0, (proc.stdout + proc.stderr).strip()[-800:]
+
+
+def _resolve_target(worktree: str) -> str:
+    """Resolve the default branch (origin/HEAD leaf, else 'main')."""
+    rc, ref_out, _ = _git_rc(
+        ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], cwd=worktree
+    )
+    if rc == 0 and ref_out.startswith(_ORIGIN_HEAD_PREFIX):
+        return ref_out[len(_ORIGIN_HEAD_PREFIX) :]
+    return "main"
+
+
+def cmd_finish(
+    worktree: str,
+    branch: str,
+    target: str,
+    repo: str,
+    *,
+    test_cmd: str | None,
+    skip_tests: bool,
+    use_lock: bool,
+    owner: str,
+) -> Outcome:
+    """One-shot happy-path land: lock -> snapshot -> land -> test -> teardown -> release.
+
+    Collapses the deterministic green path of ``/merge-worktrees`` for the common
+    case (one clean linked worktree, no conflicts) into a single call, so a caller
+    need not chain lock + snapshot + land + teardown by hand. Anything non-trivial
+    stops cleanly and returns a structured code so the caller falls back to the
+    granular subcommands:
+
+      * ``EXIT_REBASE_CONFLICT`` (13): rebase LEFT IN PROGRESS, **lock kept**,
+        snapshot returned -- resolve, ``rebase-continue``, test, ``teardown``, then
+        ``release-main``.
+      * ``EXIT_TESTS_FAILED`` (18): the branch IS landed; state is **PRESERVED**
+        (never auto-rolled-back -- that judgment is the caller's), **lock kept**,
+        snapshot returned so the caller may ``undo`` if it chooses.
+      * dirty (11) / primary-unsafe (12) / not-a-worktree / git error: nothing
+        landed, **lock released**.
+
+    The lock is acquired/released internally (``use_lock=False`` to skip); it is
+    released only on clean terminal exits and kept on the two mid-flight bail paths
+    above. Tests run only when ``test_cmd`` is given -- pass ``skip_tests=True`` to
+    land without a gate; one of the two is required (checked before any mutation).
+    This runs as a SUBPROCESS and cannot relocate the caller's session out of the
+    worktree it tears down -- the caller must already be in the primary checkout.
+
+    Args:
+        worktree: Absolute path of the linked worktree to land.
+        branch: The worktree's branch.
+        target: Default branch to land into.
+        repo: Primary checkout path.
+        test_cmd: Post-land verification command, or None.
+        skip_tests: Land without a test gate.
+        use_lock: Manage the main-target lock internally.
+        owner: Session id for the lock (empty -> proceed without a lock).
+
+    Returns:
+        An Outcome whose code is one of the EXIT_* values documented above.
+    """
+    if not skip_tests and not test_cmd:
+        return Outcome(
+            EXIT_GIT_ERROR,
+            "finish_misconfigured",
+            "finish needs --test-cmd <cmd> or --skip-tests, chosen before any mutation.",
+            target=target,
+            branch=branch,
+        )
+
+    held = False
+    if use_lock:
+        held, blocked = _acquire_main_lock(repo, owner, f"finish: landing {branch} into {target}")
+        if blocked is not None:
+            return blocked
+
+    def _bail_release(outcome: Outcome) -> Outcome:
+        if held:
+            _release_main_lock(repo, owner)
+        return outcome
+
+    snap = cmd_snapshot(repo, target, [branch])
+    if snap.code != EXIT_OK:
+        return _bail_release(snap)
+    snapshot_file = str(snap.details.get("snapshot_file", ""))
+
+    landed = cmd_land(worktree, branch, target, repo)
+    if landed.code == EXIT_REBASE_CONFLICT:
+        landed.details = {
+            **landed.details,
+            "snapshot_file": snapshot_file,
+            "lock_held": held,
+            "next": "resolve conflicts, git add, rebase-continue; then test, teardown, release-main",
+        }
+        return landed  # KEEP the lock -- the merge is mid-flight
+    if landed.code not in (EXIT_OK, EXIT_NOT_APPLICABLE):
+        return _bail_release(landed)  # nothing landed
+    already_merged = landed.code == EXIT_NOT_APPLICABLE
+
+    tested = bool(test_cmd) and not skip_tests and not already_merged
+    if tested:
+        assert test_cmd is not None
+        passed, tail = _run_tests(test_cmd, repo)
+        if not passed:
+            return Outcome(  # KEEP the lock, PRESERVE state -- the caller decides
+                EXIT_TESTS_FAILED,
+                "tests_failed",
+                f"Landed '{branch}' into '{target}' but tests FAILED. State PRESERVED "
+                "(not rolled back) and lock KEPT -- decide: fix-forward, undo, or abandon.",
+                target=target,
+                branch=branch,
+                worktree=os.path.realpath(worktree),
+                details={
+                    "test_cmd": test_cmd,
+                    "snapshot_file": snapshot_file,
+                    "output_tail": tail,
+                    "lock_held": held,
+                },
+            )
+
+    td = cmd_teardown(branch, target, repo, dry_run=False)
+    if held:
+        _release_main_lock(repo, owner)
+    if td.code != EXIT_OK:
+        td.details = {**td.details, "note": "branch landed; teardown refused (see message)"}
+        return td
+
+    verb = "was already merged into" if already_merged else "landed into"
+    suffix = " (tests passed)" if tested else ""
+    return Outcome(
+        EXIT_OK,
+        "finished",
+        f"'{branch}' {verb} '{target}'{suffix}; worktree torn down.",
+        target=target,
+        branch=branch,
+        primary=repo,
+        worktree=os.path.realpath(worktree),
+        details={
+            "commits_merged": landed.details.get("commits_merged"),
+            "tested": tested,
+            "torn_down": True,
+            "snapshot_file": snapshot_file,
+        },
+    )
+
+
 def _refresh_main_lease(repo: str) -> None:
     """Best-effort renew this session's main-target lock lease (never raises).
 
@@ -1023,6 +1251,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Delete WIP bundles older than this many days (the only mutation).",
     )
 
+    p_fin = sub.add_parser(
+        "finish",
+        help="One-shot happy-path land (lock+snapshot+land+test+teardown+release). "
+        "Caller must already be in the primary checkout.",
+    )
+    p_fin.add_argument("--worktree", required=True)
+    p_fin.add_argument("--branch", required=True)
+    p_fin.add_argument("--target", default=None, help="Default branch (resolved if omitted).")
+    p_fin.add_argument("--test-cmd", default=None, help="Post-land verification command, e.g. 'just test'.")
+    p_fin.add_argument("--skip-tests", action="store_true", help="Land without a test gate.")
+    p_fin.add_argument("--no-lock", action="store_true", help="Do not manage the main-target lock.")
+    p_fin.add_argument("--owner", default=None, help="Lock owner (default: $CLAUDE_CODE_SESSION_ID).")
+
     args = parser.parse_args(argv)
     repo = args.repo
     if args.cmd in _LEASE_REFRESH_CMDS:
@@ -1059,6 +1300,21 @@ def main(argv: list[str] | None = None) -> int:
             outcome = cmd_recover(repo, args.target, args.gc_days)
             if args.gc_days is not None:
                 _audit(repo, "recover-gc", outcome)
+            return outcome.emit()
+        if args.cmd == "finish":
+            target = args.target or _resolve_target(args.worktree)
+            owner = args.owner or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+            outcome = cmd_finish(
+                args.worktree,
+                args.branch,
+                target,
+                repo,
+                test_cmd=args.test_cmd,
+                skip_tests=args.skip_tests,
+                use_lock=not args.no_lock,
+                owner=owner,
+            )
+            _audit(repo, "finish", outcome)
             return outcome.emit()
     except GitError as exc:
         return Outcome(EXIT_GIT_ERROR, "git_error", str(exc)).emit()

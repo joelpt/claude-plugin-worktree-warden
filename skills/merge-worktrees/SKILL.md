@@ -12,6 +12,13 @@ linear history, no merge commits. Every deterministic step is a `worktree_engine
 subcommand; you only fill the judgement gaps (conflict resolution, ordering, test-failure
 decisions). Repo-scoped: only ever this repo's worktrees.
 
+> **Single clean worktree?** Prefer the one-shot `python3 $ENGINE --repo $REPO finish
+> --worktree <path> --branch <branch> --target $TARGET --test-cmd "<just test|…>"` — it does
+> lock → snapshot → land → test → teardown → release in one call (the `/finish-worktree`
+> path). Drop to the granular steps below when it returns a conflict (`13`) or test failure
+> (`18`), or for **multiple** worktrees / deliberate land ordering — the cases that need your
+> judgement.
+
 `ENGINE=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_engine.py`,
 `GATE=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_gate.py`,
 `LOCK=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_lock.py`, `REPO=<primary checkout path>`,

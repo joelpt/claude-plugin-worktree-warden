@@ -24,6 +24,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 _HOOK = _ROOT / "hooks" / "enforce_worktree_hook.py"
 _GATE = _ROOT / "scripts" / "worktree_gate.py"
 _LOCK = _ROOT / "scripts" / "worktree_lock.py"
+_ENGINE = _ROOT / "scripts" / "worktree_engine.py"
 
 
 class _Smoke:
@@ -103,6 +104,18 @@ def _lock(repo: Path, env: Mapping[str, str], *args: str) -> tuple[int, str]:
     """Run the lock CLI in repo and return its exit code and stdout."""
     proc = subprocess.run(
         [sys.executable, str(_LOCK), *args],
+        capture_output=True,
+        text=True,
+        cwd=str(repo),
+        env=env,
+    )
+    return proc.returncode, proc.stdout
+
+
+def _engine(repo: Path, env: Mapping[str, str], *args: str) -> tuple[int, str]:
+    """Run the engine CLI in repo and return its exit code and stdout."""
+    proc = subprocess.run(
+        [sys.executable, str(_ENGINE), *args],
         capture_output=True,
         text=True,
         cwd=str(repo),
@@ -196,6 +209,26 @@ def main() -> int:
         smoke.check(
             "occupancy: second session blocked (exit 2, names holder)",
             rc_ob == 2 and "OCC-A" in err_ob and "occupied" in err_ob,
+        )
+
+        # Lock CLI accepts --repo BEFORE the subcommand (engine-style order), too.
+        rc_ord, _ = _lock(repo, env, "--repo", str(repo), "acquire-main", "--owner", "ORD", "x")
+        smoke.check("lock --repo accepted before subcommand", rc_ord == 0)
+        _lock(repo, env, "force-unlock", "--repo", str(repo), "--all")
+
+        # finish: one-shot land of a clean worktree (--no-lock + --skip-tests to
+        # isolate the land/teardown flow from the lock store and a test runner).
+        fwt = base / "fwt"
+        _git(repo, "worktree", "add", "-b", "landme", str(fwt))
+        (fwt / "land.txt").write_text("land me\n")
+        _git(fwt, "add", "land.txt")
+        _git(fwt, "commit", "-m", "land work")
+        rc_fin, _ = _engine(
+            repo, env, "--repo", str(repo), "finish", "--worktree", str(fwt),
+            "--branch", "landme", "--target", "main", "--skip-tests", "--no-lock",
+        )
+        smoke.check(
+            "finish: one-shot land tears down the worktree", rc_fin == 0 and not fwt.exists()
         )
 
     if smoke.failures:

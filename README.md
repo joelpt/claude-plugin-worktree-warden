@@ -115,6 +115,10 @@ worktrees of the repo your current session belongs to — never cross-repo.
   expires old bundles). `check_worktrees` now reports a worktree whose git state
   could not be read as **UNKNOWN** rather than silently classifying it prunable —
   a flaky `git status` under load can no longer make real work look disposable.
+  The **`finish`** subcommand is the one-shot happy path for a single clean worktree —
+  lock → snapshot → land → `--test-cmd` gate → teardown → release in a single call
+  (what `/finish-worktree` uses); it bails cleanly (preserving state and the lock) on a
+  conflict (13) or test failure (18) so the caller can take over, and never auto-rolls-back.
 - `scripts/worktree_lock.py` — cooperative, advisory **concurrency lock** plus the
   `worktree-lock` CLI (`acquire-main`, `release-main`, `refresh-main`, `status`,
   `force-unlock [--all]`). Serializes multi-step operations git can't (the

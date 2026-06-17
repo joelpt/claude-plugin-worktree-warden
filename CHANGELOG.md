@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`worktree_engine.py finish` — one-shot happy-path land.** Collapses the deterministic
+  green path (acquire main-target lock → snapshot → rebase + ff-merge → run a `--test-cmd`
+  gate → teardown → release lock) into a **single** command, so landing a clean worktree no
+  longer means hand-chaining `worktree_lock.py` + `worktree_engine.py` across ~6 calls in the
+  right order. It bails cleanly on anything non-trivial — a rebase conflict (13) or test
+  failure (18) **preserves state and keeps the lock held** for the caller's judgement
+  (`/merge-worktrees`'s ladder); dirty (11) / unsafe (12) / blocked (16) land nothing. It
+  **never auto-rolls-back**. `/finish-worktree` now uses it for the single-worktree fast path,
+  falling back to `/merge-worktrees` for conflicts, test failures, and multi-worktree ordering.
+
+### Fixed
+
+- **`worktree_lock.py` accepts `--repo`/`--owner` in either position.** They were defined only
+  on the subcommands, so `--repo X acquire-main` (the order the merge skill documented, and the
+  one matching `worktree_engine.py`'s top-level `--repo`) errored; only `acquire-main --repo X`
+  worked. Both orders now work.
+
 ### Changed
 
 - **Operation locks (merge/bumpall) now carry a long 120-min lease** (`MERGE_LEASE_SECONDS`,
