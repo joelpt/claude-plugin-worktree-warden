@@ -271,6 +271,13 @@ def lock_advisory(cwd: str) -> str | None:
             "/bumpall will NOT be serialized across sessions until it is fixed "
             "(scripts/worktree_lock.py). The safety gates are unaffected."
         )
+    # Self-heal abandoned occupancy claims first -- but independently, so a prune
+    # failure (e.g. a read-only store) never suppresses the advisory below, which
+    # may be surfacing an actionable stale merge lock.
+    try:
+        worktree_lock.prune_stale_occupancy(str(common), time.time())
+    except Exception:
+        pass
     try:
         return worktree_lock.session_advisory(str(common), time.time())
     except Exception:

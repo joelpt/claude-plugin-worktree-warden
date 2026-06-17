@@ -63,6 +63,23 @@ class DecideLockTest(unittest.TestCase):
         self.assertEqual(d.record.last_active, 1050.0)  # advanced
         self.assertEqual(d.record.expires_at, 1110.0)
 
+    def test_refresh_preserves_kind_and_reason(self) -> None:
+        # A same-session occupancy edit during a merge must NOT relabel the live
+        # merge lock to "occupancy" (which the SessionStart prune would drop).
+        existing = lock.LockRecord(
+            key="/wt", owner="A", kind="merge", reason="landing X",
+            acquired_at=1000.0, last_active=1000.0, expires_at=1100.0,
+        )
+        d = lock.decide_lock(
+            key="/wt", owner="A", kind="occupancy", reason="editing", now=1050.0,
+            existing=existing, lease_seconds=60,
+        )
+        self.assertEqual(d.outcome, "refreshed")
+        assert d.record is not None
+        self.assertEqual(d.record.kind, "merge")  # preserved, not relabeled
+        self.assertEqual(d.record.reason, "landing X")  # preserved
+        self.assertEqual(d.record.expires_at, 1110.0)  # lease renewed
+
     def test_different_owner_live_is_blocked(self) -> None:
         existing = self._rec("A", last_active=1000.0)
         d = lock.decide_lock(

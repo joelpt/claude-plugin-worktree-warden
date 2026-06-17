@@ -259,6 +259,15 @@ the default branch — and the merge is itself many separate engine processes, n
 - **What uses it:** `/merge-worktrees` acquires the main-target lock for the whole land and
   releases it at every terminal exit (the engine renews the lease per subcommand); `/bumpall`
   takes it per repo and reports `SKIPPED (locked)` rather than racing another session.
+- **Per-worktree occupancy** (on by default; `occupancy_lock: false` to disable). While a
+  session edits a worktree it claims it (refreshed on each `Edit`/`Write`); a **different**
+  session that tries to edit the *same* worktree is blocked with the holder's id and the
+  `force-unlock` command. A session's own subagents share its session id, so they never block
+  each other — only genuinely separate sessions contend. The claim is layered only on the
+  gate's allow path (a gate-blocked edit never claims a worktree), has no explicit release (it
+  lapses with the lease; SessionStart prunes abandoned claims), and is best-effort: a broken
+  lock module disables *only* occupancy, never the edit gate. _(git-write Bash serialization is
+  intentionally not gated — git's own index/ref locks already prevent that corruption.)_
 
 This is distinct from native `git worktree lock` (an anti-prune marker for removable media).
 

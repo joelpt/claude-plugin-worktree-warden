@@ -55,23 +55,27 @@ def _git(repo: Path, *args: str) -> None:
     )
 
 
-def _run_hook(cwd: Path, env: Mapping[str, str]) -> tuple[int, str]:
+def _run_hook(
+    cwd: Path, env: Mapping[str, str], session_id: str | None = None
+) -> tuple[int, str]:
     """Drive the enforce hook for an Edit at ``cwd/src/main.py``.
 
     Args:
         cwd: Session working directory the hook should classify against.
         env: Isolated environment (temp XDG plus the plugin root).
+        session_id: Optional session id for the payload (owner of occupancy).
 
     Returns:
         The hook exit code and its stderr text.
     """
-    payload = json.dumps(
-        {
-            "tool_name": "Edit",
-            "cwd": str(cwd),
-            "tool_input": {"file_path": str(cwd / "src" / "main.py")},
-        }
-    )
+    body: dict[str, object] = {
+        "tool_name": "Edit",
+        "cwd": str(cwd),
+        "tool_input": {"file_path": str(cwd / "src" / "main.py")},
+    }
+    if session_id is not None:
+        body["session_id"] = session_id
+    payload = json.dumps(body)
     proc = subprocess.run(
         [sys.executable, str(_HOOK)],
         input=payload,
@@ -107,6 +111,13 @@ def _lock(repo: Path, env: Mapping[str, str], *args: str) -> tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
+def _write_user_config(env: Mapping[str, str], data: dict[str, object]) -> None:
+    """Write the user-scope worktree-gate config under the smoke's temp XDG dir."""
+    d = Path(env["XDG_CONFIG_HOME"]) / "worktree-gate"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.json").write_text(json.dumps(data))
+
+
 def _seed_repo(repo: Path) -> None:
     """Create a minimal committed git repo at repo."""
     repo.mkdir()
@@ -134,6 +145,9 @@ def main() -> int:
             "CLAUDE_PLUGIN_ROOT": str(_ROOT),
         }
         _seed_repo(repo)
+        # Keep the gate + main-lock checks free of occupancy side effects; the
+        # dedicated occupancy section below re-enables it.
+        _write_user_config(env, {"occupancy_lock": False})
 
         print("worktree-warden smoke:")
 
@@ -172,6 +186,17 @@ def main() -> int:
         _lock(repo, env, "force-unlock", "--repo", str(repo))
         _, out_st = _lock(repo, env, "status", "--repo", str(repo))
         smoke.check("force-unlock clears the lock", "no active locks" in out_st)
+
+        # Occupancy: a second session editing the same worktree is blocked; the
+        # first session (and its subagents, sharing its id) is not.
+        _write_user_config(env, {})  # re-enable occupancy (default on)
+        rc_oa, _ = _run_hook(worktree, env, session_id="OCC-A")
+        smoke.check("occupancy: first session edits worktree (allowed)", rc_oa == 0)
+        rc_ob, err_ob = _run_hook(worktree, env, session_id="OCC-B")
+        smoke.check(
+            "occupancy: second session blocked (exit 2, names holder)",
+            rc_ob == 2 and "OCC-A" in err_ob and "occupied" in err_ob,
+        )
 
     if smoke.failures:
         print(f"SMOKE FAIL ({len(smoke.failures)})")

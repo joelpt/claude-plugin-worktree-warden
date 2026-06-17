@@ -142,6 +142,78 @@ def _emit_unborn_notice(facts: gate.GitFacts, file_path: str | None) -> None:
         pass
 
 
+def _occupancy_block(
+    payload: dict[str, object], facts: gate.GitFacts, file_path: str | None
+) -> str | None:
+    """Return a block message if another live session occupies this worktree, else None.
+
+    The Phase-2 occupancy layer. Lazy + guarded on purpose: ``worktree_lock`` is
+    NOT imported at module load, so a broken/absent lock module disables ONLY
+    occupancy, never the core edit gate (which depends only on ``worktree_gate``).
+    Owner is the session id; a session's own subagents share it (verified -- their
+    hook payloads carry the parent ``session_id``), so they never block each other
+    -- only a genuinely separate session contends. Best-effort throughout: any
+    failure returns None (allow), and acquisition is non-persisting on a block.
+
+    Occupancy applies to **linked worktrees only**. The main checkout needs no
+    occupancy claim: a session making *live* (uncommitted) changes to main already
+    blocks a concurrent merge -- the engine's land/preflight refuses on a dirty
+    primary (``EXIT_PRIMARY_UNSAFE``) -- and committed main edits are just history
+    a merge rebases onto. Keeping occupancy off the primary key also means it can
+    never collide with a ``merge``/``bumpall`` lock there, and a clean grant-edit
+    session never leaves a stale main-key claim to alarm the next SessionStart.
+
+    A worktree is claimed only when the edit target is a file *inside* it (not a
+    cross-repo or ``.git``-internal edit that merely happens from this cwd).
+
+    Args:
+        payload: The PreToolUse stdin payload (for ``session_id``).
+        facts: Resolved git context for the session cwd (its ``repo_root`` is the
+            occupied worktree's key).
+        file_path: The absolute edit target, used to confirm the edit is inside the
+            worktree before claiming it.
+
+    Returns:
+        The exit-2 block message, or None to allow the edit.
+    """
+    try:
+        if not facts.in_linked_worktree:
+            return None  # occupancy is a per-linked-worktree concept (see above)
+        if not facts.is_repo or facts.repo_root is None or facts.git_common_dir is None:
+            return None
+        if facts.head_unborn or file_path is None:
+            return None
+        target = os.path.realpath(file_path)
+        if not gate._is_within(target, facts.repo_root):
+            return None  # cross-repo edit from this cwd -- don't claim the worktree
+        if gate._is_within(target, facts.git_common_dir):
+            return None  # internal .git edit -- not occupying the working tree
+        import worktree_lock  # noqa: PLC0415  -- lazy + guarded: a broken lock
+        # module must disable only occupancy, never the core edit gate.
+
+        if not worktree_lock.occupancy_enabled(facts):
+            return None
+        owner = payload.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        if not isinstance(owner, str) or not owner:
+            return None
+        decision = worktree_lock.acquire(
+            facts, owner, "occupancy", "editing this worktree", time.time()
+        )
+        if decision.outcome == "blocked" and decision.blocker is not None:
+            return worktree_lock.occupancy_block_message(decision.blocker, facts.repo_root)
+        return None
+    except Exception as exc:
+        # Fail open (allow the edit) -- but LOUDLY, not silently: occupancy is a
+        # safety-adjacent feature and the plugin's own ethos is fail-open-loudly
+        # (see the gate-load-error sentinel). Record it so a broken occupancy path
+        # is diagnosable rather than a silent no-op. Logging must never itself raise.
+        try:
+            gate.log_event("occupancy-error", repr(exc), file_path)
+        except Exception:
+            pass
+        return None
+
+
 def main() -> int:
     """Evaluate the pending Edit/Write and block it when the gate says so."""
     try:
@@ -180,6 +252,13 @@ def main() -> int:
                 # disable the gate stays off after the first commit too, so the
                 # "enforcement resumes" notice would be false.
                 _emit_unborn_notice(facts, file_path)
+            # Occupancy layer runs ONLY here, on the gate's allow path, so a
+            # gate-blocked edit never claims a worktree it will not touch.
+            occupancy = _occupancy_block(payload, facts, file_path)
+            if occupancy is not None:
+                gate.log_event("occupancy-block", "worktree occupied by another session", file_path)
+                sys.stderr.write(occupancy)
+                return 2
             return 0
 
         gate.log_event("block", decision.reason, file_path)

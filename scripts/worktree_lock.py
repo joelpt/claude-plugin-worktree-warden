@@ -50,8 +50,9 @@ LOCKS_MUTEX_FILENAME = "locks.lock"
 
 DEFAULT_LEASE_SECONDS = 30 * 60
 LEASE_CONFIG_KEY = "lock_lease_seconds"
+OCCUPANCY_CONFIG_KEY = "occupancy_lock"
 
-VALID_KINDS = ("merge", "bumpall", "main-edit", "occupancy")
+VALID_KINDS = ("merge", "bumpall", "occupancy")
 
 
 @dataclass(frozen=True)
@@ -111,8 +112,10 @@ def decide_lock(
     """Rule on one acquire request. Pure: the caller resolves all I/O.
 
     A live lock held by a *different* owner blocks. A live lock held by the
-    *same* owner is refreshed (its original ``acquired_at`` preserved). Anything
-    else -- no record, or a record whose lease has lapsed -- is acquired fresh.
+    *same* owner is refreshed: only the lease is renewed; the lock's identity
+    (``kind``, ``reason``, ``acquired_at``) is fixed at acquire time and preserved.
+    Anything else -- no record, or a record whose lease has lapsed -- is acquired
+    fresh.
 
     Args:
         key: The worktree-toplevel key being locked.
@@ -129,8 +132,19 @@ def decide_lock(
     if existing is not None and not is_stale(existing, now) and existing.owner != owner:
         return LockDecision("blocked", None, existing)
     if existing is not None and existing.owner == owner and not is_stale(existing, now):
+        # Preserve the existing kind/reason -- a refresh renews the lease, it does
+        # not redefine the lock. Otherwise a same-session occupancy edit during a
+        # merge would relabel the live "merge" lock to "occupancy", which the
+        # SessionStart prune then silently drops, destroying the crashed-merge
+        # signal. (The new kind/reason args apply only to a fresh acquire below.)
         renewed = LockRecord(
-            key, owner, kind, reason, existing.acquired_at, now, now + lease_seconds
+            key,
+            owner,
+            existing.kind,
+            existing.reason,
+            existing.acquired_at,
+            now,
+            now + lease_seconds,
         )
         return LockDecision("refreshed", renewed, None)
     fresh = LockRecord(key, owner, kind, reason, now, now, now + lease_seconds)
@@ -261,6 +275,82 @@ def read_lease_seconds(facts: gate.GitFacts) -> int:
     return seconds
 
 
+def occupancy_enabled(facts: gate.GitFacts) -> bool:
+    """Return whether per-worktree occupancy locking is enabled (default True).
+
+    Resolves the same user → project config files as the gate; project overrides
+    user. Lets a user turn occupancy off (``"occupancy_lock": false``) without
+    disabling the rest of the plugin.
+
+    Args:
+        facts: Resolved git context (project config is keyed by its repo root).
+
+    Returns:
+        True when occupancy locking is active.
+    """
+    user_cfg = gate._load_json(gate.user_config_path())
+    proj_cfg = gate._load_json(gate.project_config_path(facts.repo_root))
+    enabled = True
+    for cfg in (user_cfg, proj_cfg):
+        value = cfg.get(OCCUPANCY_CONFIG_KEY)
+        if isinstance(value, bool):
+            enabled = value
+    return enabled
+
+
+def occupancy_block_message(blocker: LockRecord, repo: str) -> str:
+    """Compose the exit-2 message shown when another session occupies a worktree.
+
+    Args:
+        blocker: The live lock record held by the other session.
+        repo: The occupied worktree's toplevel (shown + used in the recovery hint).
+
+    Returns:
+        The stderr message, naming the holder and the exact force-unlock command.
+    """
+    age = _format_age(time.time() - blocker.last_active)
+    return (
+        "🔒 worktree-warden: this worktree is occupied by another session.\n"
+        f"   {repo}\n"
+        f"   held by session {blocker.owner} ({blocker.kind}, active {age}).\n"
+        "   Two sessions editing one worktree can clobber each other. Wait for it "
+        "to finish, or — if that session is gone — release it:\n"
+        f"     {_cli_prefix()} force-unlock --repo {shlex.quote(repo)}"
+    )
+
+
+def prune_stale_occupancy(git_common_dir: str, now: float) -> list[str]:
+    """Drop stale ``occupancy`` records so abandoned claims don't accrue.
+
+    Occupancy locks have no explicit release (a session holds a worktree only via
+    its sliding lease); when a session ends, its claim lapses and is meaningless.
+    Pruning lapsed occupancy records at SessionStart keeps the store tidy and
+    prevents stale-lock alarm-fatigue, while leaving stale *operation* locks
+    (merge/bumpall) in place -- those are actionable (a crashed merge).
+
+    Args:
+        git_common_dir: The repo's shared git dir (where the store lives).
+        now: Current epoch seconds.
+
+    Returns:
+        The keys pruned.
+    """
+    if not locks_path(git_common_dir).exists():
+        return []  # nothing to prune; don't create the mutex on a quiescent repo
+    with _flock(git_common_dir):
+        store = read_store(git_common_dir)
+        pruned = [
+            key
+            for key, record in store.items()
+            if record.kind == "occupancy" and is_stale(record, now)
+        ]
+        for key in pruned:
+            del store[key]
+        if pruned:
+            _write_store(git_common_dir, store)
+    return pruned
+
+
 def acquire(
     facts: gate.GitFacts, owner: str, kind: str, reason: str, now: float
 ) -> LockDecision:
@@ -276,7 +366,17 @@ def acquire(
 
     Returns:
         The decision; on acquire/refresh the record has already been persisted.
+
+    Raises:
+        ValueError: If ``kind`` is not a known kind. ``kind`` is load-bearing --
+            ``prune_stale_occupancy`` and ``session_advisory`` branch on it -- so a
+            stray kind must surface, not silently corrupt the prune/surface rules.
+            A ``raise`` (not ``assert``) so it survives ``python -O``. Callers wrap
+            ``acquire`` in their own try/except and fail open, so this never bricks
+            an edit; it only makes the bug traceable.
     """
+    if kind not in VALID_KINDS:
+        raise ValueError(f"unknown lock kind: {kind!r}")
     assert facts.git_common_dir is not None and facts.repo_root is not None
     lease = read_lease_seconds(facts)
     with _flock(facts.git_common_dir):
@@ -375,8 +475,10 @@ def force_unlock(facts: gate.GitFacts, all_keys: bool) -> list[str]:
 def session_advisory(git_common_dir: str, now: float) -> str | None:
     """Compose a SessionStart banner line for this repo's locks, or None if quiet.
 
-    Active locks are surfaced as awareness (a merge or bumpall is running in
-    another session); stale locks are surfaced as *actionable*, with the exact
+    Active *operation* locks are surfaced as awareness (a merge or bumpall is
+    running in another session); a live *occupancy* lock is steady state (a session
+    simply editing its worktree) and is deliberately NOT surfaced -- it would be
+    per-SessionStart noise. Stale locks are surfaced as *actionable*, with the exact
     ``force-unlock`` command, since a stale lock is the residue of a force-killed
     holder and is the one thing a human may need to clear. Best-effort: any error
     reading the store yields None so a session never fails to start over a lock.
@@ -405,7 +507,7 @@ def session_advisory(git_common_dir: str, now: float) -> str | None:
                 "If that session is gone, clear it:\n"
                 f"        {_cli_prefix()} force-unlock --repo {shlex.quote(key)}"
             )
-        else:
+        elif record.kind != "occupancy":
             active.append(
                 f"  🔒 {key} — session {record.owner} ({record.kind}, active {age})"
             )
@@ -477,6 +579,23 @@ def main_facts(repo: str | None) -> gate.GitFacts:
     return facts
 
 
+def _repo_facts(repo: str | None) -> gate.GitFacts:
+    """Resolve git context for ``repo`` WITHOUT primary resolution.
+
+    Used by ``force-unlock``, whose key is the literal worktree the caller names
+    -- a linked worktree's own occupancy key -- not the primary-resolved key the
+    main-target commands use. Resolving to the primary here would clear the wrong
+    lock (and the occupancy block message's force-unlock hint names the worktree).
+
+    Args:
+        repo: A repo/worktree path, or None to use cwd.
+
+    Returns:
+        GitFacts whose ``repo_root`` is the named path's own worktree toplevel.
+    """
+    return gate.git_facts(os.path.realpath(repo) if repo else os.getcwd())
+
+
 def _resolve_owner(explicit: str | None) -> str:
     """Return the explicit owner, else the session id from the environment."""
     return explicit or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
@@ -512,7 +631,7 @@ def cmd_acquire_main(args: argparse.Namespace) -> int:
             f"reason: {blocker.reason}).\n"
             "   Another session is doing main-side work here. Wait for it, or — if "
             "you are certain it is dead — override:\n"
-            f"     {_cli_prefix()} force-unlock --repo {shlex.quote(args.repo or os.getcwd())}"
+            f"     {_cli_prefix()} force-unlock --repo {shlex.quote(facts.repo_root)}"
         )
         return 1
     try:
@@ -524,7 +643,7 @@ def cmd_acquire_main(args: argparse.Namespace) -> int:
     print(
         f"🔒 worktree-warden LOCK {verb}: {facts.repo_root}\n"
         f"   owner {owner} ({args.kind}), ~{lease_min}m lease. Release with: "
-        f"{_cli_prefix()} release-main --repo {shlex.quote(args.repo or os.getcwd())}"
+        f"{_cli_prefix()} release-main --repo {shlex.quote(facts.repo_root)}"
     )
     return 0
 
@@ -567,8 +686,8 @@ def cmd_refresh_main(args: argparse.Namespace) -> int:
 
 
 def cmd_force_unlock(args: argparse.Namespace) -> int:
-    """Remove this repo's lock (or all locks with --all), regardless of owner."""
-    facts = main_facts(args.repo)
+    """Remove the named worktree's lock (or all locks with --all), regardless of owner."""
+    facts = _repo_facts(args.repo)
     if not facts.is_repo or facts.git_common_dir is None or facts.repo_root is None:
         return _fail_open("not inside a git repository")
     try:
@@ -622,7 +741,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     acquire_p = sub.add_parser("acquire-main", help="acquire the main-target lock")
     _common(acquire_p)
-    acquire_p.add_argument("--kind", choices=VALID_KINDS, default="merge")
+    # Only operation kinds may take the main-target lock from the CLI; ``occupancy``
+    # is hook-internal and must never land on the primary key (it is prunable).
+    acquire_p.add_argument("--kind", choices=("merge", "bumpall"), default="merge")
     acquire_p.add_argument("reason", nargs="*", help="why the lock is held")
 
     release_p = sub.add_parser("release-main", help="release the main-target lock")

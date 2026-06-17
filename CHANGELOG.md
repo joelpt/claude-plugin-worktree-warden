@@ -6,6 +6,18 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Per-worktree occupancy lock** (concurrency lock Phase 2a): while a session edits a
+  worktree it claims it (keyed by the worktree toplevel, owner = session id); a **different**
+  session editing the same worktree is blocked with the holder's id and the `force-unlock`
+  command. A session's own subagents share its session id (POC-verified: a subagent's
+  PreToolUse payload carries the parent `session_id` with a distinct `agent_id`), so they never
+  block each other — only genuinely separate sessions contend. Layered only on the edit gate's
+  allow path (a gate-blocked edit never claims a worktree); enabled by default, switchable via
+  `occupancy_lock`. No explicit release — the claim lapses with the sliding lease and
+  SessionStart prunes abandoned claims. Best-effort and **decoupled**: the edit gate imports
+  the lock module lazily inside the occupancy check, so a broken lock module disables only
+  occupancy, never enforcement. git-write Bash serialization is deliberately not gated (git's
+  index/ref locks already prevent that corruption).
 - **Cooperative concurrency lock** (`scripts/worktree_lock.py`): serializes the multi-step
   operations git can't lock across sessions — above all the multi-process merge. One advisory
   lock per `realpath(worktree-toplevel)` in `<git-common-dir>/worktree-warden/locks.json`,
