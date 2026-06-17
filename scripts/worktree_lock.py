@@ -25,6 +25,15 @@ a **sliding lease** (renewed by the holder's own activity) plus a deterministic
 simply lapses after the window; nobody is left holding the ``flock`` (that is held
 only for the milliseconds of each check-and-set), so the store never wedges.
 
+**The guarantee is honest about its bound:** mutual exclusion holds only WITHIN a
+lease window. An operation that pauses longer than its lease (e.g. a merge waiting
+on a >2h human review) lapses the lease, and a second session may then reclaim the
+key -- exactly what ``force-unlock`` is for, in reverse. Operation locks therefore
+carry a long lease (``MERGE_LEASE_SECONDS``, renewed by each engine subcommand) to
+outlast a realistic pause; occupancy carries the shorter default. This narrows, but
+does not eliminate, the lapse window; closing it fully would require the engine to
+*abort* on a lost lease (a tracked follow-up), not just renew it.
+
 The whole subsystem fails OPEN: any error proceeds *without* a lock rather than
 blocking work, mirroring the rest of the plugin's gates.
 """
@@ -50,9 +59,18 @@ LOCKS_MUTEX_FILENAME = "locks.lock"
 
 DEFAULT_LEASE_SECONDS = 30 * 60
 LEASE_CONFIG_KEY = "lock_lease_seconds"
+# Operation locks (merge/bumpall) get a much longer lease than occupancy: a merge
+# spans many separate engine subprocesses with gaps (conflict resolution, tests,
+# HITL pauses) that are not continuously refreshed, so the lease must outlast a
+# realistic pause or it lapses mid-merge and a second merge could start. Mutual
+# exclusion therefore holds only WITHIN a lease window; a pause longer than the
+# window can lapse the lease (force-unlock is the deterministic escape).
+MERGE_LEASE_SECONDS = 120 * 60
+MERGE_LEASE_CONFIG_KEY = "merge_lease_seconds"
 OCCUPANCY_CONFIG_KEY = "occupancy_lock"
 
 VALID_KINDS = ("merge", "bumpall", "occupancy")
+_OPERATION_KINDS = ("merge", "bumpall")
 
 
 @dataclass(frozen=True)
@@ -275,6 +293,49 @@ def read_lease_seconds(facts: gate.GitFacts) -> int:
     return seconds
 
 
+def read_merge_lease_seconds(facts: gate.GitFacts) -> int:
+    """Return the operation-lock (merge/bumpall) lease length, user → project.
+
+    Defaults to the long MERGE_LEASE_SECONDS so a merge survives a realistic
+    HITL/test pause between engine subprocesses; configurable via
+    ``merge_lease_seconds``. Clamped to the gate's supported window bounds.
+
+    Args:
+        facts: Resolved git context (project config is keyed by its repo root).
+
+    Returns:
+        The merge lease length in seconds.
+    """
+    user_cfg = gate._load_json(gate.user_config_path())
+    proj_cfg = gate._load_json(gate.project_config_path(facts.repo_root))
+    seconds = MERGE_LEASE_SECONDS
+    for cfg in (user_cfg, proj_cfg):
+        value = cfg.get(MERGE_LEASE_CONFIG_KEY)
+        if isinstance(value, int) and not isinstance(value, bool):
+            seconds = gate._clamp_window(value)
+    return seconds
+
+
+def _lease_for_kind(facts: gate.GitFacts, kind: str) -> int:
+    """Return the lease length appropriate to a lock kind.
+
+    Operation locks (merge/bumpall) get the long merge lease; occupancy gets the
+    shorter default. Used by BOTH acquire and refresh so the engine's
+    per-subcommand refresh renews a merge lease at its own (long) length rather
+    than silently shrinking it to the occupancy default.
+
+    Args:
+        facts: Resolved git context.
+        kind: The lock kind.
+
+    Returns:
+        The lease length in seconds for that kind.
+    """
+    if kind in _OPERATION_KINDS:
+        return read_merge_lease_seconds(facts)
+    return read_lease_seconds(facts)
+
+
 def occupancy_enabled(facts: gate.GitFacts) -> bool:
     """Return whether per-worktree occupancy locking is enabled (default True).
 
@@ -378,7 +439,7 @@ def acquire(
     if kind not in VALID_KINDS:
         raise ValueError(f"unknown lock kind: {kind!r}")
     assert facts.git_common_dir is not None and facts.repo_root is not None
-    lease = read_lease_seconds(facts)
+    lease = _lease_for_kind(facts, kind)
     with _flock(facts.git_common_dir):
         store = read_store(facts.git_common_dir)
         existing = store.get(facts.repo_root)
@@ -414,11 +475,13 @@ def refresh(facts: gate.GitFacts, owner: str, now: float) -> LockDecision:
         A "refreshed" decision (record persisted) or a "lost" decision.
     """
     assert facts.git_common_dir is not None and facts.repo_root is not None
-    lease = read_lease_seconds(facts)
     with _flock(facts.git_common_dir):
         store = read_store(facts.git_common_dir)
         existing = store.get(facts.repo_root)
         if existing is not None and existing.owner == owner and not is_stale(existing, now):
+            # Renew at the lease length for the record's OWN kind, so a merge lock
+            # refreshed between engine subcommands keeps its long window.
+            lease = _lease_for_kind(facts, existing.kind)
             renewed = replace(existing, last_active=now, expires_at=now + lease)
             store[facts.repo_root] = renewed
             _write_store(facts.git_common_dir, store)

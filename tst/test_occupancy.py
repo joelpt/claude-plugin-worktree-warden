@@ -65,6 +65,29 @@ class OccupancyUnitTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.xdg)}):
             self.assertFalse(lock.occupancy_enabled(self.facts))
 
+    def test_merge_lock_gets_the_long_lease(self) -> None:
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.xdg)}):
+            d = lock.acquire(self.facts, "A", "merge", "landing", 1000.0)
+        assert d.record is not None
+        self.assertEqual(d.record.expires_at, 1000.0 + lock.MERGE_LEASE_SECONDS)
+
+    def test_occupancy_lock_gets_the_short_default_lease(self) -> None:
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.xdg)}):
+            d = lock.acquire(self.facts, "A", "occupancy", "editing", 1000.0)
+        assert d.record is not None
+        self.assertEqual(d.record.expires_at, 1000.0 + lock.DEFAULT_LEASE_SECONDS)
+        self.assertGreater(lock.MERGE_LEASE_SECONDS, lock.DEFAULT_LEASE_SECONDS)
+
+    def test_refresh_renews_merge_lock_at_the_long_lease(self) -> None:
+        # The engine refreshes a merge lock between subcommands; it must keep the
+        # long window, not silently shrink to the occupancy default.
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.xdg)}):
+            lock.acquire(self.facts, "A", "merge", "landing", 1000.0)
+            d = lock.refresh(self.facts, "A", 2000.0)
+        self.assertEqual(d.outcome, "refreshed")
+        assert d.record is not None
+        self.assertEqual(d.record.expires_at, 2000.0 + lock.MERGE_LEASE_SECONDS)
+
     def test_acquire_rejects_unknown_kind(self) -> None:
         # `kind` is load-bearing (prune/surface branch on it); a stray kind must
         # raise at the acquire boundary, not silently corrupt the store.

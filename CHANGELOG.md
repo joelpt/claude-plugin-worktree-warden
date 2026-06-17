@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Operation locks (merge/bumpall) now carry a long 120-min lease** (`MERGE_LEASE_SECONDS`,
+  configurable via `merge_lease_seconds`), renewed at that length by both `acquire` and the
+  engine's per-subcommand refresh — so a merge that pauses for conflict resolution, tests, or
+  human review no longer lapses its lease mid-operation (which could let a second merge start).
+  Occupancy keeps the shorter default lease. The guarantee is documented honestly: mutual
+  exclusion holds only within a lease window; a pause longer than the window can lapse the lock,
+  and `force-unlock` is the deterministic escape. (Fully closing the window — aborting a merge
+  on a lost lease rather than renewing — is a tracked follow-up.)
+
 ### Added
 
 - **Per-worktree occupancy lock** (concurrency lock Phase 2a): while a session edits a
