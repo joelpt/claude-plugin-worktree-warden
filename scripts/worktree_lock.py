@@ -30,9 +30,11 @@ lease window. An operation that pauses longer than its lease (e.g. a merge waiti
 on a >2h human review) lapses the lease, and a second session may then reclaim the
 key -- exactly what ``force-unlock`` is for, in reverse. Operation locks therefore
 carry a long lease (``MERGE_LEASE_SECONDS``, renewed by each engine subcommand) to
-outlast a realistic pause; occupancy carries the shorter default. This narrows, but
-does not eliminate, the lapse window; closing it fully would require the engine to
-*abort* on a lost lease (a tracked follow-up), not just renew it.
+outlast a realistic pause; occupancy carries the shorter default. That narrows the
+lapse window (Option A); the engine closes it (Option B) by *aborting* a merge step
+whose lease ``refresh`` reports ``"lost"`` (``--require-lease`` →
+``EXIT_LEASE_LOST``), so a reclaimed key halts the merge before it can race a second
+writer onto ``main`` rather than silently continuing.
 
 The whole subsystem fails OPEN: any error proceeds *without* a lock rather than
 blocking work, mirroring the rest of the plugin's gates.
@@ -43,11 +45,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import json
 import os
 import shlex
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -262,6 +265,51 @@ def read_store(git_common_dir: str) -> dict[str, LockRecord]:
     return store
 
 
+def read_store_strict(git_common_dir: str) -> dict[str, LockRecord]:
+    """Like ``read_store`` but RAISES on an unreadable/corrupt store.
+
+    ``read_store`` (via ``gate._load_json``) fails OPEN: an IO error reads as an
+    empty ``{}``, indistinguishable from a store that genuinely holds no records.
+    That ambiguity is fine for acquire/prune/surface, but NOT for the lost-lease
+    abort -- an IO fault must never masquerade as a force-unlocked lease and halt a
+    healthy merge. This reader therefore lets ``OSError``/``ValueError`` propagate
+    so the caller can fail OPEN (proceed) on a fault, while still treating a
+    cleanly-read, record-less store as a genuine loss. A *missing* file is a
+    genuine empty store (``force-unlock --all`` can rewrite the file with no keys,
+    and a never-locked repo has none), not a fault, so it returns ``{}``.
+
+    Args:
+        git_common_dir: The repo's shared git dir.
+
+    Returns:
+        A mapping of worktree-key to its current LockRecord.
+
+    Raises:
+        OSError: The store file exists but could not be read.
+        ValueError: The store file exists but is not valid JSON.
+    """
+    path = locks_path(git_common_dir)
+    if not path.exists():
+        return {}
+    raw = json.loads(path.read_text())
+    if not isinstance(raw, dict):
+        # A valid-JSON but non-object store (e.g. ``[]`` from partial corruption)
+        # is structurally invalid, not an empty store. Raise so the caller fails
+        # OPEN rather than reading it as a lost lease and spuriously aborting.
+        raise ValueError(f"lock store is not a JSON object: {type(raw).__name__}")
+    store: dict[str, LockRecord] = {}
+    for key, value in raw.items():
+        record = _record_from_dict(value)
+        if record is None:
+            # ``read_store`` silently drops a malformed record (fail-open); the
+            # strict reader must NOT -- a torn-but-JSON-valid OWN record would
+            # then read as a missing lease and spuriously abort a healthy merge.
+            # Raise so the caller fails OPEN on the corruption instead.
+            raise ValueError(f"lock store has a malformed record for key {key!r}")
+        store[str(key)] = record
+    return store
+
+
 def _write_store(git_common_dir: str, store: dict[str, LockRecord]) -> None:
     """Persist the lock store atomically."""
     payload: dict[str, object] = {
@@ -458,25 +506,31 @@ def acquire(
     return decision
 
 
-def refresh(facts: gate.GitFacts, owner: str, now: float) -> LockDecision:
-    """Renew the holder's own live lease; no-op if it is gone or foreign.
+def _refresh_with(
+    facts: gate.GitFacts,
+    owner: str,
+    now: float,
+    reader: Callable[[str], dict[str, LockRecord]],
+) -> LockDecision:
+    """Renew this owner's live lease under the mutex, reading via ``reader``.
 
-    Called best-effort by each engine subcommand so a long merge keeps its lease
-    alive between steps. It deliberately never *acquires* -- only the operation's
-    entry point acquires -- so a refresh that finds the lock missing or taken by
-    someone else (e.g. after a force-unlock) just reports "lost".
+    The whole check-renew-or-report-loss runs inside a single ``_flock`` so the
+    record decided on is the record written -- no read/decide/re-read window.
 
     Args:
         facts: Resolved git context.
         owner: The session id expected to hold the lock.
         now: Current epoch seconds.
+        reader: The store reader -- ``read_store`` (fail-open) or
+            ``read_store_strict`` (raises on a corrupt/unreadable store).
 
     Returns:
-        A "refreshed" decision (record persisted) or a "lost" decision.
+        A "refreshed" decision (record persisted) or a "lost" decision whose
+        ``blocker`` is whatever record currently occupies the key (or None).
     """
     assert facts.git_common_dir is not None and facts.repo_root is not None
     with _flock(facts.git_common_dir):
-        store = read_store(facts.git_common_dir)
+        store = reader(facts.git_common_dir)
         existing = store.get(facts.repo_root)
         if existing is not None and existing.owner == owner and not is_stale(existing, now):
             # Renew at the lease length for the record's OWN kind, so a merge lock
@@ -487,6 +541,51 @@ def refresh(facts: gate.GitFacts, owner: str, now: float) -> LockDecision:
             _write_store(facts.git_common_dir, store)
             return LockDecision("refreshed", renewed, None)
         return LockDecision("lost", None, existing)
+
+
+def refresh(facts: gate.GitFacts, owner: str, now: float) -> LockDecision:
+    """Renew the holder's own live lease; no-op if it is gone or foreign.
+
+    Called best-effort by each engine subcommand so a long merge keeps its lease
+    alive between steps. It deliberately never *acquires* -- only the operation's
+    entry point acquires -- so a refresh that finds the lock missing or taken by
+    someone else (e.g. after a force-unlock) just reports "lost". Reads fail-open:
+    an IO fault reads as an empty store and reports "lost" without raising.
+
+    Args:
+        facts: Resolved git context.
+        owner: The session id expected to hold the lock.
+        now: Current epoch seconds.
+
+    Returns:
+        A "refreshed" decision (record persisted) or a "lost" decision.
+    """
+    return _refresh_with(facts, owner, now, read_store)
+
+
+def refresh_strict(facts: gate.GitFacts, owner: str, now: float) -> LockDecision:
+    """Like ``refresh`` but reads strictly, so a fault RAISES instead of "lost".
+
+    The lost-lease abort must distinguish a genuine loss (clean store, our record
+    gone) from a transient fault (which fail-open ``refresh`` would misreport as
+    "lost"). Reading via ``read_store_strict`` under the *same* flock that does the
+    renewal collapses that into one atomic, race-free decision: a corrupt or
+    unreadable store raises here so the caller can fail OPEN (proceed, no abort),
+    while a cleanly-read store missing our live record is a true loss.
+
+    Args:
+        facts: Resolved git context.
+        owner: The session id expected to hold the lock.
+        now: Current epoch seconds.
+
+    Returns:
+        A "refreshed" or "lost" decision, derived from a single strict read.
+
+    Raises:
+        OSError: The store file exists but could not be read.
+        ValueError: The store file exists but is structurally invalid.
+    """
+    return _refresh_with(facts, owner, now, read_store_strict)
 
 
 def release(facts: gate.GitFacts, owner: str) -> bool:

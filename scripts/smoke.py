@@ -231,6 +231,27 @@ def main() -> int:
             "finish: one-shot land tears down the worktree", rc_fin == 0 and not fwt.exists()
         )
 
+        # lease-lost abort (F-A Option B): a mutating step with --require-lease
+        # aborts (exit 19) when its main-target lease was force-unlocked mid-merge,
+        # leaving the worktree un-landed (recoverable). The engine reads the owner
+        # from CLAUDE_CODE_SESSION_ID, so seed it for this leg only.
+        lwt = base / "lwt"
+        _git(repo, "worktree", "add", "-b", "leaseme", str(lwt))
+        (lwt / "lease.txt").write_text("lease work\n")
+        _git(lwt, "add", "lease.txt")
+        _git(lwt, "commit", "-m", "lease work")
+        lease_env = {**env, "CLAUDE_CODE_SESSION_ID": "LEASE"}
+        _lock(repo, lease_env, "acquire-main", "--repo", str(repo), "--owner", "LEASE", "x")
+        _lock(repo, lease_env, "force-unlock", "--repo", str(repo), "--all")  # lease lost
+        rc_lost, _ = _engine(
+            repo, lease_env, "--repo", str(repo), "land", "--worktree", str(lwt),
+            "--branch", "leaseme", "--target", "main", "--require-lease",
+        )
+        smoke.check(
+            "lease-lost: land --require-lease aborts (exit 19), nothing landed",
+            rc_lost == 19 and lwt.exists(),
+        )
+
     if smoke.failures:
         print(f"SMOKE FAIL ({len(smoke.failures)})")
         return 1

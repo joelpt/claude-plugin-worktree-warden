@@ -79,6 +79,7 @@ EXIT_GIT_ERROR = 15
 EXIT_LOCK_BLOCKED = 16
 EXIT_CORE_BARE = 17
 EXIT_TESTS_FAILED = 18
+EXIT_LEASE_LOST = 19
 
 # Harness-regenerated file; discarding it is user-authorized (mirrors rmws.py).
 NOISE_PATH = ".claude/settings.local.json"
@@ -1167,36 +1168,112 @@ def cmd_finish(
     )
 
 
-def _refresh_main_lease(repo: str) -> None:
-    """Best-effort renew this session's main-target lock lease (never raises).
+def _log_lease_error(repo: str, exc: Exception) -> None:
+    """Record a lease-refresh fault to the audit log; never raise.
+
+    The lease refresh fails OPEN on any fault, but does so LOUDLY (the plugin's
+    fail-open-and-log ethos) so a genuine defect that silently disables every
+    abort -- re-opening the two-writers-on-main race -- leaves a diagnosable trail.
+    """
+    try:
+        import worktree_gate  # noqa: PLC0415
+
+        worktree_gate.log_event("lease-refresh-error", f"{repo}: {exc!r}", None)
+    except Exception:
+        pass
+
+
+def _refresh_main_lease(repo: str) -> tuple[bool, str | None]:
+    """Renew this session's main-target lease; report whether it was LOST.
 
     The merge skill acquires the main-target lock once and holds it for the whole
     operation, but each engine subcommand is a separate process, so the lease
     would otherwise only be renewed at acquire time. Renewing it on entry to each
-    mutating step keeps a long merge's lease alive across steps. The gaps between
-    steps (conflict resolution, ``just test``, HITL pauses) are deliberately not
-    covered here -- the generous lease window and ``force-unlock`` are the
-    backstops. Everything is lazy and guarded: a missing/broken lock module, an
-    absent session id, or any IO error simply skips the refresh so the engine
-    (and the merge) is never broken by the lock subsystem.
+    mutating step keeps a long merge's lease alive across steps (Option A). When
+    the lease is *gone* -- force-unlocked, or reclaimed by another session after a
+    pause outlasted the window -- ``refresh`` reports ``"lost"``; this returns that
+    signal so the caller can ABORT before mutating ``main`` (Option B, the closing
+    of the lapse window).
+
+    Everything is lazy and guarded: a missing/broken lock module, an absent session
+    id, or any IO error returns ``(False, None)`` -- a fault is NEVER read as a lost
+    lease, so it can never spuriously abort a merge; it just proceeds unlocked, like
+    the rest of the plugin's gates. A lost lease is only ever a *positive* signal
+    from a cleanly-read store.
+
+    The subtlety: a fail-OPEN read turns an IO fault into an empty ``{}`` --
+    indistinguishable from a genuinely record-less store -- so a transient disk blip
+    mid-merge would report a spurious ``"lost"``. ``refresh_strict`` closes that by
+    renewing and deciding under a *single* flock with a strict read (one that RAISES on
+    a fault): a fault is caught here and proceeds (no abort); only a cleanly-read store
+    lacking our live record is a true loss. One flock means the record decided on is the
+    record written -- no read/decide/re-read window for a third session to slip through.
 
     Args:
         repo: The primary checkout path (the main-target key).
+
+    Returns:
+        ``(lost, holder)``: ``lost`` is True only on a true loss confirmed against a
+        cleanly-read store; ``holder`` is the session id now holding the key when a
+        *different, live* session reclaimed it (so the caller knows ``undo`` would
+        collide with a live writer), else None (force-unlocked / our own lapsed lease /
+        a stale foreign record -- no live contender, ``undo`` is safe).
     """
     try:
         import worktree_lock  # noqa: PLC0415  -- lazy + guarded (fail-open)
 
         owner = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
         if not owner:
-            return
+            return False, None
         facts = worktree_lock.main_facts(repo)  # keys on the primary, like acquire
-        if facts.is_repo and facts.git_common_dir is not None:
-            worktree_lock.refresh(facts, owner, time.time())
-    except Exception:
-        pass
+        if not (facts.is_repo and facts.git_common_dir is not None):
+            return False, None
+        now = time.time()
+        try:
+            decision = worktree_lock.refresh_strict(facts, owner, now)
+        except Exception as exc:
+            # A strict-read fault suppresses the abort (fail OPEN, never halt a
+            # healthy merge on a blip) -- but it also skipped this step's renewal,
+            # so attempt a best-effort fail-open renewal to keep a live lease from
+            # lapsing across steps under recurring blips. Its loss verdict is
+            # discarded: an abort fires only on a strict, confirmed loss.
+            _log_lease_error(repo, exc)
+            try:
+                worktree_lock.refresh(facts, owner, now)
+            except Exception:
+                pass
+            return False, None
+        if decision.outcome != "lost":
+            return False, None
+        blocker = decision.blocker
+        if blocker is not None and blocker.owner != owner and not worktree_lock.is_stale(blocker, now):
+            return True, blocker.owner  # a live foreign session reclaimed the key
+        return True, None  # force-unlocked / our own lapse / stale foreign -- undo is safe
+    except Exception as exc:
+        # Fail OPEN but LOUDLY (the plugin's ethos): a genuine defect here would
+        # otherwise silently skip every abort and re-open the two-writers race.
+        _log_lease_error(repo, exc)
+        return False, None
 
 
 _LEASE_REFRESH_CMDS = frozenset({"land", "rebase-continue", "snapshot", "teardown", "undo"})
+
+
+def _add_require_lease(p: argparse.ArgumentParser) -> None:
+    """Attach the opt-in ``--require-lease`` flag to a mutating subparser.
+
+    Only the orchestrator (the merge skill / finish) knows it is mid-merge and
+    holds a lease, so only it opts in: with the flag, a lost lease ABORTS the step
+    before any mutation (EXIT_LEASE_LOST); without it, the engine behaves exactly
+    as before (best-effort refresh, never an abort) so direct CLI callers that
+    never acquired a lock are unaffected. ``undo`` deliberately does NOT offer the
+    flag -- recovery must never be blockable by the lease-loss it recovers from.
+    """
+    p.add_argument(
+        "--require-lease",
+        action="store_true",
+        help="Abort (exit 19) if this session's main-target lease was lost.",
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1208,16 +1285,19 @@ def main(argv: list[str] | None = None) -> int:
     p_land.add_argument("--worktree", required=True)
     p_land.add_argument("--branch", required=True)
     p_land.add_argument("--target", default="main")
+    _add_require_lease(p_land)
 
     p_cont = sub.add_parser("rebase-continue")
     p_cont.add_argument("--worktree", required=True)
     p_cont.add_argument("--branch", required=True)
     p_cont.add_argument("--target", default="main")
+    _add_require_lease(p_cont)
 
     p_snap = sub.add_parser("snapshot")
     p_snap.add_argument("--target", default="main")
     p_snap.add_argument("--branches", default="", help="Comma-separated branch names.")
     p_snap.add_argument("--out", default=None, help="Snapshot JSON path (default: under git dir).")
+    _add_require_lease(p_snap)
 
     p_pre = sub.add_parser("preflight")
     p_pre.add_argument("--branches", default="", help="Comma-separated branch names.")
@@ -1241,6 +1321,7 @@ def main(argv: list[str] | None = None) -> int:
     p_td.add_argument("--branch", required=True)
     p_td.add_argument("--target", default="main")
     p_td.add_argument("--dry-run", action="store_true")
+    _add_require_lease(p_td)
 
     p_rec = sub.add_parser("recover")
     p_rec.add_argument("--target", default="main")
@@ -1267,7 +1348,31 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     repo = args.repo
     if args.cmd in _LEASE_REFRESH_CMDS:
-        _refresh_main_lease(repo)
+        lost, holder = _refresh_main_lease(repo)
+        if lost and getattr(args, "require_lease", False):
+            if args.cmd == "snapshot":
+                # Aborting AT the snapshot step: no snapshot file and no land yet,
+                # so there is nothing to undo -- just stop.
+                tail = "Nothing has landed yet — nothing to undo. Stop and re-acquire the lock before retrying."
+            elif holder is not None:
+                tail = (
+                    f"Another session ({holder}) now holds the lock and may be writing "
+                    f"'{getattr(args, 'target', 'main')}' — do NOT undo blindly; coordinate first."
+                )
+            else:
+                tail = "No session holds the lock now; undo the held snapshot to recover any landed work."
+            outcome = Outcome(
+                EXIT_LEASE_LOST,
+                "lease_lost",
+                "Main-target lease LOST before this step (force-unlocked or reclaimed). "
+                "Aborted before any mutation — nothing changed. Halt the merge. " + tail,
+                target=getattr(args, "target", ""),
+                branch=getattr(args, "branch", ""),
+                primary=repo,
+                details={"holder": holder, "aborted_cmd": args.cmd},
+            )
+            _audit(repo, "lease-lost", outcome)
+            return outcome.emit()
     try:
         if args.cmd == "preflight":
             branches = [b for b in args.branches.split(",") if b]

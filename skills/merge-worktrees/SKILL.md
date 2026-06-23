@@ -25,7 +25,26 @@ decisions). Repo-scoped: only ever this repo's worktrees.
 `TARGET` and cleanliness resolved by **preflight** (see below). Engine exit codes: `0` ok
 · `10` n/a (already merged / on target) · `11` worktree dirty · `12` primary unsafe
 · `13` rebase conflict (LEFT IN PROGRESS) · `14` ff-merge failed · `15` git error
-· `17` core.bare corruption.
+· `16` lock blocked · `17` core.bare corruption · `18` tests failed · `19` lease lost.
+
+> **Lost-lease abort (exit `19`) — a global rule that overrides per-step handling.** Every
+> mutating engine step below is passed `--require-lease`, so it ABORTS *before any mutation*
+> if this session's step-0 lock was reclaimed or force-unlocked mid-merge (nothing changed on
+> that step). **Any `19` → STOP immediately: do not retry the step, do not run further steps.**
+> Surface it to the user with the `message` verbatim and follow the recovery action the
+> `message` states. Then read `details.holder` — but treat it as a **point-in-time snapshot,
+> not a standing fact**: it was true the instant the abort read the store, and a second session
+> can reclaim (or release) the key immediately after. If it names another session, that session
+> may be writing `$TARGET` right now — do **not** `undo`; report and let the user coordinate. If
+> `holder` is `null`, no live session held the lock *at abort time*: if a snapshot was already
+> taken (the abort was at land / rebase-continue / teardown), recovery is `undo` of the held
+> snapshot (step 6's command; `undo` is intentionally NOT gated by the lease, so it always runs)
+> — but because the advisory can go stale, **re-confirm immediately before undoing** that no
+> session has reclaimed the key (`python3 $LOCK status --repo $REPO`); if one now holds it, stop
+> and let the user coordinate instead of racing `undo` against a live writer. If the abort was
+> at the **snapshot** step itself, nothing landed and there is nothing to undo — just stop and
+> re-acquire. `19` is the only code that can interrupt the granular steps out of band; treat it
+> as a hard halt, not a per-step branch.
 
 **Safety contract:**
 
@@ -114,7 +133,7 @@ preflight and `git -C <path> diff HEAD --stat`; `AskUserQuestion` "commit these 
 ## 2. Snapshot the restore anchors
 
 After all commits, before any rebase:
-`python3 $ENGINE --repo $REPO snapshot --target $TARGET --branches <b1,b2,…>`
+`python3 $ENGINE --repo $REPO snapshot --target $TARGET --branches <b1,b2,…> --require-lease`
 Save `details.snapshot_file` (the engine writes the target tip, each branch tip, and each
 branch's worktree path to it) — this is what `undo` reads to rebuild the pre-land branch/
 target tips **and recreate any torn-down worktrees**. Because step 1 already committed every
@@ -144,7 +163,7 @@ calls pass `--repo $REPO` explicitly regardless.
 ## 5. Land in order
 
 For each branch in order:
-`python3 $ENGINE --repo $REPO land --worktree <path> --branch <branch> --target $TARGET`
+`python3 $ENGINE --repo $REPO land --worktree <path> --branch <branch> --target $TARGET --require-lease`
 
 - `0` → landed; next worktree (each subsequent rebases onto the now-advanced `$TARGET`).
 - `13` (conflict, rebase LEFT IN PROGRESS) → resolving edits worktree files while this
@@ -154,7 +173,7 @@ For each branch in order:
   the listed `details.conflicts` in the worktree. High-confidence resolution → just do it.
   Low/medium (e.g. `foo(argA)`+`foo(argB)` → `foo(argA,argB)` + a combined test) → run the
   **step-3 escalation ladder**. Then `git -C <path> add <files>` and
-  `python3 $ENGINE --repo $REPO rebase-continue --worktree <path> --branch <branch> --target $TARGET`;
+  `python3 $ENGINE --repo $REPO rebase-continue --worktree <path> --branch <branch> --target $TARGET --require-lease`;
   loop on repeated `13`. When the branch lands (`0`) or you stop, close it:
   `python3 $GATE finished`.
 - `10` → already merged; skip to teardown for it. `11`/`12`/`14`/`15`/`17` → stop, report
@@ -193,7 +212,7 @@ Expect: clean status + expected commits visible. Then run the suite: Justfile `t
 ## 7. Teardown (only on green: verify clean AND tests pass)
 
 For each successfully landed worktree:
-`python3 $ENGINE --repo $REPO teardown --branch <branch> --target $TARGET`
+`python3 $ENGINE --repo $REPO teardown --branch <branch> --target $TARGET --require-lease`
 `0` = pruned/no-op; non-zero = refused (report verbatim, never force).
 
 Then **release the merge lock** — the operation is done:

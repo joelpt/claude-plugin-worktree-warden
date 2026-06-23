@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Abort a merge on a lost lease (F-A Option B; closes the lease-lapse window).** The
+  multi-process merge holds its main-target lease across many separate `worktree_engine.py`
+  subprocesses; a pause that outlasts the lease — or a human `force-unlock` — can let a second
+  session reclaim the key mid-merge. Option A (the long, per-subcommand-renewed lease) *narrowed*
+  that window; Option B *closes* it. Mutating engine steps now accept `--require-lease`: when set
+  and the per-subcommand `refresh` reports the lease `"lost"`, the step **aborts before any
+  mutation** with the new exit code `19` (`EXIT_LEASE_LOST`), so a reclaimed key halts the merge
+  instead of racing a second writer onto `main`. The abort reports `details.holder` — the live
+  reclaiming session, or `null` after a force-unlock — so the orchestrator knows whether `undo`
+  is safe or would collide with a live writer, and emits a `lease-lost` audit event. The flag is
+  opt-in (only the orchestrator knows it holds a lease; a bare CLI `land` that never acquired one
+  is unaffected — `refresh` alone cannot distinguish "lost my lease" from "never had one"), and
+  `undo` deliberately has **no** such flag so recovery is never blockable by the lease-loss it
+  recovers from. `/merge-worktrees` passes `--require-lease` on snapshot/land/rebase-continue/
+  teardown and treats `19` as a global hard-halt.
+
 - **`worktree_engine.py finish` — one-shot happy-path land.** Collapses the deterministic
   green path (acquire main-target lock → snapshot → rebase + ff-merge → run a `--test-cmd`
   gate → teardown → release lock) into a **single** command, so landing a clean worktree no
