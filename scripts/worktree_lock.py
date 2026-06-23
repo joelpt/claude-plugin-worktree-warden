@@ -53,6 +53,7 @@ import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import cast
 
 import worktree_gate as gate
 
@@ -210,19 +211,44 @@ def _flock(git_common_dir: str) -> Iterator[None]:
             os.close(fd)
 
 
+def _coerce_float(value: object) -> float:
+    """Coerce a stored JSON scalar to float; raise for anything non-numeric.
+
+    Mirrors what ``float(...)`` accepted (int/float/numeric str) without leaking
+    the parsed value's ``object`` type into the call -- ``bool`` is rejected
+    explicitly since it is an ``int`` subclass that should never be a timestamp.
+
+    Args:
+        value: A scalar pulled from the parsed lock store.
+
+    Returns:
+        The value as a float.
+
+    Raises:
+        TypeError: The value is not a number or numeric string.
+        ValueError: The value is a string that does not parse as a float.
+    """
+    if isinstance(value, bool):
+        raise TypeError("expected a number, got bool")
+    if isinstance(value, (int, float, str)):
+        return float(value)
+    raise TypeError(f"expected a number, got {type(value).__name__}")
+
+
 def _record_from_dict(data: object) -> LockRecord | None:
     """Parse one stored record, returning None for anything malformed."""
     if not isinstance(data, dict):
         return None
+    fields = cast("dict[str, object]", data)
     try:
         return LockRecord(
-            key=str(data["key"]),
-            owner=str(data["owner"]),
-            kind=str(data.get("kind", "")),
-            reason=str(data.get("reason", "")),
-            acquired_at=float(data["acquired_at"]),
-            last_active=float(data["last_active"]),
-            expires_at=float(data["expires_at"]),
+            key=str(fields["key"]),
+            owner=str(fields["owner"]),
+            kind=str(fields.get("kind", "")),
+            reason=str(fields.get("reason", "")),
+            acquired_at=_coerce_float(fields["acquired_at"]),
+            last_active=_coerce_float(fields["last_active"]),
+            expires_at=_coerce_float(fields["expires_at"]),
         )
     except (KeyError, TypeError, ValueError):
         return None
