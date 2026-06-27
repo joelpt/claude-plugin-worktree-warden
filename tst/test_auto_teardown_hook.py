@@ -165,7 +165,7 @@ class AutoTeardownHookTest(unittest.TestCase):
         _, out = self._hook({"cwd": str(self.wt), "session_id": "s1"})
         data = json.loads(out)
         self.assertIn("auto", data["reason"])
-        self.assertIn("merge-worktrees", data["reason"])
+        self.assertIn("finish-worktree", data["reason"])
 
     def test_always_mode_reason(self) -> None:
         self._add_commit(self.wt)
@@ -182,7 +182,7 @@ class AutoTeardownHookTest(unittest.TestCase):
         _, out = self._hook({"cwd": str(self.wt), "session_id": "s1"})
         data = json.loads(out)
         self.assertIn("commit-only", data["reason"])
-        self.assertNotIn("merge-worktrees", data["reason"])
+        self.assertNotIn("finish-worktree", data["reason"])
 
     # ── debounce ──────────────────────────────────────────────────────────────
 

@@ -1,94 +1,54 @@
 ---
 name: finish-worktree
-description: Land the current linked worktree into its default branch and tear it down. Use when wrapping up work from inside a worktree. From the primary checkout, use check-worktrees instead.
+description: Finish one linked worktree.
 argument-hint: "[target-branch]"
 allowed-tools: Bash(python3 *) Bash(git *) Bash(cd *) ExitWorktree EnterWorktree Skill(worktree-warden:merge-worktrees) Skill(worktree-warden:check-worktrees) Skill(commit-commands:commitall)
 ---
 
 `ENGINE=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_engine.py`
+`RESOLVE_TEST=${CLAUDE_PLUGIN_ROOT}/scripts/resolve_test_cmd.py`
 
-## Contract
+Single-worktree fast path. Prefer this over `/worktree-warden:merge-worktrees`.
 
-`finish-worktree` is the single-worktree fast path. The green path is one engine
-call after relocation:
+1. Preflight:
 
 ```bash
-python3 $ENGINE --repo $PRIMARY finish --worktree $WORKTREE_PATH --branch $BRANCH --target $TARGET --test-cmd "<cmd>"
+python3 $ENGINE finish-preflight --worktree "$(git rev-parse --show-toplevel)" [--target $ARGUMENTS]
 ```
 
-Do not invoke `/worktree-warden:merge-worktrees` on the green path. It is only
-for exit `13` conflicts, exit `18` test failures, multiple worktrees, or a
-deliberate landing order.
+- Read `primary`, `target`, `branch`, `worktree`, `details.kind`, `details.detached`.
+- If not a repo or engine error: report `message`.
+- If `details.kind == "primary"`: use `/worktree-warden:check-worktrees`.
+- If detached or `branch == target`: stop.
 
-## Procedure
+2. Relocate:
 
-1. Run preflight:
+- `ExitWorktree(action:"keep")`
+- If no-op, `cd "$PRIMARY"`
 
-   ```bash
-   python3 $ENGINE finish-preflight --worktree "$(git rev-parse --show-toplevel)" [--target $ARGUMENTS]
-   ```
+3. Resolve test argv:
 
-   Read top-level `primary`, `target`, `branch`, and `worktree`; read
-   `details.kind` and `details.detached`.
+```bash
+python3 $RESOLVE_TEST "$PRIMARY"
+```
 
-2. Stop or reroute:
+Read returned JSON `argv`.
 
-   - not a repo / engine error: report the message.
-   - `details.kind == "primary"`: use `/worktree-warden:check-worktrees`; this
-     command only finishes the current linked worktree.
-   - `details.detached`: stop; there is no branch to land.
-   - `BRANCH == TARGET`: stop; nothing should land.
+4. Run finish:
 
-3. Relocate to the primary checkout:
+```bash
+python3 $ENGINE --repo $PRIMARY finish --worktree $WORKTREE_PATH --branch $BRANCH --target $TARGET ...
+```
 
-   - First call `ExitWorktree(action:"keep")`.
-   - If it is a no-op because this was not an `EnterWorktree` session, run
-     `cd "$PRIMARY"` via Bash. Continue with all engine calls using `--repo`.
+Append the `argv` returned by `resolve_test_cmd.py`.
 
-4. Resolve the test command, in order: `just test` if Justfile has `test`;
-   `npm test` if `package.json`; `pytest` if Python tests/project metadata;
-   `cargo test` if Cargo; otherwise use `--skip-tests`.
+5. Exit handling:
 
-5. Run `finish`:
+- `0`: recap from `details.recap`; keep it compact
+- non-zero: read [fallbacks.md](fallbacks.md)
 
-   ```bash
-   python3 $ENGINE --repo $PRIMARY finish --worktree $WORKTREE_PATH --branch $BRANCH --target $TARGET --test-cmd "<cmd>"
-   ```
+Rules:
 
-   Use `--skip-tests` instead of `--test-cmd` only when no test command applies.
-
-6. Handle by exit code:
-
-   - `0 finished`: landed, tested if applicable, torn down, lock released.
-   - `10 already_merged`: torn down; no new commits to recap.
-   - `11 dirty_worktree`: `EnterWorktree(path:$WORKTREE_PATH)`,
-     `/commit-commands:commitall`, relocate again, then retry step 5.
-   - `13 rebase_conflict`: stop the fast path. Hand off to
-     `/worktree-warden:merge-worktrees --worktree $WORKTREE_PATH --branch $BRANCH --repo $PRIMARY --target $TARGET`.
-   - `18 tests_failed`: state is preserved and the lock is kept. Hand off to
-     `/worktree-warden:merge-worktrees` for fix-forward / undo / abandon.
-   - `16 lock_blocked`: report the holder from `message`/`details`; wait or
-     force-unlock only on explicit user direction.
-   - `12`, `14`, `15`, `17`, `19`: report `message` verbatim and stop.
-
-## Recap
-
-Keep the success recap compact by default: no more than 200 words or 5-10 bullets.
-Use `details.recap` from the `finish` JSON when present. Mention:
-
-- target and branch
-- number of commits landed
-- commit subjects
-- changed file count and capped top file list
-- test result and teardown result
-
-Never run raw `git log --stat` or full diff output for the default recap. Use
-larger git output only if the user explicitly asks for a detailed recap.
-
-## Hard Rules
-
-- Never hand-roll merge or teardown.
-- Never `ExitWorktree(action:"remove")`; use `"keep"` and delegate teardown to
-  the engine.
-- `merge-worktrees` is fallback orchestration, not part of the normal
-  single-worktree success path.
+- never hand-roll merge or teardown
+- never `ExitWorktree(action:"remove")`
+- use `/worktree-warden:merge-worktrees` only for fallback paths

@@ -71,14 +71,9 @@ def is_main_worktree(cwd: str) -> bool:
 
 
 _ENFORCEMENT_MSG = (
-    "MANDATORY: This repo enforces worktree-first editing. "
-    "You MUST call EnterWorktree BEFORE using the Edit or Write tool on any file "
-    "in this repository. "
-    "The PreToolUse gate hard-blocks direct edits to the main checkout "
-    "(exit code 2; no bypass exists under any permission mode). "
-    "Required workflow: (1) call EnterWorktree, "
-    "(2) make all edits inside the returned worktree path, "
-    "(3) call /worktree-warden:finish-worktree when done."
+    "MANDATORY: call EnterWorktree before Edit or Write in this repo. "
+    "Main-checkout edits are hard-blocked by the PreToolUse gate. "
+    "Edit inside the worktree, then call /worktree-warden:finish-worktree when done."
 )
 
 

@@ -142,8 +142,8 @@ class MainEmitTest(TestCase):
         self.assertEqual(rc, 0)
         emitted = json.loads(out)
         self.assertNotIn("systemMessage", emitted)
-        self.assertIn("MANDATORY", emitted["additionalInformation"])
         self.assertIn("EnterWorktree", emitted["additionalInformation"])
+        self.assertIn("finish-worktree", emitted["additionalInformation"])
 
     def test_enforcement_emits_additional_information_alongside_banner(self) -> None:
         rc, out = self._run_main(
@@ -152,7 +152,7 @@ class MainEmitTest(TestCase):
         self.assertEqual(rc, 0)
         emitted = json.loads(out)
         self.assertIn("systemMessage", emitted)
-        self.assertIn("MANDATORY", emitted["additionalInformation"])
+        self.assertIn("EnterWorktree", emitted["additionalInformation"])
 
     def test_mergeable_mode_silent_when_all_held_back_no_enforcement(self) -> None:
         rc, out = self._run_main([_wt(session=True)], mode="mergeable", enforcement=False)

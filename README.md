@@ -63,19 +63,15 @@ worktrees of the repo your current session belongs to — never cross-repo.
   with a `Ready?` verdict and a concise `Note` (state, commits ahead, last edit),
   then asks which to merge (All / None / a paged subset). Worktrees blocked by a
   live session are shown but never offered for merge.
-- **`/worktree-warden:merge-worktrees`** — lands the chosen worktrees into the default
-  branch from the primary checkout by **rebase + fast-forward** (linear history, no
-  merge commits): commits dirty trees (via `commit-commands:commitall`), snapshots a
-  restore anchor, determines a land order (escalating advisor → thinking-suite → HITL
-  only when confidence is low), lands each via the engine with conflict handling,
-  runs the test suite, and on failure rolls back to the exact pre-land state. The
-  deterministic git work lives in `worktree_engine.py`; the skill only fills the
-  judgement gaps.
+- **`/worktree-warden:merge-worktrees`** — fallback / multi-worktree landing path from
+  the primary checkout: commit dirty trees, snapshot, choose order, land by
+  rebase + fast-forward, test, then tear down. The deterministic git work lives
+  in `worktree_engine.py`; the skill handles only the judgment gaps.
 - **`/worktree-warden:finish-worktree`** — lands the current worktree into the default
   branch and tears it down. Works whether the session arrived via `EnterWorktree`
-  or started in the worktree directly (background jobs). Delegates to
-  `/worktree-warden:merge-worktrees` for all git mutation, re-entering the worktree on
-  rollback if the session was relocated.
+  or started in the worktree directly (background jobs). This is the normal
+  single-worktree path; it falls back to `/worktree-warden:merge-worktrees` only
+  for conflicts, test failures, or deliberate multi-worktree landing.
 
 ## Scripts
 
@@ -216,10 +212,10 @@ has pending work. Its behaviour is governed by the `teardown_mode` setting:
 
 | Mode | Behaviour |
 | --- | --- |
-| `ask` (default) | Self-assess completion; if done, use `AskUserQuestion` to offer commit + merge + teardown. |
-| `auto` | Self-assess; if confidently done, commit + merge + teardown without confirmation. |
+| `ask` (default) | Self-assess completion; if done, ask whether to finish now, commit only, or skip. |
+| `auto` | Self-assess; if confidently done, run `finish-worktree` without confirmation. |
 | `commit-only` | Commit dirty files; do not merge or tear down. |
-| `always` | Verify task complete + tests pass + no major conflict with main; then commit + merge + teardown. |
+| `always` | Verify task complete + tests pass + no major conflict with main; then run `finish-worktree`. |
 | `never` | Never trigger. |
 
 Set it at user scope (`--user`) to apply across all repos, or project scope

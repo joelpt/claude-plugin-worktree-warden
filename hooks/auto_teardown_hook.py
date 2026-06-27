@@ -210,44 +210,27 @@ def _build_reason(
 
     if mode == "ask":
         return (
-            f"You are in a linked git worktree ({state}).\n"
-            "Your auto-teardown policy: ask.\n\n"
-            "Self-assess: is the task genuinely complete?\n"
-            "  - YES → use AskUserQuestion now to offer commit + merge + teardown."
-            " Show branch/commit count. Respect the answer.\n"
-            "  - NO  → ignore this message and continue normally."
+            f"Linked worktree pending ({state}). Mode: ask.\n"
+            "If task is done, AskUserQuestion with: finish now, commit only, skip.\n"
+            "If not done, ignore this message."
         )
     if mode == "auto":
         return (
-            f"You are in a linked git worktree ({state}).\n"
-            "Your auto-teardown policy: auto.\n\n"
-            "Self-assess: is the task genuinely complete?\n"
-            "  - YES, confident  → commit any dirty files, then run"
-            " /worktrees:merge-worktrees to land and tear down. No confirmation needed.\n"
-            "  - YES, uncertain  → use AskUserQuestion to confirm before proceeding.\n"
-            "  - NO              → ignore this message and continue normally."
+            f"Linked worktree pending ({state}). Mode: auto.\n"
+            "If confidently done, run /worktree-warden:finish-worktree.\n"
+            "If uncertain, ask. If not done, ignore this message."
         )
     if mode == "commit-only":
         return (
-            f"You are in a linked git worktree ({state}).\n"
-            "Your auto-teardown policy: commit-only.\n\n"
-            "Self-assess: is it safe to commit uncommitted work?\n"
-            "  - YES → commit any dirty changes (/commit-commands:commitall)."
-            " Do NOT merge or tear down.\n"
-            "  - NO  → ignore this message and continue normally."
+            f"Linked worktree pending ({state}). Mode: commit-only.\n"
+            "If safe, run /commit-commands:commitall. Do not merge or tear down.\n"
+            "Otherwise ignore this message."
         )
     if mode == "always":
         return (
-            f"You are in a linked git worktree ({state}).\n"
-            "Your auto-teardown policy: always.\n\n"
-            "Self-assess — ALL three must be true:\n"
-            "  1. Task is complete per the original specification.\n"
-            "  2. Work has been appropriately tested (run tests if not done).\n"
-            "  3. No non-trivial conflict with main (trivial rebase conflict = fine;"
-            " main was refactored while you worked = stop).\n\n"
-            "  - ALL three true → commit, merge via /worktrees:merge-worktrees,"
-            " tear down. No confirmation.\n"
-            "  - Any criterion fails → report WHICH one failed and why. Do NOT proceed."
+            f"Linked worktree pending ({state}). Mode: always.\n"
+            "Proceed only if task is complete, tested, and not in non-trivial conflict with main.\n"
+            "If all true, run /worktree-warden:finish-worktree. Otherwise report which check failed."
         )
     return ""
 
