@@ -15,11 +15,9 @@ exits with the contract code below):
                    clean/dirty status for each branch's worktree. Replaces two+
                    model round-trips (symbolic-ref + per-worktree status checks)
                    with a single call.
-  finish-preflight capture all identity data for /finish-worktree (primary,
-                   target, branch, commit_count) in one call, replacing three
-                   sequential model-issued git commands. Accepts optional
-                   --target to override symbolic-ref and keep commit_count
-                   consistent when the user passes a non-default target.
+  finish-preflight capture the identity data /finish-worktree needs (primary,
+                   target, branch, path, linked-vs-primary) in one call.
+                   Accepts optional --target to override symbolic-ref.
   land             preflight + rebase <branch> onto <target> (in the worktree)
                    + ff-merge into <target> (in the primary). On conflict the
                    rebase is LEFT IN PROGRESS for the caller to resolve.
@@ -103,8 +101,9 @@ class Outcome:
     worktree: str = ""
     details: dict[str, object] = field(default_factory=dict)
 
-    def emit(self) -> int:
-        print(json.dumps(self.__dict__, indent=2))
+    def emit(self, *, pretty: bool = False) -> int:
+        payload = {k: v for k, v in self.__dict__.items() if v not in ("", {})}
+        print(json.dumps(payload, indent=2 if pretty else None, separators=None if pretty else (",", ":")))
         print(f"[worktree-engine] {self.status}: {self.message}", file=sys.stderr)
         return self.code
 
@@ -243,13 +242,63 @@ def _primary_blocker(primary: str, target: str) -> tuple[str, dict]:
     if dirty:
         reasons.append(f"{len(dirty)} uncommitted change(s)")
     if reasons:
-        return "; ".join(reasons), {"primary_branch": pb, "primary_uncommitted": dirty}
+        return "; ".join(reasons), {"primary_branch": pb, "primary_uncommitted": _bounded_list(dirty)}
     return "", {}
 
 
 def _conflicts(worktree: str) -> list[str]:
     out = _git(["diff", "--name-only", "--diff-filter=U"], cwd=worktree, check=False)
     return [ln for ln in out.splitlines() if ln.strip()]
+
+
+def _bounded_list(items: list[str], limit: int = 20) -> dict[str, object]:
+    return {
+        "items": items[:limit],
+        "count": len(items),
+        "truncated": len(items) > limit,
+    }
+
+
+def _tail(text: str, limit: int = 800) -> str:
+    return text.strip()[-limit:]
+
+
+def _commit_summaries(repo: str, base: str, tip: str = "HEAD", limit: int = 20) -> list[dict[str, object]]:
+    raw = _git(
+        ["log", "--reverse", "--format=%h%x1f%s", f"{base}..{tip}"],
+        cwd=repo,
+        check=False,
+    )
+    commits: list[dict[str, object]] = []
+    for line in raw.splitlines()[:limit]:
+        parts = line.split("\x1f", 1)
+        if len(parts) == 2:
+            short, subject = parts
+            commits.append({"sha": short, "subject": subject})
+    return commits
+
+
+def _diff_stat_summary(repo: str, base: str, tip: str = "HEAD", limit: int = 20) -> dict[str, object]:
+    numstat = _git(["diff", "--numstat", f"{base}..{tip}"], cwd=repo, check=False)
+    files: list[str] = []
+    for line in numstat.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        files.append(parts[2])
+    return {
+        "files": files[:limit],
+        "file_count": len(files),
+        "truncated": len(files) > limit,
+    }
+
+
+def _recap(repo: str, base: str, tip: str = "HEAD", limit: int = 20) -> dict[str, object]:
+    return {
+        "commit_count": _ahead_count(base, tip, repo),
+        "commits": _commit_summaries(repo, base, tip, limit),
+        "diffstat": _diff_stat_summary(repo, base, tip, limit),
+    }
 
 
 def _ff_merge(branch: str, target: str, repo: str, base: Outcome) -> Outcome:
@@ -260,12 +309,11 @@ def _ff_merge(branch: str, target: str, repo: str, base: Outcome) -> Outcome:
         base.code = EXIT_MERGE_FAILED
         base.status = "merge_failed"
         base.message = f"Fast-forward merge of '{branch}' into '{target}' failed: {err}"
-        base.details = {"git_stderr": err}
+        base.details = {"git_stderr": _tail(err)}
         return base
     base.code = EXIT_OK
     base.status = "landed"
     base.message = f"Rebased and fast-forwarded {ahead} commit(s) from '{branch}' into '{target}'."
-    base.details = {"commits_merged": ahead, "head": _git(["rev-parse", "HEAD"], cwd=repo)}
     return base
 
 
@@ -298,7 +346,7 @@ def cmd_land(worktree: str, branch: str, target: str, repo: str) -> Outcome:
     if wt_dirty:
         base.code, base.status = EXIT_DIRTY_WORKTREE, "dirty_worktree"
         base.message = "Worktree has uncommitted changes; commit before landing."
-        base.details = {"uncommitted": wt_dirty}
+        base.details = {"uncommitted": _bounded_list(wt_dirty)}
         return base
 
     reason, det = _primary_blocker(primary, target)
@@ -323,7 +371,11 @@ def cmd_land(worktree: str, branch: str, target: str, repo: str) -> Outcome:
             f"Rebase of '{branch}' onto '{target}' hit conflicts and is LEFT IN "
             "PROGRESS. Resolve in the worktree, `git add`, then rebase-continue."
         )
-        base.details = {"conflicts": _conflicts(wt), "git_stderr": err, "rebase_in_progress": True}
+        base.details = {
+            "conflicts": _bounded_list(_conflicts(wt)),
+            "git_stderr": _tail(err),
+            "rebase_in_progress": True,
+        }
         return base
 
     return _ff_merge(branch, target, repo, base)
@@ -357,7 +409,11 @@ def cmd_rebase_continue(worktree: str, branch: str, target: str, repo: str) -> O
         if _rebase_in_progress(wt):
             base.code, base.status = EXIT_REBASE_CONFLICT, "rebase_conflict"
             base.message = "More conflicts after --continue; resolve, `git add`, continue again."
-            base.details = {"conflicts": _conflicts(wt), "git_stderr": err, "rebase_in_progress": True}
+            base.details = {
+                "conflicts": _bounded_list(_conflicts(wt)),
+                "git_stderr": _tail(err),
+                "rebase_in_progress": True,
+            }
             return base
         base.code, base.status = EXIT_GIT_ERROR, "git_error"
         base.message = f"rebase --continue failed: {err}"
@@ -484,22 +540,18 @@ def cmd_preflight(repo: str, branches: list[str]) -> Outcome:
 def cmd_finish_preflight(worktree: str, target_override: str | None = None) -> Outcome:
     """Capture all identity data for /finish-worktree in one engine call.
 
-    Replaces three sequential model-issued git calls (``git worktree list`` →
-    PRIMARY, ``git symbolic-ref`` → TARGET, ``git rev-list --count`` →
-    COMMIT_COUNT) with a single scripted call.  Accepts an optional
-    ``target_override`` so ``commit_count`` is computed against the same target
-    that will be used for the recap—critical when the user passes a non-default
-    target via ``$ARGUMENTS`` in ``/finish-worktree``.
+    Replaces separate model-issued git calls for PRIMARY, TARGET, BRANCH, and
+    linked-vs-primary classification with a single scripted call. Accepts an
+    optional ``target_override`` for the user-supplied target branch.
 
     Args:
         worktree: Absolute path of the linked worktree being finished.
         target_override: If provided, skip symbolic-ref lookup and use this
-            branch as TARGET.  Pass when the user supplies a non-default target
-            via ``$ARGUMENTS`` so that ``commit_count`` stays consistent.
+            branch as TARGET.
 
     Returns:
-        Outcome with ``details``: ``primary``, ``target``, ``branch``,
-        ``commit_count``.
+        Outcome with top-level ``primary``, ``target``, ``branch``, and
+        ``worktree`` plus ``details.kind`` / ``details.detached``.
     """
     try:
         worktree = os.path.realpath(worktree)
@@ -516,26 +568,41 @@ def cmd_finish_preflight(worktree: str, target_override: str | None = None) -> O
                 if rc == 0 and ref_out.startswith(_ORIGIN_HEAD_PREFIX)
                 else "main"
             )
-        commit_count = int(
-            _git(["rev-list", "--count", f"{target}..HEAD"], cwd=worktree) or "0"
-        )
+        git_dir = _git(["rev-parse", "--git-dir"], cwd=worktree)
+        common_dir = _git_common_dir(worktree)
+        git_dir_abs = git_dir if os.path.isabs(git_dir) else os.path.join(worktree, git_dir)
+        is_primary = os.path.realpath(git_dir_abs) == os.path.realpath(common_dir)
     except (GitError, ValueError) as exc:
         return Outcome(EXIT_GIT_ERROR, "git_error", str(exc))
 
+    classification = "primary" if is_primary else "linked"
     return Outcome(
         EXIT_OK,
         "finish_preflight",
-        f"branch={branch}, primary={primary}, target={target}, commit_count={commit_count}",
+        f"branch={branch}, primary={primary}, target={target}, kind={classification}",
         target=target,
         branch=branch,
         primary=primary,
         worktree=worktree,
         details={
-            "primary": primary,
-            "target": target,
-            "branch": branch,
-            "commit_count": commit_count,
+            "kind": classification,
+            "detached": branch == "HEAD",
         },
+    )
+
+
+def cmd_finish_recap(repo: str, base: str, tip: str = "HEAD", limit: int = 20) -> Outcome:
+    """Emit bounded commit and diff metadata for a just-finished worktree."""
+    try:
+        details = _recap(repo, base, tip, limit)
+    except GitError as exc:
+        return Outcome(EXIT_GIT_ERROR, "git_error", str(exc), primary=repo)
+    return Outcome(
+        EXIT_OK,
+        "finish_recap",
+        f"{details['commit_count']} commit(s), {details['diffstat']['file_count']} changed file(s).",
+        primary=repo,
+        details=details,
     )
 
 
@@ -1103,6 +1170,7 @@ def cmd_finish(
             _release_main_lock(repo, owner)
         return outcome
 
+    old_head = _git(["rev-parse", target], cwd=repo, check=False)
     snap = cmd_snapshot(repo, target, [branch])
     if snap.code != EXIT_OK:
         return _bail_release(snap)
@@ -1113,8 +1181,6 @@ def cmd_finish(
         landed.details = {
             **landed.details,
             "snapshot_file": snapshot_file,
-            "lock_held": held,
-            "next": "resolve conflicts, git add, rebase-continue; then test, teardown, release-main",
         }
         return landed  # KEEP the lock -- the merge is mid-flight
     if landed.code not in (EXIT_OK, EXIT_NOT_APPLICABLE):
@@ -1135,10 +1201,8 @@ def cmd_finish(
                 branch=branch,
                 worktree=os.path.realpath(worktree),
                 details={
-                    "test_cmd": test_cmd,
                     "snapshot_file": snapshot_file,
                     "output_tail": tail,
-                    "lock_held": held,
                 },
             )
 
@@ -1151,20 +1215,16 @@ def cmd_finish(
 
     verb = "was already merged into" if already_merged else "landed into"
     suffix = " (tests passed)" if tested else ""
+    details: dict[str, object] = {"tested": tested}
+    if not already_merged:
+        details["recap"] = _recap(repo, old_head, target, limit=20)
     return Outcome(
         EXIT_OK,
         "finished",
         f"'{branch}' {verb} '{target}'{suffix}; worktree torn down.",
         target=target,
         branch=branch,
-        primary=repo,
-        worktree=os.path.realpath(worktree),
-        details={
-            "commits_merged": landed.details.get("commits_merged"),
-            "tested": tested,
-            "torn_down": True,
-            "snapshot_file": snapshot_file,
-        },
+        details=details,
     )
 
 
@@ -1279,6 +1339,7 @@ def _add_require_lease(p: argparse.ArgumentParser) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="worktree_engine.py")
     parser.add_argument("--repo", default=os.getcwd(), help="Primary checkout (default: cwd).")
+    parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_land = sub.add_parser("land")
@@ -1313,6 +1374,11 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Override default branch (skips symbolic-ref lookup).",
     )
+
+    p_recap = sub.add_parser("finish-recap")
+    p_recap.add_argument("--base", required=True, help="Old target SHA before finish.")
+    p_recap.add_argument("--tip", default="HEAD", help="Tip to summarize (default: HEAD).")
+    p_recap.add_argument("--limit", type=int, default=20, help="Maximum commits/files to emit.")
 
     p_undo = sub.add_parser("undo")
     p_undo.add_argument("--snapshot", required=True, help="Path to the snapshot JSON.")
@@ -1372,40 +1438,42 @@ def main(argv: list[str] | None = None) -> int:
                 details={"holder": holder, "aborted_cmd": args.cmd},
             )
             _audit(repo, "lease-lost", outcome)
-            return outcome.emit()
+            return outcome.emit(pretty=args.pretty)
     try:
         if args.cmd == "preflight":
             branches = [b for b in args.branches.split(",") if b]
-            return cmd_preflight(repo, branches).emit()
+            return cmd_preflight(repo, branches).emit(pretty=args.pretty)
         if args.cmd == "finish-preflight":
-            return cmd_finish_preflight(args.worktree, args.target).emit()
+            return cmd_finish_preflight(args.worktree, args.target).emit(pretty=args.pretty)
+        if args.cmd == "finish-recap":
+            return cmd_finish_recap(repo, args.base, args.tip, args.limit).emit(pretty=args.pretty)
         if args.cmd == "land":
             outcome = cmd_land(args.worktree, args.branch, args.target, repo)
             _audit(repo, "land", outcome)
-            return outcome.emit()
+            return outcome.emit(pretty=args.pretty)
         if args.cmd == "rebase-continue":
             outcome = cmd_rebase_continue(args.worktree, args.branch, args.target, repo)
             _audit(repo, "rebase-continue", outcome)
-            return outcome.emit()
+            return outcome.emit(pretty=args.pretty)
         if args.cmd == "snapshot":
             branches = [b for b in args.branches.split(",") if b]
             outcome = cmd_snapshot(repo, args.target, branches, args.out)
             _audit(repo, "snapshot", outcome)
-            return outcome.emit()
+            return outcome.emit(pretty=args.pretty)
         if args.cmd == "undo":
             outcome = cmd_undo(repo, args.snapshot)
             _audit(repo, "undo", outcome)
-            return outcome.emit()
+            return outcome.emit(pretty=args.pretty)
         if args.cmd == "teardown":
             outcome = cmd_teardown(args.branch, args.target, repo, args.dry_run)
             if not args.dry_run:
                 _audit(repo, "teardown", outcome)
-            return outcome.emit()
+            return outcome.emit(pretty=args.pretty)
         if args.cmd == "recover":
             outcome = cmd_recover(repo, args.target, args.gc_days)
             if args.gc_days is not None:
                 _audit(repo, "recover-gc", outcome)
-            return outcome.emit()
+            return outcome.emit(pretty=args.pretty)
         if args.cmd == "finish":
             target = args.target or _resolve_target(args.worktree)
             owner = args.owner or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
@@ -1420,9 +1488,9 @@ def main(argv: list[str] | None = None) -> int:
                 owner=owner,
             )
             _audit(repo, "finish", outcome)
-            return outcome.emit()
+            return outcome.emit(pretty=args.pretty)
     except GitError as exc:
-        return Outcome(EXIT_GIT_ERROR, "git_error", str(exc)).emit()
+        return Outcome(EXIT_GIT_ERROR, "git_error", str(exc)).emit(pretty=args.pretty)
     return EXIT_GIT_ERROR
 
 

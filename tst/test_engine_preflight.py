@@ -166,7 +166,7 @@ class PreflightTest(unittest.TestCase):
 
 
 class FinishPreflightTest(unittest.TestCase):
-    """cmd_finish_preflight captures primary/target/branch/commit_count in one call."""
+    """cmd_finish_preflight captures the fields finish-worktree needs."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -189,18 +189,19 @@ class FinishPreflightTest(unittest.TestCase):
     def tearDown(self) -> None:
         self._tmp.cleanup()
 
-    def test_resolves_primary_target_branch_commit_count(self) -> None:
-        """Returns primary checkout, default target, current branch, and commit count."""
+    def test_resolves_primary_target_branch_and_kind(self) -> None:
+        """Returns primary checkout, default target, current branch, and worktree kind."""
         out = engine.cmd_finish_preflight(str(self.wt))
         self.assertEqual(out.code, engine.EXIT_OK)
         assert isinstance(out.details, dict)
-        self.assertEqual(out.details["branch"], "feat")
-        self.assertEqual(out.details["target"], "main")
-        self.assertEqual(out.details["commit_count"], 1)
-        self.assertEqual(out.details["primary"], str(self.repo.resolve()))
+        self.assertEqual(out.branch, "feat")
+        self.assertEqual(out.target, "main")
+        self.assertEqual(out.primary, str(self.repo.resolve()))
+        self.assertEqual(out.details["kind"], "linked")
+        self.assertFalse(out.details["detached"])
 
-    def test_target_override_used_for_commit_count(self) -> None:
-        """When --target is supplied, commit_count is computed against the override."""
+    def test_target_override_used(self) -> None:
+        """When --target is supplied, it is returned as the target."""
         _git(
             "symbolic-ref",
             "refs/remotes/origin/HEAD",
@@ -209,15 +210,12 @@ class FinishPreflightTest(unittest.TestCase):
         )
         out = engine.cmd_finish_preflight(str(self.wt), target_override="main")
         self.assertEqual(out.code, engine.EXIT_OK)
-        assert isinstance(out.details, dict)
-        self.assertEqual(out.details["target"], "main")
-        self.assertEqual(out.details["commit_count"], 1)
+        self.assertEqual(out.target, "main")
 
     def test_target_falls_back_to_main_without_origin_head(self) -> None:
         """Without origin/HEAD, target defaults to 'main'."""
         out = engine.cmd_finish_preflight(str(self.wt))
-        assert isinstance(out.details, dict)
-        self.assertEqual(out.details["target"], "main")
+        self.assertEqual(out.target, "main")
 
     def test_target_resolved_from_origin_head(self) -> None:
         """When origin/HEAD points to trunk, target is 'trunk'."""
@@ -229,8 +227,7 @@ class FinishPreflightTest(unittest.TestCase):
             cwd=self.repo,
         )
         out = engine.cmd_finish_preflight(str(self.wt))
-        assert isinstance(out.details, dict)
-        self.assertEqual(out.details["target"], "trunk")
+        self.assertEqual(out.target, "trunk")
 
     def test_cli_outputs_valid_json(self) -> None:
         """CLI finish-preflight exits 0 and emits JSON with required keys."""
@@ -248,5 +245,8 @@ class FinishPreflightTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0)
         data = json.loads(proc.stdout)
-        for key in ("primary", "target", "branch", "commit_count"):
+        for key in ("primary", "target", "branch", "worktree"):
+            self.assertIn(key, data)
+        for key in ("kind", "detached"):
             self.assertIn(key, data["details"])
+        self.assertEqual(data["details"]["kind"], "linked")

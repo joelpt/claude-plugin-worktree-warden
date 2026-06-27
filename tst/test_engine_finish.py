@@ -94,7 +94,21 @@ class FinishHappyTest(_FinishRepo):
         )
         self.assertEqual(out.code, engine.EXIT_OK, out.message)
         self.assertTrue(out.details["tested"])
+        recap = out.details["recap"]
+        self.assertIsInstance(recap, dict)
+        self.assertEqual(recap["commit_count"], 1)
+        self.assertEqual(recap["commits"][0]["subject"], "feat work")
+        self.assertEqual(recap["diffstat"]["file_count"], 1)
         self.assertFalse(self.wt.exists())
+
+    def test_finish_recap_is_bounded(self) -> None:
+        base = self.main_sha
+        out = engine.cmd_finish_recap(str(self.repo), base, "feat", limit=1)
+        self.assertEqual(out.code, engine.EXIT_OK, out.message)
+        self.assertEqual(out.details["commit_count"], 1)
+        self.assertEqual(out.details["commits"][0]["subject"], "feat work")
+        self.assertEqual(out.details["diffstat"]["file_count"], 1)
+        self.assertFalse(out.details["diffstat"]["truncated"])
 
 
 class FinishBailTest(_FinishRepo):
