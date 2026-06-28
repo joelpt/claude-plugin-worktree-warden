@@ -261,27 +261,124 @@ def _mtime_to_relative(mtime: float) -> str:
     return f"{weeks}w ago"
 
 
-def _get_most_recent_file_mtime(path: str) -> float:
-    """Recursively find the most recent file modification time in a directory tree.
-    
-    Walks the entire directory tree (except .git) and returns the highest mtime found.
-    Returns 0.0 if no files found or on error.
+def _status_paths(status: str) -> list[str]:
+    """Return candidate file paths from `git status --porcelain` output."""
+    paths: list[str] = []
+    for line in status.splitlines():
+        if not line.strip() or len(line) < 4:
+            continue
+        path = line[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        paths.append(path)
+    return paths
+
+
+def _get_most_recent_file_mtime(path: str, candidates: list[str]) -> float:
+    """Find the most recent mtime among changed paths.
+
+    This avoids walking the full worktree, which is disproportionately expensive
+    on large repos. For directories surfaced by git status, walk only that
+    subtree; for files, stat them directly.
     """
     max_mtime = 0.0
-    try:
-        for root, dirs, files in os.walk(path):
-            # Skip .git directory
-            dirs[:] = [d for d in dirs if d != ".git"]
-            for fname in files:
-                try:
-                    fpath = os.path.join(root, fname)
-                    mtime = os.stat(fpath).st_mtime
-                    max_mtime = max(max_mtime, mtime)
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    for candidate in candidates:
+        target = os.path.join(path, candidate)
+        try:
+            if os.path.isdir(target):
+                for root, dirs, files in os.walk(target):
+                    dirs[:] = [d for d in dirs if d != ".git"]
+                    for fname in files:
+                        try:
+                            fpath = os.path.join(root, fname)
+                            mtime = os.stat(fpath).st_mtime
+                            max_mtime = max(max_mtime, mtime)
+                        except OSError:
+                            pass
+                continue
+            mtime = os.stat(target).st_mtime
+            max_mtime = max(max_mtime, mtime)
+        except OSError:
+            pass
     return max_mtime
+
+
+def _json_payload(worktrees: list[Worktree]) -> list[dict[str, object]]:
+    return [
+        {
+            "path": wt.path,
+            "branch": wt.branch,
+            "dirty": wt.dirty,
+            "commit_count": wt.commit_count,
+            "behind_base": wt.behind,
+            "last_rel": wt.last_rel,
+            "last_iso": wt.last_iso,
+            "mtime": wt.mtime,
+            "file_mtime": wt.file_mtime,
+            "file_mtime_rel": wt.file_mtime_rel,
+            "session_status": wt.session_status,
+            "session_kind": wt.session_kind,
+            "session_name": wt.session_name,
+            "recently_active": wt.recently_active,
+            "unreadable": wt.unreadable,
+            "category": wt.readiness.value,
+            "note": wt.ready_note,
+            "ready": wt.is_mergeable,
+        }
+        for wt in worktrees
+    ]
+
+
+def to_json(worktrees: list[Worktree]) -> str:
+    return json.dumps(_json_payload(worktrees), indent=2)
+
+
+def to_bundle_json(worktrees: list[Worktree]) -> str:
+    return json.dumps(
+        {
+            "table": render_table(worktrees),
+            "worktrees": _json_payload(worktrees),
+        },
+        indent=2,
+    )
+
+
+async def fill_state(wt: Worktree, base: str, cwd: str) -> None:
+    """Populate a worktree's dirty/commit/last-commit/mtime/behind fields."""
+    status_t = run_git(["-C", wt.path, "status", "--porcelain"], cwd)
+    log_t = run_git(
+        ["-C", wt.path, "log", "--oneline", "--no-decorate", f"{base}..HEAD"], cwd
+    )
+    last_t = run_git(["-C", wt.path, "log", "-1", "--format=%cr%x1f%cI"], cwd)
+    behind_t = run_git(
+        ["-C", wt.path, "rev-list", "--count", f"HEAD..{base}"], cwd
+    )
+    (src, status), (lrc, log), (_, last), (brc, behind) = await asyncio.gather(
+        status_t, log_t, last_t, behind_t
+    )
+    # A failed status/log query makes dirty/commit_count untrustworthy: an empty
+    # `status` from a *failure* is indistinguishable from a genuinely clean tree,
+    # and defaulting to "clean + 0 commits" would misclassify a worktree holding
+    # real work as prunable — precisely under the system stress that makes git
+    # flaky. Mark it unreadable so readiness reports UNKNOWN, never PRUNE.
+    wt.unreadable = src != 0 or lrc != 0
+    wt.dirty = bool(status.strip())
+    wt.commits = [ln for ln in log.splitlines() if ln.strip()]
+    wt.commit_count = len(wt.commits)
+    if last and "\x1f" in last:
+        wt.last_rel, wt.last_iso = last.split("\x1f", 1)
+    wt.behind = int(behind) if brc == 0 and behind.isdigit() else 0
+    try:
+        wt.mtime = os.stat(wt.path).st_mtime
+    except OSError:
+        wt.mtime = 0.0
+    if wt.dirty:
+        try:
+            wt.file_mtime = _get_most_recent_file_mtime(wt.path, _status_paths(status))
+            wt.file_mtime_rel = _mtime_to_relative(wt.file_mtime)
+        except OSError:
+            wt.file_mtime = 0.0
+            wt.file_mtime_rel = ""
 
 
 def _recent(mtime: float, now: float, window: int = RECENT_WINDOW_SECONDS) -> bool:
@@ -341,41 +438,6 @@ def _latest_transcript_mtime(path: str, projects_dir: Path) -> float:
         return max((f.stat().st_mtime for f in d.glob("*.jsonl")), default=0.0)
     except OSError:
         return 0.0
-
-
-async def fill_state(wt: Worktree, base: str, cwd: str) -> None:
-    """Populate a worktree's dirty/commit/last-commit/mtime/behind fields."""
-    status_t = run_git(["-C", wt.path, "status", "--porcelain"], cwd)
-    log_t = run_git(
-        ["-C", wt.path, "log", "--oneline", "--no-decorate", f"{base}..HEAD"], cwd
-    )
-    last_t = run_git(["-C", wt.path, "log", "-1", "--format=%cr%x1f%cI"], cwd)
-    behind_t = run_git(
-        ["-C", wt.path, "rev-list", "--count", f"HEAD..{base}"], cwd
-    )
-    (src, status), (lrc, log), (_, last), (brc, behind) = await asyncio.gather(
-        status_t, log_t, last_t, behind_t
-    )
-    # A failed status/log query makes dirty/commit_count untrustworthy: an empty
-    # `status` from a *failure* is indistinguishable from a genuinely clean tree,
-    # and defaulting to "clean + 0 commits" would misclassify a worktree holding
-    # real work as prunable — precisely under the system stress that makes git
-    # flaky. Mark it unreadable so readiness reports UNKNOWN, never PRUNE.
-    wt.unreadable = src != 0 or lrc != 0
-    wt.dirty = bool(status.strip())
-    wt.commits = [ln for ln in log.splitlines() if ln.strip()]
-    wt.commit_count = len(wt.commits)
-    if last and "\x1f" in last:
-        wt.last_rel, wt.last_iso = last.split("\x1f", 1)
-    wt.behind = int(behind) if brc == 0 and behind.isdigit() else 0
-    try:
-        wt.mtime = os.stat(wt.path).st_mtime
-    except OSError:
-        wt.mtime = 0.0
-    # For dirty worktrees, compute the most recent file modification time
-    if wt.dirty:
-        wt.file_mtime = _get_most_recent_file_mtime(wt.path)
-        wt.file_mtime_rel = _mtime_to_relative(wt.file_mtime)
 
 
 async def load_sessions() -> list[dict]:
@@ -518,33 +580,6 @@ def render_table(worktrees: list[Worktree]) -> str:
     return "\n".join(lines + detail)
 
 
-def to_json(worktrees: list[Worktree]) -> str:
-    payload = [
-        {
-            "path": wt.path,
-            "branch": wt.branch,
-            "dirty": wt.dirty,
-            "commit_count": wt.commit_count,
-            "behind_base": wt.behind,
-            "last_rel": wt.last_rel,
-            "last_iso": wt.last_iso,
-            "mtime": wt.mtime,
-            "file_mtime": wt.file_mtime,
-            "file_mtime_rel": wt.file_mtime_rel,
-            "session_status": wt.session_status,
-            "session_kind": wt.session_kind,
-            "session_name": wt.session_name,
-            "recently_active": wt.recently_active,
-            "unreadable": wt.unreadable,
-            "category": wt.readiness.value,
-            "note": wt.ready_note,
-            "ready": wt.is_mergeable,
-        }
-        for wt in worktrees
-    ]
-    return json.dumps(payload, indent=2)
-
-
 async def gather_worktrees(cwd: str) -> list[Worktree]:
     """Resolve, populate, and session-match every linked worktree of the repo.
 
@@ -575,6 +610,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(prog="check_worktrees")
     parser.add_argument("--cwd", default=os.getcwd())
     parser.add_argument("--json", dest="as_json", action="store_true")
+    parser.add_argument("--bundle-json", action="store_true", help="Emit one JSON object with both table and machine-readable rows.")
     args = parser.parse_args()
 
     try:
@@ -582,12 +618,19 @@ def main() -> int:
     except Exception:  # noqa: BLE001 — honor the "exit 0, no output" contract
         if args.as_json:
             print("[]")
+        elif args.bundle_json:
+            print(json.dumps({"table": "", "worktrees": []}, indent=2))
         return 0
     if not worktrees:
         if args.as_json:
             print("[]")
+        elif args.bundle_json:
+            print(json.dumps({"table": "", "worktrees": []}, indent=2))
         return 0
-    print(to_json(worktrees) if args.as_json else render_table(worktrees))
+    if args.bundle_json:
+        print(to_bundle_json(worktrees))
+    else:
+        print(to_json(worktrees) if args.as_json else render_table(worktrees))
     return 0
 
 

@@ -6,8 +6,7 @@ allowed-tools: Bash(python3 *) Bash(git *) Skill(commit-commands:commitall)
 
 `ENGINE=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_engine.py`,
 `GATE=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_gate.py`,
-`LOCK=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_lock.py`,
-`RESOLVE_TEST=${CLAUDE_PLUGIN_ROOT}/scripts/resolve_test_cmd.py`
+`LOCK=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_lock.py`
 
 Use this skill for:
 
@@ -29,67 +28,36 @@ Prefer `/worktree-warden:finish-worktree` for one normal worktree.
 python3 $ENGINE --repo $REPO preflight --branches <b1,b2,...>
 ```
 
-Read `details.target` and `details.worktrees`.
+- Read `details.target` and `details.worktrees`.
+- Choose the land order now; the final engine call will honor the order you pass.
 
-3. Acquire the main-target lock:
-
-```bash
-python3 $LOCK --repo $REPO acquire-main "merge-worktrees: landing <b1,b2,...> into $TARGET"
-```
-
-- blocked: ask whether to wait; force-unlock only on explicit user direction
-- broken or fail-open output: proceed, but note lock protection is off
-
-4. Commit dirty worktrees one at a time.
+3. Commit dirty worktrees one at a time.
 
 - show dirty files and `git -C <path> diff HEAD --stat`
 - ask before committing
 - if yes: `EnterWorktree(path:<path>)` -> `/commit-commands:commitall` -> `ExitWorktree(action:"keep")`
 - if no: drop that worktree from the set
 
-5. Snapshot:
+4. Run the batched engine path once for the remaining clean branches, in the chosen order.
 
-```bash
-python3 $ENGINE --repo $REPO snapshot --target $TARGET --branches <b1,b2,...> --require-lease
-```
-
-Save `details.snapshot_file`.
-
-6. Choose land order.
-
-- default: oldest first
+- default order: oldest first
 - if unclear: read [order.md](order.md)
-
-7. Land each worktree:
+- resolve the repo test command inline at skill-run time if needed:
+  - `just test` when `Justfile` has `test:`
+  - else `npm test` when `package.json` exists
+  - else `pytest` for Python repos
+  - else `cargo test` when `Cargo.toml` exists
+  - else `--skip-tests`
 
 ```bash
-python3 $ENGINE --repo $REPO land --worktree <path> --branch <branch> --target $TARGET --require-lease
+python3 $ENGINE --repo $REPO finish-many --target $TARGET --branches <ordered,b1,b2,...> ...
 ```
 
-- `0`: continue
-- `10`: already merged; continue to teardown later
+- Append either `--test-cmd <cmd>` or `--skip-tests`.
+- `0`: recap from `details.recap`; keep it compact
 - `13`: read [conflict.md](conflict.md)
-- `19`: stop immediately; report `message`
-- `11`, `12`, `14`, `15`, `17`: report `message`, release lock, stop
-
-8. Verify and test after all lands.
-
-```bash
-git -C $REPO log --oneline -n 20
-git -C $REPO status --porcelain
-python3 $RESOLVE_TEST "$REPO"
-```
-
-Run the returned test argv unless it is `--skip-tests`.
-
-- pass: continue
-- fail or verify wrong: read [failure.md](failure.md)
-
-9. Teardown landed worktrees:
-
-```bash
-python3 $ENGINE --repo $REPO teardown --branch <branch> --target $TARGET --require-lease
-python3 $LOCK --repo $REPO release-main
-```
+- `18`: read [failure.md](failure.md)
+- `16`: report holder; wait or force-unlock only on explicit user direction
+- `11`, `12`, `14`, `15`, `17`, `19`: report `message` and stop
 
 Never hand-roll merge, reset, or teardown.

@@ -111,6 +111,22 @@ def gather(cwd: str) -> list[cw.Worktree]:
         return []
 
 
+def has_linked_worktrees(cwd: str) -> bool:
+    """Cheap check for whether the repo has any linked worktrees at all."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", cwd, "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return False
+    if proc.returncode != 0:
+        return False
+    return proc.stdout.count("\n\n") > 0
+
+
 def build_banner(worktrees: list[cw.Worktree], mode: str) -> str | None:
     """Compose the SessionStart banner for the given mode, or None to stay silent.
 
@@ -359,6 +375,8 @@ def main() -> int:
     ):
         return 0
 
+    linked_worktrees_exist = has_linked_worktrees(cwd)
+
     # Force-quit backstop + external-removal detection. Both are best-effort and
     # independent of the banner: capture WIP of any dirty worktree a prior
     # force-quit stranded (before it can be removed uncaptured), then diff the
@@ -366,6 +384,8 @@ def main() -> int:
     # itself perform. Failures here must never affect the rest of the hook.
     removal_advisory = ""
     try:
+        if not linked_worktrees_exist:
+            raise RuntimeError("no linked worktrees")
         import worktree_wip  # noqa: PLC0415
         import worktree_population  # noqa: PLC0415
 

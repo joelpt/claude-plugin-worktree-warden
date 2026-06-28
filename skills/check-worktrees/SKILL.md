@@ -1,29 +1,23 @@
 ---
 name: check-worktrees
-description: Review linked worktrees in this repo.
+description: Review this repo's linked worktrees.
 allowed-tools: Bash(python3 *) Skill(worktree-warden:merge-worktrees)
 ---
 
 Repo-scoped only.
 
-1. Render the table:
+1. Fetch table + JSON in one call:
 
 ```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_worktrees.py
+python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_worktrees.py --bundle-json
 ```
 
-- empty output: say so and stop
+- Read `table` and `worktrees`.
+- if `table` is empty, say so and stop
 - otherwise show the table verbatim in a code block
+- Keep each ready worktree's `path` and `branch`.
 
-2. Get JSON:
-
-```bash
-python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_worktrees.py --json
-```
-
-Keep `path` and `branch`.
-
-3. Offer only `ready: true` worktrees.
+2. Offer only `ready: true` worktrees.
 
 - if `cooldown` or `blocked` exist, mention them in one short line
 - if none are ready, stop
@@ -33,7 +27,10 @@ Keep `path` and `branch`.
   - Choose specific
 - For `Choose specific`, page ready worktrees at 4 max with `multiSelect: true`
 
-4. If the chosen set is non-empty, invoke `/worktree-warden:merge-worktrees` with each chosen `path` + `branch`.
+3. If the chosen set is non-empty, invoke `/worktree-warden:merge-worktrees` ONCE with the chosen branches in the selected order.
+
+- Pass every selected `path` + `branch` together in the same invocation.
+- Never invoke `/worktree-warden:merge-worktrees` once per worktree.
 
 Notes:
 

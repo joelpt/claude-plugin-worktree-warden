@@ -576,6 +576,7 @@ def cmd_finish_preflight(worktree: str, target_override: str | None = None) -> O
         return Outcome(EXIT_GIT_ERROR, "git_error", str(exc))
 
     classification = "primary" if is_primary else "linked"
+    test = resolve_test_args(Path(primary))
     return Outcome(
         EXIT_OK,
         "finish_preflight",
@@ -587,6 +588,8 @@ def cmd_finish_preflight(worktree: str, target_override: str | None = None) -> O
         details={
             "kind": classification,
             "detached": branch == "HEAD",
+            "test_argv": test["argv"],
+            "test_source": test["source"],
         },
     )
 
@@ -1068,6 +1071,47 @@ def _release_main_lock(repo: str, owner: str) -> None:
         pass
 
 
+def _parse_branch_csv(branches: str) -> list[str]:
+    return [branch for branch in branches.split(",") if branch]
+
+
+def _has_just_test(repo: Path) -> bool:
+    path = repo / "Justfile"
+    if not path.is_file():
+        return False
+    try:
+        for line in path.read_text().splitlines():
+            if line.strip().startswith("test:"):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _has_python_tests(repo: Path) -> bool:
+    markers = ("pytest.ini", "tox.ini", "setup.py", "requirements.txt", "manage.py")
+    if any((repo / name).exists() for name in markers):
+        return True
+    return any((repo / name).exists() for name in ("pyproject.toml", "setup.cfg", "tests"))
+
+
+def resolve_test_args(repo: Path) -> dict[str, object]:
+    """Resolve the default test command for a repo.
+
+    Kept in-engine so the skill layer does not need a separate shell round-trip
+    just to discover the post-land verification command.
+    """
+    if _has_just_test(repo):
+        return {"argv": ["--test-cmd", "just test"], "source": "justfile"}
+    if (repo / "package.json").is_file():
+        return {"argv": ["--test-cmd", "npm test"], "source": "package.json"}
+    if _has_python_tests(repo):
+        return {"argv": ["--test-cmd", "pytest"], "source": "python"}
+    if (repo / "Cargo.toml").is_file():
+        return {"argv": ["--test-cmd", "cargo test"], "source": "cargo"}
+    return {"argv": ["--skip-tests"], "source": "none"}
+
+
 def _run_tests(test_cmd: str, cwd: str) -> tuple[bool, str]:
     """Run the caller-supplied test command in ``cwd``; return (passed, output-tail).
 
@@ -1224,6 +1268,176 @@ def cmd_finish(
         f"'{branch}' {verb} '{target}'{suffix}; worktree torn down.",
         target=target,
         branch=branch,
+        details=details,
+    )
+
+
+def cmd_finish_many(
+    repo: str,
+    branches: list[str],
+    target: str,
+    *,
+    test_cmd: str | None,
+    skip_tests: bool,
+    use_lock: bool,
+    owner: str,
+) -> Outcome:
+    """Batch the deterministic multi-worktree happy path into one call.
+
+    The caller still owns judgment-heavy work: deciding which dirty worktrees to
+    commit, choosing order when dependencies are unclear, and resolving
+    conflicts/tests-failures. Once that setup is done, this collapses the rest:
+    lock, snapshot, sequential land, verify/test, teardown, release.
+    """
+    if not branches:
+        return Outcome(EXIT_NOT_APPLICABLE, "not_applicable", "No branches selected to land.", target=target)
+    if not skip_tests and not test_cmd:
+        return Outcome(
+            EXIT_GIT_ERROR,
+            "finish_many_misconfigured",
+            "finish-many needs --test-cmd <cmd> or --skip-tests, chosen before any mutation.",
+            target=target,
+        )
+
+    branch_to_path = _worktrees_by_branch(repo)
+    ordered: list[tuple[str, str]] = []
+    missing: list[str] = []
+    dirty: dict[str, list[str]] = {}
+    for branch in branches:
+        path = branch_to_path.get(branch)
+        if path is None:
+            missing.append(branch)
+            continue
+        dirty_files = _non_noise_dirty(path)
+        if dirty_files:
+            dirty[branch] = dirty_files
+        ordered.append((branch, path))
+    if missing:
+        return Outcome(
+            EXIT_GIT_ERROR,
+            "missing_worktrees",
+            f"Branches are not checked out in linked worktrees: {', '.join(missing)}.",
+            target=target,
+            details={"missing_branches": missing},
+        )
+    if dirty:
+        return Outcome(
+            EXIT_DIRTY_WORKTREE,
+            "dirty_worktree",
+            "One or more selected worktrees have uncommitted changes; commit or drop them first.",
+            target=target,
+            details={
+                "dirty_worktrees": {
+                    branch: _bounded_list(files) for branch, files in dirty.items()
+                },
+                "next_action": "commit_or_drop_dirty_worktrees",
+            },
+        )
+
+    held = False
+    if use_lock:
+        held, blocked = _acquire_main_lock(repo, owner, f"finish-many: landing {', '.join(branches)} into {target}")
+        if blocked is not None:
+            return blocked
+
+    def _bail_release(outcome: Outcome) -> Outcome:
+        if held:
+            _release_main_lock(repo, owner)
+        return outcome
+
+    old_head = _git(["rev-parse", target], cwd=repo, check=False)
+    snap = cmd_snapshot(repo, target, branches)
+    if snap.code != EXIT_OK:
+        return _bail_release(snap)
+    snapshot_file = str(snap.details.get("snapshot_file", ""))
+
+    landed_branches: list[str] = []
+    already_merged: list[str] = []
+    for branch, worktree in ordered:
+        landed = cmd_land(worktree, branch, target, repo)
+        if landed.code == EXIT_REBASE_CONFLICT:
+            landed.details = {
+                **landed.details,
+                "snapshot_file": snapshot_file,
+                "landed_branches": landed_branches,
+                "already_merged_branches": already_merged,
+                "remaining_branches": [b for b, _ in ordered if b not in landed_branches and b not in already_merged],
+                "next_action": "resolve_conflict_then_rebase_continue",
+            }
+            return landed
+        if landed.code == EXIT_NOT_APPLICABLE:
+            already_merged.append(branch)
+            continue
+        if landed.code != EXIT_OK:
+            landed.details = {
+                **landed.details,
+                "snapshot_file": snapshot_file,
+                "landed_branches": landed_branches,
+                "already_merged_branches": already_merged,
+                "next_action": "stop_and_report",
+            }
+            return _bail_release(landed)
+        landed_branches.append(branch)
+
+    tested = bool(test_cmd) and not skip_tests and bool(landed_branches)
+    if tested:
+        assert test_cmd is not None
+        passed, tail = _run_tests(test_cmd, repo)
+        if not passed:
+            return Outcome(
+                EXIT_TESTS_FAILED,
+                "tests_failed",
+                "Selected branches were landed but tests FAILED. State PRESERVED and lock KEPT.",
+                target=target,
+                details={
+                    "snapshot_file": snapshot_file,
+                    "landed_branches": landed_branches,
+                    "already_merged_branches": already_merged,
+                    "output_tail": tail,
+                    "next_action": "decide_fix_forward_or_undo",
+                },
+            )
+
+    teardown_notes: list[dict[str, object]] = []
+    for branch, _ in ordered:
+        td = cmd_teardown(branch, target, repo, dry_run=False)
+        teardown_notes.append(
+            {
+                "branch": branch,
+                "status": td.status,
+                "code": td.code,
+                "message": td.message,
+            }
+        )
+        if td.code != EXIT_OK:
+            if held:
+                _release_main_lock(repo, owner)
+            td.details = {
+                **td.details,
+                "snapshot_file": snapshot_file,
+                "landed_branches": landed_branches,
+                "already_merged_branches": already_merged,
+                "teardown_results": teardown_notes,
+                "next_action": "report_teardown_failure",
+            }
+            return td
+
+    if held:
+        _release_main_lock(repo, owner)
+    details: dict[str, object] = {
+        "tested": tested,
+        "landed_branches": landed_branches,
+        "already_merged_branches": already_merged,
+        "teardown_results": teardown_notes,
+        "next_action": "done",
+    }
+    if landed_branches:
+        details["recap"] = _recap(repo, old_head, target, limit=20)
+    return Outcome(
+        EXIT_OK,
+        "finished_many",
+        f"Landed {len(landed_branches)} branch(es) into '{target}' and tore down {len(ordered)} worktree(s).",
+        target=target,
         details=details,
     )
 
@@ -1411,6 +1625,17 @@ def main(argv: list[str] | None = None) -> int:
     p_fin.add_argument("--no-lock", action="store_true", help="Do not manage the main-target lock.")
     p_fin.add_argument("--owner", default=None, help="Lock owner (default: $CLAUDE_CODE_SESSION_ID).")
 
+    p_fm = sub.add_parser(
+        "finish-many",
+        help="Batch the deterministic multi-worktree path (lock+snapshot+land+test+teardown+release).",
+    )
+    p_fm.add_argument("--target", default=None, help="Default branch (resolved if omitted).")
+    p_fm.add_argument("--branches", default="", help="Comma-separated branch names in land order.")
+    p_fm.add_argument("--test-cmd", default=None, help="Post-land verification command, e.g. 'just test'.")
+    p_fm.add_argument("--skip-tests", action="store_true", help="Land without a test gate.")
+    p_fm.add_argument("--no-lock", action="store_true", help="Do not manage the main-target lock.")
+    p_fm.add_argument("--owner", default=None, help="Lock owner (default: $CLAUDE_CODE_SESSION_ID).")
+
     args = parser.parse_args(argv)
     repo = args.repo
     if args.cmd in _LEASE_REFRESH_CMDS:
@@ -1488,6 +1713,21 @@ def main(argv: list[str] | None = None) -> int:
                 owner=owner,
             )
             _audit(repo, "finish", outcome)
+            return outcome.emit(pretty=args.pretty)
+        if args.cmd == "finish-many":
+            branches = _parse_branch_csv(args.branches)
+            target = args.target or _resolve_target(repo)
+            owner = args.owner or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+            outcome = cmd_finish_many(
+                repo,
+                branches,
+                target,
+                test_cmd=args.test_cmd,
+                skip_tests=args.skip_tests,
+                use_lock=not args.no_lock,
+                owner=owner,
+            )
+            _audit(repo, "finish-many", outcome)
             return outcome.emit(pretty=args.pretty)
     except GitError as exc:
         return Outcome(EXIT_GIT_ERROR, "git_error", str(exc)).emit(pretty=args.pretty)
