@@ -68,6 +68,34 @@ class PreflightTest(unittest.TestCase):
         self.assertTrue(entry["clean"])
         self.assertEqual(entry["dirty_files"], [])
 
+    def test_branch_with_no_commits_flagged_as_empty(self) -> None:
+        """A branch with zero commits ahead of target is surfaced as a warning,
+        not silently reported as ordinary clean status."""
+        out = engine.cmd_preflight(str(self.repo), ["feat-clean"])
+        self.assertEqual(out.code, engine.EXIT_OK)
+        worktrees = out.details["worktrees"]
+        assert isinstance(worktrees, list)
+        entry = worktrees[0]
+        assert isinstance(entry, dict)
+        self.assertEqual(entry["own_commits"], 0)
+        self.assertEqual(out.details["empty_branches"], ["feat-clean"])
+        self.assertIn("WARNING", out.message)
+        self.assertIn("feat-clean", out.message)
+
+    def test_branch_with_commits_not_flagged_as_empty(self) -> None:
+        """A branch with real, unlanded commits is not flagged as empty."""
+        (self.wt_clean / "f.txt").write_text("real work\n")
+        _git("add", "f.txt", cwd=self.wt_clean)
+        _git("commit", "-m", "real work", cwd=self.wt_clean)
+
+        out = engine.cmd_preflight(str(self.repo), ["feat-clean"])
+        self.assertEqual(out.code, engine.EXIT_OK)
+        worktrees = out.details["worktrees"]
+        assert isinstance(worktrees, list)
+        self.assertEqual(worktrees[0]["own_commits"], 1)
+        self.assertEqual(out.details["empty_branches"], [])
+        self.assertNotIn("WARNING", out.message)
+
     def test_dirty_worktree_reported_dirty(self) -> None:
         """An untracked file in a worktree marks it dirty and lists the path."""
         out = engine.cmd_preflight(str(self.repo), ["feat-dirty"])

@@ -111,6 +111,28 @@ class FinishHappyTest(_FinishRepo):
         self.assertFalse(out.details["diffstat"]["truncated"])
 
 
+class FinishAlreadyMergedTest(_FinishRepo):
+    """cmd_finish's "already merged" no-op path had zero prior test coverage."""
+
+    def test_branch_already_ancestor_of_target_lands_nothing(self) -> None:
+        """A worktree branched off target with no commits of its own is a
+        no-op: reported as already-merged, torn down, nothing added to target."""
+        empty_wt = self.base / "wtEmpty"
+        _git("worktree", "add", "-b", "empty-branch", str(empty_wt), cwd=self.repo)
+        target_sha_before = self.main_sha
+
+        out = engine.cmd_finish(
+            str(empty_wt), "empty-branch", "main", str(self.repo),
+            test_cmd=None, skip_tests=True, use_lock=False, owner="",
+        )
+        self.assertEqual(out.code, engine.EXIT_OK, out.message)
+        self.assertIn("was already merged into", out.message)
+        self.assertNotIn("recap", out.details)
+        self.assertFalse(empty_wt.exists())
+        self.assertFalse(self._branch_exists("empty-branch"))
+        self.assertEqual(self.main_sha, target_sha_before)
+
+
 class FinishBailTest(_FinishRepo):
     """Non-trivial conditions stop cleanly without auto-rollback."""
 

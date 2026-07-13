@@ -197,6 +197,23 @@ def _is_ancestor(branch: str, target: str, repo: str) -> bool:
     return rc == 0
 
 
+def _own_commit_count(branch: str, target: str, repo: str) -> int:
+    """Commits unique to *branch* since it diverged from *target*.
+
+    Whenever *branch* is already an ancestor of *target*, this is always 0 --
+    ``merge-base(branch, target)`` collapses to *branch*'s own tip once it's
+    reachable from *target*, so the count can't tell "never had any commits"
+    apart from "its commits already landed by another path" (e.g. a prior
+    fast-forward merge, or the same fix committed separately elsewhere). Zero
+    is a signal worth a second look before treating the branch as done, not
+    proof that no work happened.
+    """
+    mb = _git(["merge-base", branch, target], cwd=repo, check=False)
+    if not mb:
+        return _ahead_count(target, branch, repo)
+    return _ahead_count(mb, branch, repo)
+
+
 def _worktree_for_branch(branch: str, repo: str) -> str | None:
     """Path of the linked worktree checked out at *branch*, else None."""
     current: str | None = None
@@ -428,6 +445,7 @@ class WorktreeStatus(TypedDict):
     path: str | None
     clean: bool
     dirty_files: list[str]
+    own_commits: int | None
 
 
 def _worktrees_by_branch(repo: str) -> dict[str, str]:
@@ -515,24 +533,44 @@ def cmd_preflight(repo: str, branches: list[str]) -> Outcome:
                     f"Worktree path {path!r} for branch '{branch}' is inaccessible: {exc}",
                     target=target,
                 )
+            try:
+                own_commits = _own_commit_count(branch, target, repo)
+            except GitError:
+                own_commits = None
         else:
             dirty_files = []
+            own_commits = None
         worktrees.append(
             WorktreeStatus(
                 branch=branch,
                 path=path,
                 clean=not dirty_files,
                 dirty_files=dirty_files,
+                own_commits=own_commits,
             )
         )
 
     dirty_count = sum(1 for w in worktrees if not w["clean"])
+    empty_branches = [w["branch"] for w in worktrees if w["own_commits"] == 0]
+    message = f"TARGET={target}; {len(worktrees)} worktree(s), {dirty_count} dirty."
+    if empty_branches:
+        message += (
+            f" WARNING: {len(empty_branches)} branch(es) show ZERO commits ahead of"
+            f" '{target}' -- either that work already landed by another path, or it"
+            f" was never done; git history alone can't tell which. Verify (e.g. an"
+            f" issue tracker or a plugin's own state) before batch-landing: "
+            f"{', '.join(empty_branches)}."
+        )
     out = Outcome(
         EXIT_OK,
         "preflight",
-        f"TARGET={target}; {len(worktrees)} worktree(s), {dirty_count} dirty.",
+        message,
         target=target,
-        details={"target": target, "worktrees": [dict(w) for w in worktrees]},
+        details={
+            "target": target,
+            "worktrees": [dict(w) for w in worktrees],
+            "empty_branches": empty_branches,
+        },
     )
     return out
 
@@ -1346,6 +1384,15 @@ def cmd_finish_many(
         return outcome
 
     old_head = _git(["rev-parse", target], cwd=repo, check=False)
+    # Computed against the pre-batch target tip, mirroring cmd_preflight: a
+    # branch already an ancestor of target always shows 0 here (merge-base of
+    # an ancestor and its descendant is the ancestor itself), whether that's
+    # because its own commits already landed by another path or because it
+    # was never touched -- git's object graph can't tell those apart. It's a
+    # signal worth a second look before teardown, not proof of either story.
+    zero_commit_branches = {
+        branch for branch, _ in ordered if _own_commit_count(branch, target, repo) == 0
+    }
     snap = cmd_snapshot(repo, target, branches)
     if snap.code != EXIT_OK:
         return _bail_release(snap)
@@ -1424,19 +1471,29 @@ def cmd_finish_many(
 
     if held:
         _release_main_lock(repo, owner)
+    empty_branches = [b for b in already_merged if b in zero_commit_branches]
     details: dict[str, object] = {
         "tested": tested,
         "landed_branches": landed_branches,
         "already_merged_branches": already_merged,
+        "empty_branches": empty_branches,
         "teardown_results": teardown_notes,
         "next_action": "done",
     }
     if landed_branches:
         details["recap"] = _recap(repo, old_head, target, limit=20)
+    message = f"Landed {len(landed_branches)} branch(es) into '{target}' and tore down {len(ordered)} worktree(s)."
+    if empty_branches:
+        message += (
+            f" WARNING: {len(empty_branches)} branch(es) were torn down with ZERO"
+            f" commits ahead of '{target}' -- either their work already landed by"
+            f" another path, or it was never done; git history can't tell which."
+            f" Verify before trusting this batch: {', '.join(empty_branches)}."
+        )
     return Outcome(
         EXIT_OK,
         "finished_many",
-        f"Landed {len(landed_branches)} branch(es) into '{target}' and tore down {len(ordered)} worktree(s).",
+        message,
         target=target,
         details=details,
     )
