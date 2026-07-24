@@ -20,6 +20,13 @@ python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_worktrees.py --bundle-json
 2. Offer only `ready: true` worktrees.
 
 - if `cooldown` or `blocked` exist, mention them in one short line
+- if any `category == "merged"` worktrees exist: `commit_count == 0` there is ambiguous by
+  construction — it means either this branch's work already landed by some other path, or
+  the branch never had any commits to begin with (both look identical once HEAD is an
+  ancestor of base). Before offering these in "Merge all N", check ground truth for each
+  one (its tracked issue/PR status, or another record of the work) — do not take the
+  "merged" label on faith. Call this out to the user as a distinct line, separate from
+  plain `ready` worktrees.
 - if none are ready, stop
 - AskUserQuestion options:
   - Merge all N

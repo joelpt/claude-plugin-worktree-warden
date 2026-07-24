@@ -76,7 +76,7 @@ class ReadinessTest(unittest.TestCase):
         wt = _wt(dirty=False, commit_count=0, behind=3)
         self.assertEqual(wt.readiness, cw.Readiness.MERGED)
         self.assertEqual(wt.ready_emoji, "🧹")
-        self.assertEqual(wt.ready_note, "merged, can be pruned")
+        self.assertEqual(wt.ready_note, "0 commits ahead — verify before pruning")
         self.assertTrue(wt.is_mergeable)
 
     def test_dirty_outranks_already_merged(self) -> None:

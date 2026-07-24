@@ -44,7 +44,12 @@ class Readiness(str, Enum):
 
     READY = "ready"  # clean, commits ahead of base — land as-is
     NEEDS_COMMIT = "needs_commit"  # uncommitted work — commit, then land
-    MERGED = "merged"  # clean, HEAD already in base's chain but behind it — prune
+    MERGED = "merged"  # clean, HEAD already in base's chain, base has since moved on —
+    # ambiguous: either this branch's work genuinely landed by some path, or it
+    # never had any commits to begin with. rev-list base..HEAD is 0 either way
+    # (once HEAD is an ancestor of base, nothing reachable from HEAD is absent
+    # from base) — verify against an issue tracker or other ground truth before
+    # trusting this as "already done".
     PRUNE = "prune"  # clean, HEAD == base tip — nothing here, just prune
     COOLDOWN = "cooldown"  # active within the recent window — hold off (overridable)
     BLOCKED = "blocked"  # a live claude session sits inside it
@@ -64,7 +69,7 @@ _EMOJI: dict[Readiness, str] = {
 _NOTE: dict[Readiness, str] = {
     Readiness.READY: "ready to merge",
     Readiness.NEEDS_COMMIT: "can merge after commit",
-    Readiness.MERGED: "merged, can be pruned",
+    Readiness.MERGED: "0 commits ahead — verify before pruning",
     Readiness.PRUNE: "empty, can be pruned",
     Readiness.COOLDOWN: "active <15m ago",
     Readiness.BLOCKED: "live session",
@@ -107,9 +112,14 @@ class Worktree:
         the worktree on COOLDOWN below a live session but above its git state —
         a safety harness against landing half-baked work, overridable on
         explicit request. A clean worktree with no commits ahead of base has its
-        HEAD already in base's chain; `behind > 0` means real history that base
-        has moved past (merged), while `behind == 0` means HEAD sits exactly on
-        base (empty).
+        HEAD already in base's chain; `behind > 0` (MERGED) means base has since
+        moved past it, which is consistent with this branch's work having
+        landed by some path -- but is equally consistent with the branch never
+        having had any commits at all (both give `commit_count == 0` once HEAD
+        is an ancestor of base, so this is a signal to verify, not proof either
+        way). `behind == 0` means HEAD sits exactly on base's current tip
+        (PRUNE) -- base hasn't moved at all, a much narrower window for the
+        same ambiguity.
 
         When a git state query failed (`unreadable`), the dirty/commit_count
         fields are not trustworthy — a failed `git status` defaults `dirty` to
