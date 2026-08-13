@@ -384,14 +384,17 @@ def main() -> int:
     # itself perform. Failures here must never affect the rest of the hook.
     removal_advisory = ""
     try:
-        if not linked_worktrees_exist:
-            raise RuntimeError("no linked worktrees")
-        import worktree_wip  # noqa: PLC0415
         import worktree_population  # noqa: PLC0415
 
-        worktree_wip.capture_dirty_orphans(cwd)
+        # capture_dirty_orphans genuinely needs live worktrees; reconcile does
+        # not — it must run even when the LAST linked worktree just vanished,
+        # or that disappearance (the highest-risk case) is never detected.
+        if linked_worktrees_exist:
+            import worktree_wip  # noqa: PLC0415
+
+            worktree_wip.capture_dirty_orphans(cwd)
         removal_advisory = worktree_population.format_advisory(
-            worktree_population.reconcile(cwd)
+            worktree_population.reconcile(cwd), cwd
         )
     except Exception:
         removal_advisory = ""

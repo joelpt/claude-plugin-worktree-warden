@@ -20,6 +20,7 @@ break SessionStart.
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import shlex
@@ -27,6 +28,18 @@ import subprocess
 import time
 from pathlib import Path
 from typing import TypedDict, cast
+
+_TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def _parse_ts(ts: object) -> float | None:
+    """Parse an ``_audit()``-written UTC timestamp string to epoch seconds."""
+    if not isinstance(ts, str):
+        return None
+    try:
+        return calendar.timegm(time.strptime(ts, _TS_FORMAT))
+    except ValueError:
+        return None
 
 _POPULATION_FILE = "population.json"
 _AUDIT_FILE = "audit.log"
@@ -108,6 +121,7 @@ def current_population(repo: str) -> dict[str, WorktreeRecord] | None:
         (a repo with genuinely no linked worktrees): the caller must not treat a
         failed read as "everything disappeared", which would false-flag every
         worktree and wipe the baseline.
+
     """
     rc, out = _git(["worktree", "list", "--porcelain"], repo)
     if rc != 0:
@@ -163,7 +177,7 @@ def _save_snapshot(common: str, population: dict[str, WorktreeRecord]) -> None:
 
 
 def _definitely_unlanded(repo: str, ref: str, target: str) -> bool:
-    """True only when ``ref`` resolves AND is provably not an ancestor of target.
+    """Return True only when ``ref`` resolves AND is provably not an ancestor of target.
 
     Fails CLOSED toward "not unlanded": a ref that no longer resolves (gc'd) or a
     git error yields False, so a vanished/unresolvable SHA never produces a false
@@ -176,11 +190,53 @@ def _definitely_unlanded(repo: str, ref: str, target: str) -> bool:
     return _git(["merge-base", "--is-ancestor", ref, target], repo)[0] == 1
 
 
-def _warden_accounted(common: str, path: str, branch: str) -> bool:
-    """True if warden's audit log records a teardown/undo touching this worktree.
+_ACCOUNTED_ACTIONS = ("teardown", "undo", "finish", "finish-many")
 
-    A disappearance warden itself caused (teardown after a land, or an undo) is
-    expected, not an external removal.
+
+def _proven_torn_down_branches(rec: dict) -> list[str]:
+    """Branch names this record proves warden actually tore down.
+
+    `teardown`/`undo`/`finish` carry the branch at the top level, gated on the
+    record's own `code`. `finish-many` audits a whole batch under one record;
+    a branch counts only when ITS OWN entry in `details.teardown_results`
+    shows success. `details.landed_branches` is deliberately NOT trusted here:
+    it only proves the land step ran, not that the worktree was torn down — a
+    batch that lands several branches and then fails a later teardown would
+    otherwise wrongly excuse branches whose worktrees survive.
+    """
+    action = rec.get("action")
+    if action in ("teardown", "undo", "finish"):
+        if rec.get("code", 0) != 0:
+            return []
+        top = rec.get("branch")
+        return [top] if top else []
+    if action == "finish-many":
+        details = rec.get("details")
+        results = details.get("teardown_results") if isinstance(details, dict) else None
+        if not isinstance(results, list):
+            return []
+        return [
+            r["branch"]
+            for r in results
+            if isinstance(r, dict)
+            and r.get("code", 0) == 0
+            and isinstance(r.get("branch"), str)
+        ]
+    return []
+
+
+def _warden_accounted(common: str, path: str, branch: str, since_ts: float | None) -> bool:
+    """Return True if warden's audit log records a teardown/undo touching this worktree.
+
+    A disappearance warden itself caused is expected, not an external removal.
+    That includes the composite `finish`/`finish-many` commands, which tear a
+    worktree down internally without ever writing a standalone `teardown`
+    record. Branch-name matches are bounded to records at or after
+    ``since_ts`` (the previous snapshot's save time): unbounded matching would
+    let an old `finish` record for branch "feat" permanently suppress
+    detection of a LATER, unrelated worktree that reuses the same branch name
+    and is genuinely removed externally. Path matches need no such bound — a
+    worktree path is not reused the way a branch name commonly is.
     """
     try:
         lines = (Path(common) / "worktree-warden" / _AUDIT_FILE).read_text().splitlines()
@@ -191,9 +247,18 @@ def _warden_accounted(common: str, path: str, branch: str) -> bool:
             rec = json.loads(line)
         except ValueError:
             continue
-        if rec.get("action") not in ("teardown", "undo"):
+        if not isinstance(rec, dict):
             continue
-        if rec.get("worktree") == path or (branch and rec.get("branch") == branch):
+        if rec.get("action") not in _ACCOUNTED_ACTIONS:
+            continue
+        if path and rec.get("code", 0) == 0 and rec.get("worktree") == path:
+            return True
+        if not branch:
+            continue
+        ts = _parse_ts(rec.get("ts"))
+        if since_ts is not None and (ts is None or ts < since_ts):
+            continue
+        if branch in _proven_torn_down_branches(rec):
             return True
     return False
 
@@ -210,10 +275,23 @@ def reconcile(repo: str) -> list[ExternalRemoval]:
 
     Returns:
         List of ExternalRemoval entries (empty when nothing of concern vanished).
+
     """
     common = _common_dir(repo)
     if common is None:
         return []
+    snapshot_path = Path(common) / "worktree-warden" / _POPULATION_FILE
+    try:
+        # The previous snapshot's save time bounds branch-name matching in
+        # _warden_accounted: only audit records at or after it could explain
+        # something that disappeared since then. No prior snapshot (first run
+        # for this repo) means nothing to bound against. Floor to whole
+        # seconds: audit timestamps have only second precision, so an audit
+        # record written the same wall-clock second as (but nanoseconds
+        # before) this mtime must still count as "at or after" it.
+        since_ts: float | None = float(int(snapshot_path.stat().st_mtime))
+    except OSError:
+        since_ts = None
     previous = _load_snapshot(common)
     current = current_population(repo)
     if current is None:
@@ -228,7 +306,7 @@ def reconcile(repo: str) -> list[ExternalRemoval]:
             continue
         branch = rec.get("branch", "")
         head = rec.get("head", "")
-        if _warden_accounted(common, path, branch):
+        if _warden_accounted(common, path, branch, since_ts):
             continue
 
         branch_alive = bool(branch) and _git(
@@ -266,12 +344,25 @@ def reconcile(repo: str) -> list[ExternalRemoval]:
             )
         )
 
-    _save_snapshot(common, current)
+    # Skip the write for a repo with no worktree-tracking history at all (no
+    # prior snapshot AND no linked worktrees right now) — reconcile() now runs
+    # unconditionally from the hook, so without this every git repo on disk
+    # would otherwise grow an empty `.git/worktree-warden/population.json`.
+    if previous or current:
+        _save_snapshot(common, current)
     return removals
 
 
-def format_advisory(removals: list[ExternalRemoval]) -> str:
-    """Render an external-removal advisory for the SessionStart banner."""
+def format_advisory(removals: list[ExternalRemoval], repo: str = "") -> str:
+    """Render an external-removal advisory for the SessionStart banner.
+
+    Args:
+        removals: Entries produced by ``reconcile()``.
+        repo: Primary checkout path, used to compose a runnable ``recover``
+            command. When omitted, the trailing "run this" line is skipped
+            rather than emit an unpasteable placeholder.
+
+    """
     if not removals:
         return ""
     stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
@@ -290,7 +381,8 @@ def format_advisory(removals: list[ExternalRemoval]) -> str:
         lines.append(f"  • {label} — {', '.join(flags) or 'content at risk'}")
         if r["recovery"]:
             lines.append(f"      recover: {r['recovery']}")
-    lines.append(
-        "  Run `python3 <plugin>/scripts/worktree_engine.py recover` for the full picture."
-    )
+    if repo:
+        engine = Path(__file__).resolve().with_name("worktree_engine.py")
+        cmd = f"python3 {shlex.quote(str(engine))} --repo {shlex.quote(repo)} recover"
+        lines.append(f"  Run `{cmd}` for the full picture.")
     return "\n".join(lines)
