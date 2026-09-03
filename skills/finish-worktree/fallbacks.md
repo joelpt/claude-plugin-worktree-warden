@@ -3,10 +3,14 @@
 Read only if `finish` exits non-zero.
 
 - `11 dirty_worktree`
-  - `EnterWorktree(path:$WORKTREE_PATH)`
-  - run `/commit-commands:commitall`
-  - relocate to `$PRIMARY`
-  - retry `finish`
+  - if the work SHOULD land:
+    - `EnterWorktree(path:$WORKTREE_PATH)`
+    - run `/commit-commands:commitall`
+    - relocate to `$PRIMARY`
+    - retry `finish`
+  - if the work must NOT land (abandoned branch), ask the user first, then:
+    - `python3 $ENGINE --repo $PRIMARY teardown --branch $BRANCH --target $TARGET --discard`
+  - do NOT commit purely to clear this error -- that just trips `12` next
 - `13 rebase_conflict`
   - hand off to `/worktree-warden:merge-worktrees --worktree $WORKTREE_PATH --branch $BRANCH --repo $PRIMARY --target $TARGET`
 - `18 tests_failed`
@@ -15,5 +19,9 @@ Read only if `finish` exits non-zero.
   - report holder; wait or force-unlock only on explicit user direction
 - `10 already_merged`
   - recap briefly; teardown already happened
-- `12`, `14`, `15`, `17`, `19`
+- `12 branch_unmerged`
+  - the branch holds commits not on `$TARGET`. Landing them is `merge-worktrees`.
+  - if the work must NOT land, ask the user, then tear down with `--discard` as above
+  - never hand-roll `git worktree remove --force` / `git branch -D`
+- `14`, `15`, `17`, `19`
   - report `message` verbatim and stop

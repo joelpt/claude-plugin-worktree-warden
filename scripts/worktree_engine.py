@@ -30,6 +30,9 @@ exits with the contract code below):
                    `git reset --hard`) and recreate any torn-down worktree on its
                    branch.
   teardown         idempotent worktree removal + branch -d + prune (post-land).
+                   --discard abandons instead: tears down a dirty or unmerged
+                   branch whose work must NOT land, salvaging it to the object
+                   store first. Never bypasses the path gate.
   recover          read-only scan for recoverable content: stranded (prunable)
                    worktrees whose branch holds commits not yet landed, plus WIP
                    capture bundles, each with the exact restore command. With
@@ -820,8 +823,25 @@ def cmd_undo(repo: str, snapshot_path: str) -> Outcome:
     return out
 
 
-def cmd_teardown(branch: str, target: str, repo: str, dry_run: bool) -> Outcome:
-    """Idempotently remove a landed worktree + delete its branch + prune."""
+def cmd_teardown(
+    branch: str, target: str, repo: str, dry_run: bool, discard: bool = False
+) -> Outcome:
+    """Idempotently remove a landed worktree + delete its branch + prune.
+
+    ``discard=True`` is the abandon path: it overrides the dirty-worktree and
+    unmerged-branch guards so a branch whose work must NOT land can be torn
+    down. Without it those guards make abandoning impossible -- committing the
+    dirty state to clear the first merely trips the second -- which left
+    hand-rolled ``worktree remove --force`` + ``branch -D`` as the only route,
+    exactly what this engine exists to prevent.
+
+    Discarding never bypasses the path gate: the primary checkout stays
+    untouchable. It is also recoverable by construction -- the branch tip is
+    captured before deletion, and dirty tracked state is salvaged into a
+    dangling commit via ``git stash create`` -- so both survive in the object
+    store until gc. What it destroys is recorded in ``details``, never
+    silently.
+    """
     try:
         primary = _primary_worktree(repo)
     except GitError as exc:
@@ -839,6 +859,7 @@ def cmd_teardown(branch: str, target: str, repo: str, dry_run: bool) -> Outcome:
         return base
 
     main_path, linked = _registered_worktrees(repo)
+    dirty: list[str] = []
     if wt_path is not None:
         base.worktree = wt_path
         if wt_path == main_path or wt_path not in linked:
@@ -846,17 +867,23 @@ def cmd_teardown(branch: str, target: str, repo: str, dry_run: bool) -> Outcome:
             base.message = f"'{wt_path}' is not a registered linked worktree; refusing teardown."
             return base
         dirty = _non_noise_dirty(wt_path)
-        if dirty:
+        if dirty and not discard:
             base.code, base.status = EXIT_DIRTY_WORKTREE, "dirty_worktree"
             base.message = f"Worktree {wt_path} has uncommitted changes; refusing teardown."
             base.details = {"uncommitted": dirty}
             return base
 
-    if branch_exists and not _is_ancestor(branch, target, repo):
-        ahead = _ahead_count(target, branch, repo)
+    unmerged = (
+        _ahead_count(target, branch, repo)
+        if branch_exists and not _is_ancestor(branch, target, repo)
+        else 0
+    )
+    if unmerged and not discard:
         base.code, base.status = EXIT_PRIMARY_UNSAFE, "branch_unmerged"
-        base.message = f"Branch '{branch}' is not an ancestor of '{target}' ({ahead} unmerged); refusing."
-        base.details = {"unmerged_commits": ahead}
+        base.message = (
+            f"Branch '{branch}' is not an ancestor of '{target}' ({unmerged} unmerged); refusing."
+        )
+        base.details = {"unmerged_commits": unmerged}
         return base
 
     if dry_run:
@@ -870,15 +897,24 @@ def cmd_teardown(branch: str, target: str, repo: str, dry_run: bool) -> Outcome:
         _git_rc(["rev-parse", branch], cwd=repo) if branch_exists else (0, "", "")
     )
 
+    # Salvage dirty tracked state into a dangling commit BEFORE the working
+    # tree is destroyed, so a discard stays recoverable from the object store.
+    salvaged_stash = ""
+    if discard and wt_path is not None and dirty:
+        rc, out, _ = _git_rc(["stash", "create"], cwd=wt_path)
+        if rc == 0:
+            salvaged_stash = out.strip()
+
     if wt_path is not None:
         _neutralize_noise(wt_path)
-        rc, _, err = _git_rc(["worktree", "remove", wt_path], cwd=primary)
+        remove_argv = ["worktree", "remove"] + (["--force"] if discard else []) + [wt_path]
+        rc, _, err = _git_rc(remove_argv, cwd=primary)
         if rc != 0:
             base.code, base.status = EXIT_GIT_ERROR, "worktree_remove_failed"
             base.message = f"git worktree remove {wt_path} failed: {err}"
             return base
     if branch_exists:
-        rc, _, err = _git_rc(["branch", "-d", branch], cwd=primary)
+        rc, _, err = _git_rc(["branch", "-D" if discard else "-d", branch], cwd=primary)
         if rc != 0:
             base.code, base.status = EXIT_GIT_ERROR, "branch_delete_failed"
             base.message = f"git branch -d {branch} failed: {err}"
@@ -890,6 +926,10 @@ def cmd_teardown(branch: str, target: str, repo: str, dry_run: bool) -> Outcome:
         "worktree_removed": wt_path is not None,
         "branch_deleted": branch_exists,
         "branch_tip": branch_tip,
+        "discarded": discard,
+        "uncommitted": dirty,
+        "unmerged_commits": unmerged,
+        "salvaged_stash": salvaged_stash,
     }
     return base
 
@@ -1658,6 +1698,16 @@ def main(argv: list[str] | None = None) -> int:
     p_td.add_argument("--branch", required=True)
     p_td.add_argument("--target", default="main")
     p_td.add_argument("--dry-run", action="store_true")
+    p_td.add_argument(
+        "--discard",
+        action="store_true",
+        help=(
+            "Abandon path: tear down even when the worktree is dirty or the branch is "
+            "unmerged, for work that must NOT land. Never bypasses the path gate. "
+            "Recoverable -- the branch tip is kept and dirty tracked state is salvaged "
+            "into a dangling commit; both are reported in details."
+        ),
+    )
     _add_require_lease(p_td)
 
     p_rec = sub.add_parser("recover")
@@ -1747,7 +1797,7 @@ def main(argv: list[str] | None = None) -> int:
             _audit(repo, "undo", outcome)
             return outcome.emit(pretty=args.pretty)
         if args.cmd == "teardown":
-            outcome = cmd_teardown(args.branch, args.target, repo, args.dry_run)
+            outcome = cmd_teardown(args.branch, args.target, repo, args.dry_run, args.discard)
             if not args.dry_run:
                 _audit(repo, "teardown", outcome)
             return outcome.emit(pretty=args.pretty)

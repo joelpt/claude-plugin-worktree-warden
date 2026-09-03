@@ -6,6 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`teardown --discard`: a sanctioned path for abandoning a worktree whose work must NOT
+  land.** `teardown` refused a dirty worktree (`11 dirty_worktree`) and refused an unmerged
+  branch (`12 branch_unmerged`). Both are correct defaults, but together they made abandoning
+  a branch impossible through the engine: committing the dirty state to clear the first guard
+  merely trips the second, and the only remaining route was hand-rolled
+  `git worktree remove --force` + `git branch -D` — precisely what this plugin's own skills
+  forbid, and what the engine exists to prevent. Found in practice on a branch that had been
+  deliberately *disproved* and therefore had to be discarded rather than merged. `--discard`
+  is opt-in, **never** bypasses the path gate (the primary checkout stays untouchable), and is
+  recoverable by construction: the branch tip is captured before deletion and dirty tracked
+  state is salvaged into a dangling commit via `git stash create`, so both survive in the
+  object store until gc. What it destroyed — `uncommitted`, `unmerged_commits`,
+  `salvaged_stash`, `branch_tip` — is reported in `details` and the audit log, never silently.
+  `finish-worktree`'s fallbacks now route exits `11` and `12` to it (with a user check first)
+  instead of dead-ending, and `12` is split out of the report-and-stop catch-all.
+
 - **Abort a merge on a lost lease (F-A Option B; closes the lease-lapse window).** The
   multi-process merge holds its main-target lease across many separate `worktree_engine.py`
   subprocesses; a pause that outlasts the lease — or a human `force-unlock` — can let a second

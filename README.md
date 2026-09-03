@@ -100,8 +100,11 @@ worktrees of the repo your current session belongs to — never cross-repo.
   `snapshot` (writes a JSON of the target tip, each branch tip, and its worktree
   path) / `undo` (restores those tips and **recreates any torn-down worktree on
   its branch** — so a roll-back even after teardown reconstructs the worktrees),
-  and `teardown` (idempotent, path-gated worktree removal + `branch -d`, no
-  `--force`/`-D`). Every mutation (`land`/`teardown`/`undo`/`snapshot`) appends a
+  and `teardown` (idempotent, path-gated worktree removal + `branch -d`; no
+  `--force`/`-D` unless you pass `--discard`, the explicit abandon path for work
+  that must NOT land -- which still honours the path gate, and first salvages the
+  branch tip and any dirty tracked state into the object store so the discard
+  stays recoverable). Every mutation (`land`/`teardown`/`undo`/`snapshot`) appends a
   JSON line to `<git-common-dir>/worktree-warden/audit.log` — recording the
   action, branch, target, worktree path, and key SHAs (the torn-down branch tip,
   the pre-`undo` reset SHAs) — so a vanished worktree is diagnosable and its last
