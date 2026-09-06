@@ -184,6 +184,7 @@ async def run_git(args: list[str], cwd: str) -> tuple[int, str]:
 
 
 async def is_git_repo(cwd: str) -> bool:
+    """Check whether `cwd` sits inside a git working tree."""
     rc, out = await run_git(["rev-parse", "--is-inside-work-tree"], cwd)
     return rc == 0 and out == "true"
 
@@ -340,14 +341,38 @@ def _json_payload(worktrees: list[Worktree]) -> list[dict[str, object]]:
 
 
 def to_json(worktrees: list[Worktree]) -> str:
+    """Serialize the full per-worktree field set as a JSON array."""
     return json.dumps(_json_payload(worktrees), indent=2)
 
 
+def _bundle_json_payload(worktrees: list[Worktree]) -> list[dict[str, object]]:
+    """Project only the fields `check-worktrees/SKILL.md` actually reads.
+
+    A separate projection from `_json_payload` (used by `to_json()` for the
+    general `--json` CLI consumer) so trimming this one doesn't change the
+    other's contract.
+    """
+    return [
+        {
+            "path": wt.path,
+            "branch": wt.branch,
+            "dirty": wt.dirty,
+            "commit_count": wt.commit_count,
+            "session_status": wt.session_status,
+            "category": wt.readiness.value,
+            "note": wt.ready_note,
+            "ready": wt.is_mergeable,
+        }
+        for wt in worktrees
+    ]
+
+
 def to_bundle_json(worktrees: list[Worktree]) -> str:
+    """Serialize the human-readable table alongside the slimmed bundle rows."""
     return json.dumps(
         {
             "table": render_table(worktrees),
-            "worktrees": _json_payload(worktrees),
+            "worktrees": _bundle_json_payload(worktrees),
         },
         indent=2,
     )
@@ -392,7 +417,7 @@ async def fill_state(wt: Worktree, base: str, cwd: str) -> None:
 
 
 def _recent(mtime: float, now: float, window: int = RECENT_WINDOW_SECONDS) -> bool:
-    """True iff `mtime` is a real timestamp within `window` seconds of `now`."""
+    """Return True iff `mtime` is a real timestamp within `window` seconds of `now`."""
     return mtime > 0 and (now - mtime) <= window
 
 
@@ -617,6 +642,7 @@ async def gather_worktrees(cwd: str) -> list[Worktree]:
 
 
 def main() -> int:
+    """Run the CLI: render the table or JSON for the current repo's worktrees."""
     parser = argparse.ArgumentParser(prog="check_worktrees")
     parser.add_argument("--cwd", default=os.getcwd())
     parser.add_argument("--json", dest="as_json", action="store_true")

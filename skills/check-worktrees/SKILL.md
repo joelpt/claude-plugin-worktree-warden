@@ -12,7 +12,8 @@ Repo-scoped only.
 python3 ${CLAUDE_PLUGIN_ROOT}/scripts/check_worktrees.py --bundle-json
 ```
 
-- Read `table` and `worktrees`.
+- Read `table` and `worktrees` (each row: `path`, `branch`, `dirty`, `commit_count`,
+  `session_status`, `category`, `note`, `ready`).
 - if `table` is empty, say so and stop
 - otherwise show the table verbatim in a code block
 - Keep each ready worktree's `path` and `branch`.

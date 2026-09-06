@@ -1,7 +1,7 @@
 ---
 name: merge-worktrees
 description: Land selected worktrees into the default branch.
-allowed-tools: Bash(python3 *) Bash(git *) Skill(commit-commands:commitall)
+allowed-tools: Bash(python3 *) Bash(git *) Skill(code-review) Skill(simplify)
 ---
 
 `ENGINE=${CLAUDE_PLUGIN_ROOT}/scripts/worktree_engine.py`,
@@ -31,12 +31,21 @@ python3 $ENGINE --repo $REPO preflight --branches <b1,b2,...>
 - Read `details.target` and `details.worktrees`.
 - Choose the land order now; the final engine call will honor the order you pass.
 
-3. Commit dirty worktrees one at a time.
+3. Commit dirty worktrees in one batch, never one review pass per worktree.
 
-- show dirty files and `git -C <path> diff HEAD --stat`
-- ask before committing
-- if yes: `EnterWorktree(path:<path>)` -> `/commit-commands:commitall` -> `ExitWorktree(action:"keep")`
-- if no: drop that worktree from the set
+- for every dirty worktree, show its files and `git -C <path> diff HEAD --stat`
+- ask once whether to commit the whole dirty set (not once per worktree)
+- if no: drop the declined worktrees from the set; continue with the rest
+- for the accepted set, judge from the combined diffs whether a real review is
+  warranted:
+  - small/WIP-shaped changes, no risky patterns: skip review entirely -- for
+    each worktree, `git -C <path> add <files>` then `git -C <path> commit -m
+    "..."` with a normal conventional message (no `commitall` invocation)
+  - larger or risky changes: invoke `/code-review` and/or `/simplify` **once**
+    against the union of the accepted diffs, apply any fixes, then commit each
+    worktree directly as above
+- either way, no per-worktree commit review pass: a heavy review runs **at
+  most once total** for this step, covering every accepted worktree together
 
 4. Run the batched engine path once for the remaining clean branches, in the chosen order.
 
