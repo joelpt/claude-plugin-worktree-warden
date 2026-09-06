@@ -165,7 +165,7 @@ and a recovery command. That is what turns "a worktree mysteriously vanished" in
 "X was removed by something other than warden between session A and B; recover it
 with this command."
 
-#### Gate load failure (fail-open loudly)
+### Gate load failure (fail-open loudly)
 
 The **PreToolUse edit gate** and **destruction gate** each wrap their module imports
 in try/except: if `worktree_gate` or `worktree_destruction` fail to import (due to a
@@ -269,8 +269,8 @@ the default branch — and the merge is itself many separate engine processes, n
   each other — only genuinely separate sessions contend. The claim is layered only on the
   gate's allow path (a gate-blocked edit never claims a worktree), has no explicit release (it
   lapses with the lease; SessionStart prunes abandoned claims), and is best-effort: a broken
-  lock module disables *only* occupancy, never the edit gate. _(git-write Bash serialization is
-  intentionally not gated — git's own index/ref locks already prevent that corruption.)_
+  lock module disables *only* occupancy, never the edit gate. *(git-write Bash serialization is
+  intentionally not gated — git's own index/ref locks already prevent that corruption.)*
 
 This is distinct from native `git worktree lock` (an anti-prune marker for removable media).
 

@@ -4,6 +4,17 @@ MD024: false
 MD030: false
 MD031: false
 
+# Skill/command markdown has no h1 by design (frontmatter name/description
+# owns the title).
+MD041: false
+
+# Skill steps are written as standalone "N. Heading" lines separated by
+# prose/code blocks, not one contiguous markdown list -- each is its own
+# single-item list to markdownlint, so no MD029 style (one/ordered/zero)
+# is satisfiable without collapsing the steps into one real list, which
+# would break in-body references like "step 3".
+MD029: false
+
 # Disable table column style enforcement
 #
 # Reason: MD060 (markdownlint v0.40.0+) flags padded table pipes
