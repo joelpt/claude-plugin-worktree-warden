@@ -40,6 +40,7 @@ class ReadinessTest(unittest.TestCase):
     """The four readiness buckets and their precedence."""
 
     def test_clean_with_commits_is_ready_to_merge(self) -> None:
+        """Clean with commits is ready to merge."""
         wt = _wt(commit_count=2)
         self.assertEqual(wt.readiness, cw.Readiness.READY)
         self.assertEqual(wt.ready_emoji, "✅")
@@ -47,6 +48,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(wt.is_mergeable)
 
     def test_unreadable_is_unknown_never_prune(self) -> None:
+        """Unreadable is unknown never prune."""
         # A failed git query defaults dirty=False, commit_count=0 — which would
         # otherwise be PRUNE. Unreadable must override that to UNKNOWN.
         wt = _wt(unreadable=True)
@@ -55,10 +57,12 @@ class ReadinessTest(unittest.TestCase):
         self.assertEqual(wt.ready_note, "state unreadable")
 
     def test_live_session_outranks_unreadable(self) -> None:
+        """Live session outranks unreadable."""
         wt = _wt(unreadable=True, session=True)
         self.assertEqual(wt.readiness, cw.Readiness.BLOCKED)
 
     def test_dirty_can_merge_after_commit(self) -> None:
+        """Dirty can merge after commit."""
         wt = _wt(dirty=True, commit_count=0)
         self.assertEqual(wt.readiness, cw.Readiness.NEEDS_COMMIT)
         self.assertEqual(wt.ready_emoji, "✅")
@@ -66,6 +70,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(wt.is_mergeable)
 
     def test_clean_zero_commits_at_base_tip_is_empty(self) -> None:
+        """Clean zero commits at base tip is empty."""
         wt = _wt(dirty=False, commit_count=0, behind=0)
         self.assertEqual(wt.readiness, cw.Readiness.PRUNE)
         self.assertEqual(wt.ready_emoji, "🧹")
@@ -73,6 +78,7 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(wt.is_mergeable)
 
     def test_clean_head_already_in_base_chain_is_merged(self) -> None:
+        """Clean head already in base chain is merged."""
         wt = _wt(dirty=False, commit_count=0, behind=3)
         self.assertEqual(wt.readiness, cw.Readiness.MERGED)
         self.assertEqual(wt.ready_emoji, "🧹")
@@ -80,10 +86,12 @@ class ReadinessTest(unittest.TestCase):
         self.assertTrue(wt.is_mergeable)
 
     def test_dirty_outranks_already_merged(self) -> None:
+        """Dirty outranks already merged."""
         wt = _wt(dirty=True, commit_count=0, behind=3)
         self.assertEqual(wt.readiness, cw.Readiness.NEEDS_COMMIT)
 
     def test_recently_active_is_cooldown_and_not_offered(self) -> None:
+        """Recently active is cooldown and not offered."""
         wt = _wt(commit_count=2, recently_active=True)
         self.assertEqual(wt.readiness, cw.Readiness.COOLDOWN)
         self.assertEqual(wt.ready_emoji, "⏳")
@@ -91,10 +99,12 @@ class ReadinessTest(unittest.TestCase):
         self.assertFalse(wt.is_mergeable)
 
     def test_live_session_outranks_cooldown(self) -> None:
+        """Live session outranks cooldown."""
         wt = _wt(recently_active=True, session=True)
         self.assertEqual(wt.readiness, cw.Readiness.BLOCKED)
 
     def test_cooldown_outranks_git_state(self) -> None:
+        """Cooldown outranks git state."""
         wt = _wt(dirty=True, commit_count=5, recently_active=True)
         self.assertEqual(wt.readiness, cw.Readiness.COOLDOWN)
         self.assertFalse(wt.is_mergeable)
@@ -106,31 +116,38 @@ class RecencyHelpersTest(unittest.TestCase):
     _NOW = 1_000_000.0
 
     def test_recent_true_within_window(self) -> None:
+        """Recent true within window."""
         self.assertTrue(cw._recent(self._NOW - 60, self._NOW))
 
     def test_recent_false_outside_window(self) -> None:
+        """Recent false outside window."""
         self.assertFalse(cw._recent(self._NOW - 1000, self._NOW))
 
     def test_recent_false_for_zero_mtime(self) -> None:
+        """Recent false for zero mtime."""
         self.assertFalse(cw._recent(0.0, self._NOW))
 
     def test_last_edit_uses_file_mtime_when_dirty(self) -> None:
+        """Last edit uses file mtime when dirty."""
         wt = _wt(dirty=True)
         wt.file_mtime = 12345.0
         self.assertEqual(cw._last_edit_mtime(wt), 12345.0)
 
     def test_last_edit_parses_commit_iso_when_clean(self) -> None:
+        """Last edit parses commit iso when clean."""
         wt = _wt(commit_count=1)
         wt.last_iso = "2026-05-29T12:08:56-07:00"
         expected = datetime.fromisoformat(wt.last_iso).timestamp()
         self.assertEqual(cw._last_edit_mtime(wt), expected)
 
     def test_last_edit_zero_on_unparseable_iso(self) -> None:
+        """Last edit zero on unparseable iso."""
         wt = _wt(commit_count=1)
         wt.last_iso = "not-a-timestamp"
         self.assertEqual(cw._last_edit_mtime(wt), 0.0)
 
     def test_last_edit_ignores_inherited_commit_time_when_zero_ahead(self) -> None:
+        """Last edit ignores inherited commit time when zero ahead."""
         # A 0-ahead clean worktree's last_iso is the base tip it inherited, not
         # its own activity — it must not register as a last-edit signal.
         wt = _wt(commit_count=0)
@@ -138,6 +155,7 @@ class RecencyHelpersTest(unittest.TestCase):
         self.assertEqual(cw._last_edit_mtime(wt), 0.0)
 
     def test_encode_project_dir_matches_observed_claude_mapping(self) -> None:
+        """Encode project dir matches observed claude mapping."""
         # Pins the observed Claude Code cwd -> ~/.claude/projects/<dir> mapping,
         # verified against the live filesystem: every "/" and "." becomes "-",
         # a leading "/" yields a leading "-", "/.claude" collapses to "--claude",
@@ -148,6 +166,7 @@ class RecencyHelpersTest(unittest.TestCase):
         self.assertEqual(encoded, "-Users-dev-code-my-app--claude-worktrees-feat-x")
 
     def test_live_session_is_blocked(self) -> None:
+        """Live session is blocked."""
         wt = _wt(commit_count=3, session=True)
         self.assertEqual(wt.readiness, cw.Readiness.BLOCKED)
         self.assertEqual(wt.ready_emoji, "❌")
@@ -155,11 +174,13 @@ class RecencyHelpersTest(unittest.TestCase):
         self.assertFalse(wt.is_mergeable)
 
     def test_session_takes_precedence_over_dirty_and_commits(self) -> None:
+        """Session takes precedence over dirty and commits."""
         wt = _wt(dirty=True, commit_count=5, session=True)
         self.assertEqual(wt.readiness, cw.Readiness.BLOCKED)
         self.assertFalse(wt.is_mergeable)
 
     def test_dirty_takes_precedence_over_commits_ahead(self) -> None:
+        """Dirty takes precedence over commits ahead."""
         wt = _wt(dirty=True, commit_count=5)
         self.assertEqual(wt.readiness, cw.Readiness.NEEDS_COMMIT)
 
@@ -168,6 +189,7 @@ class RenderTableTest(unittest.TestCase):
     """The rendered table's columns and emoji alignment."""
 
     def test_headers_reflect_new_columns(self) -> None:
+        """Headers reflect new columns."""
         table = cw.render_table([_wt(commit_count=1)])
         self.assertIn("Ready?", table)
         self.assertIn("Note", table)
@@ -177,6 +199,7 @@ class RenderTableTest(unittest.TestCase):
         self.assertNotIn("Last modified", table)
 
     def test_emoji_cell_does_not_break_border_alignment(self) -> None:
+        """Emoji cell does not break border alignment."""
         table = cw.render_table(
             [_wt(commit_count=1), _wt(session=True), _wt(recently_active=True)]
         )
@@ -189,6 +212,7 @@ class ToJsonTest(unittest.TestCase):
     """The JSON payload carries the readiness fields the skill routes on."""
 
     def test_json_includes_readiness_fields_and_branch(self) -> None:
+        """Json includes readiness fields and branch."""
         payload = json.loads(cw.to_json([_wt(dirty=True)]))
         entry = payload[0]
         self.assertEqual(entry["branch"], "feat-x")
@@ -197,15 +221,46 @@ class ToJsonTest(unittest.TestCase):
         self.assertTrue(entry["ready"])
 
     def test_blocked_worktree_is_not_ready_in_json(self) -> None:
+        """Blocked worktree is not ready in json."""
         payload = json.loads(cw.to_json([_wt(commit_count=1, session=True)]))
         self.assertFalse(payload[0]["ready"])
         self.assertEqual(payload[0]["category"], "blocked")
 
     def test_cooldown_worktree_in_json(self) -> None:
+        """Cooldown worktree in json."""
         payload = json.loads(cw.to_json([_wt(commit_count=1, recently_active=True)]))
         self.assertEqual(payload[0]["category"], "cooldown")
         self.assertTrue(payload[0]["recently_active"])
         self.assertFalse(payload[0]["ready"])
+
+
+class ToBundleJsonTest(unittest.TestCase):
+    """The `--bundle-json` payload stays a slim, unescaped projection."""
+
+    _BUNDLE_FIELDS = {
+        "path",
+        "branch",
+        "dirty",
+        "commit_count",
+        "session_status",
+        "category",
+        "note",
+        "ready",
+    }
+
+    def test_bundle_rows_are_the_slim_projection(self) -> None:
+        """Bundle rows are the slim projection."""
+        payload = json.loads(cw.to_bundle_json([_wt(dirty=True)]))
+        self.assertEqual(set(payload["worktrees"][0].keys()), self._BUNDLE_FIELDS)
+        self.assertIn("table", payload)
+
+    def test_bundle_json_is_not_ascii_escaped(self) -> None:
+        """Bundle json is not ascii escaped."""
+        wt = _wt(dirty=True)
+        wt.branch = "feat-café"
+        raw = cw.to_bundle_json([wt])
+        self.assertIn("café", raw)
+        self.assertNotIn("\\u", raw)
 
 
 if __name__ == "__main__":
