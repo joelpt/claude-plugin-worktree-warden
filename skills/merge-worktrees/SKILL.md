@@ -42,8 +42,13 @@ python3 $ENGINE --repo $REPO preflight --branches <b1,b2,...>
     each worktree, `git -C <path> add <files>` then `git -C <path> commit -m
     "..."` with a normal conventional message (no `commitall` invocation)
   - larger or risky changes: invoke `/code-review` and/or `/simplify` **once**
-    against the union of the accepted diffs, apply any fixes, then commit each
-    worktree directly as above
+    against the union of the accepted diffs. The edit gate blocks Edit/Write
+    calls targeting a linked worktree's files while cwd is the primary
+    checkout (a worktree path still resolves under the primary's repo root),
+    so apply any fixes per worktree via `EnterWorktree(path:<path>)` ->
+    apply -> `ExitWorktree(action:"keep")`, then commit each worktree
+    directly as above (plain `git` calls via Bash are never gate-blocked,
+    regardless of cwd)
 - either way, no per-worktree commit review pass: a heavy review runs **at
   most once total** for this step, covering every accepted worktree together
 

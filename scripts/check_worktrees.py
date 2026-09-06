@@ -342,7 +342,7 @@ def _json_payload(worktrees: list[Worktree]) -> list[dict[str, object]]:
 
 def to_json(worktrees: list[Worktree]) -> str:
     """Serialize the full per-worktree field set as a JSON array."""
-    return json.dumps(_json_payload(worktrees), indent=2)
+    return json.dumps(_json_payload(worktrees), indent=2, ensure_ascii=False)
 
 
 def _bundle_json_payload(worktrees: list[Worktree]) -> list[dict[str, object]]:
@@ -375,6 +375,7 @@ def to_bundle_json(worktrees: list[Worktree]) -> str:
             "worktrees": _bundle_json_payload(worktrees),
         },
         indent=2,
+        ensure_ascii=False,
     )
 
 
