@@ -33,6 +33,7 @@ class _FinishRepo(unittest.TestCase):
     """A temp repo with one clean, landable linked worktree on branch ``feat``."""
 
     def setUp(self) -> None:
+        """Set up test fixtures."""
         self._tmp = tempfile.TemporaryDirectory()
         self.base = Path(self._tmp.name)
         self.repo = self.base / "repo"
@@ -53,6 +54,7 @@ class _FinishRepo(unittest.TestCase):
         _git("commit", "-m", "feat work", cwd=self.wt)
 
     def tearDown(self) -> None:
+        """Tear down test fixtures."""
         self._tmp.cleanup()
 
     @property
@@ -78,6 +80,7 @@ class FinishHappyTest(_FinishRepo):
     """Clean worktree → landed, tested, torn down — all in one call."""
 
     def test_clean_land_skip_tests(self) -> None:
+        """Clean land skip tests."""
         out = engine.cmd_finish(
             str(self.wt), "feat", "main", str(self.repo),
             test_cmd=None, skip_tests=True, use_lock=False, owner="",
@@ -88,6 +91,7 @@ class FinishHappyTest(_FinishRepo):
         self.assertIn("f.txt", _git("show", "--name-only", "--format=", "main", cwd=self.repo))
 
     def test_clean_land_tests_pass(self) -> None:
+        """Clean land tests pass."""
         out = engine.cmd_finish(
             str(self.wt), "feat", "main", str(self.repo),
             test_cmd="true", skip_tests=False, use_lock=False, owner="",
@@ -102,6 +106,7 @@ class FinishHappyTest(_FinishRepo):
         self.assertFalse(self.wt.exists())
 
     def test_finish_recap_is_bounded(self) -> None:
+        """Finish recap is bounded."""
         base = self.main_sha
         out = engine.cmd_finish_recap(str(self.repo), base, "feat", limit=1)
         self.assertEqual(out.code, engine.EXIT_OK, out.message)
@@ -115,8 +120,10 @@ class FinishAlreadyMergedTest(_FinishRepo):
     """cmd_finish's "already merged" no-op path had zero prior test coverage."""
 
     def test_branch_already_ancestor_of_target_lands_nothing(self) -> None:
-        """A worktree branched off target with no commits of its own is a
-        no-op: reported as already-merged, torn down, nothing added to target."""
+        """A worktree branched off target with no commits of its own is a no-op.
+
+        Reported as already-merged, torn down, nothing added to target.
+        """
         empty_wt = self.base / "wtEmpty"
         _git("worktree", "add", "-b", "empty-branch", str(empty_wt), cwd=self.repo)
         target_sha_before = self.main_sha
@@ -137,6 +144,7 @@ class FinishBailTest(_FinishRepo):
     """Non-trivial conditions stop cleanly without auto-rollback."""
 
     def test_tests_fail_preserves_landed_state(self) -> None:
+        """Tests fail preserves landed state."""
         before = self.main_sha
         out = engine.cmd_finish(
             str(self.wt), "feat", "main", str(self.repo),
@@ -148,6 +156,7 @@ class FinishBailTest(_FinishRepo):
         self.assertIn("snapshot_file", out.details)  # undo available IF caller chooses
 
     def test_dirty_worktree_lands_nothing(self) -> None:
+        """Dirty worktree lands nothing."""
         (self.wt / "scratch.txt").write_text("uncommitted\n")
         before = self.main_sha
         out = engine.cmd_finish(
@@ -159,6 +168,7 @@ class FinishBailTest(_FinishRepo):
         self.assertTrue(self.wt.exists())
 
     def test_misconfigured_mutates_nothing(self) -> None:
+        """Misconfigured mutates nothing."""
         before = self.main_sha
         out = engine.cmd_finish(
             str(self.wt), "feat", "main", str(self.repo),
@@ -170,6 +180,7 @@ class FinishBailTest(_FinishRepo):
         self.assertTrue(self.wt.exists())
 
     def test_conflict_keeps_state_for_caller(self) -> None:
+        """Conflict keeps state for caller."""
         (self.repo / "seed.txt").write_text("main change\n")
         _git("add", "seed.txt", cwd=self.repo)
         _git("commit", "-m", "main edits seed", cwd=self.repo)
@@ -189,6 +200,7 @@ class FinishLockTest(_FinishRepo):
     """The lock is released on the clean path and KEPT on the bail paths."""
 
     def test_happy_path_releases_lock(self) -> None:
+        """Happy path releases lock."""
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.xdg)}):
             out = engine.cmd_finish(
                 str(self.wt), "feat", "main", str(self.repo),
@@ -198,6 +210,7 @@ class FinishLockTest(_FinishRepo):
         self.assertEqual(self._store, {})  # released
 
     def test_test_failure_keeps_lock(self) -> None:
+        """Test failure keeps lock."""
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.xdg)}):
             out = engine.cmd_finish(
                 str(self.wt), "feat", "main", str(self.repo),
@@ -209,6 +222,7 @@ class FinishLockTest(_FinishRepo):
         self.assertEqual(self._store[key]["owner"], "A")
 
     def test_blocked_by_another_owner_lands_nothing(self) -> None:
+        """Blocked by another owner lands nothing."""
         before = self.main_sha
         with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.xdg)}):
             facts = lock.main_facts(str(self.repo))
@@ -221,6 +235,27 @@ class FinishLockTest(_FinishRepo):
         self.assertIn("OTHER", out.message)
         self.assertEqual(self.main_sha, before)  # nothing landed
         self.assertTrue(self.wt.exists())
+
+
+class AuditRotationWiringTest(_FinishRepo):
+    """Confirms ``_audit()`` calls the shared rotation helper before appending."""
+
+    def test_audit_rotates_when_oversized(self) -> None:
+        """Audit rotates when oversized."""
+        import worktree_gate
+
+        audit_dir = self.repo / ".git" / "worktree-warden"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = audit_dir / "audit.log"
+        audit_path.write_bytes(b"pre-existing-oversized\n" + b"a" * worktree_gate.AUDIT_MAX_BYTES)
+
+        engine._audit(str(self.repo), "teardown", engine.Outcome(0, "ok", ""))
+
+        rotated = audit_dir / "audit.log.1"
+        self.assertTrue(rotated.exists())
+        self.assertIn(b"pre-existing-oversized", rotated.read_bytes())
+        self.assertTrue(audit_path.exists())
+        self.assertIn(b"teardown", audit_path.read_bytes())
 
 
 if __name__ == "__main__":

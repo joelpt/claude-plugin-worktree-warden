@@ -95,6 +95,8 @@ class GitError(RuntimeError):
 
 @dataclass
 class Outcome:
+    """Structured result of one engine subcommand, emitted as JSON on stdout."""
+
     code: int
     status: str
     message: str
@@ -105,6 +107,7 @@ class Outcome:
     details: dict[str, object] = field(default_factory=dict)
 
     def emit(self, *, pretty: bool = False) -> int:
+        """Print this outcome as JSON (stdout) plus a summary line (stderr)."""
         payload = {k: v for k, v in self.__dict__.items() if v not in ("", {})}
         print(json.dumps(payload, indent=2 if pretty else None, separators=None if pretty else (",", ":")))
         print(f"[worktree-engine] {self.status}: {self.message}", file=sys.stderr)
@@ -186,7 +189,7 @@ def _neutralize_noise(worktree: str) -> bool:
 
 
 def _ahead_count(base: str, tip: str, repo: str) -> int:
-    """Commits in *tip* not in *base*."""
+    """Count commits in *tip* not in *base*."""
     return int(_git(["rev-list", "--count", f"{base}..{tip}"], cwd=repo) or "0")
 
 
@@ -201,7 +204,7 @@ def _is_ancestor(branch: str, target: str, repo: str) -> bool:
 
 
 def _own_commit_count(branch: str, target: str, repo: str) -> int:
-    """Commits unique to *branch* since it diverged from *target*.
+    """Count commits unique to *branch* since it diverged from *target*.
 
     Whenever *branch* is already an ancestor of *target*, this is always 0 --
     ``merge-base(branch, target)`` collapses to *branch*'s own tip once it's
@@ -464,6 +467,7 @@ def _worktrees_by_branch(repo: str) -> dict[str, str]:
     Returns:
         Dict mapping each linked worktree's branch name to its realpath.
         The primary worktree and detached-HEAD worktrees are excluded.
+
     """
     mapping: dict[str, str] = {}
     current: str | None = None
@@ -495,6 +499,7 @@ def cmd_preflight(repo: str, branches: list[str]) -> Outcome:
     Returns:
         Outcome with ``details["target"]`` (resolved default branch) and
         ``details["worktrees"]`` (list of WorktreeStatus entries).
+
     """
     rc, ref_out, _ = _git_rc(
         ["symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"], cwd=repo
@@ -593,6 +598,7 @@ def cmd_finish_preflight(worktree: str, target_override: str | None = None) -> O
     Returns:
         Outcome with top-level ``primary``, ``target``, ``branch``, and
         ``worktree`` plus ``details.kind`` / ``details.detached``.
+
     """
     try:
         worktree = os.path.realpath(worktree)
@@ -676,6 +682,7 @@ def cmd_snapshot(
 
     Returns:
         Outcome carrying the snapshot file path and captured anchors.
+
     """
     try:
         target_sha = _git(["rev-parse", target], cwd=repo)
@@ -721,6 +728,7 @@ def cmd_undo(repo: str, snapshot_path: str) -> Outcome:
 
     Returns:
         Outcome listing what was restored, or a partial/error state.
+
     """
     try:
         primary = _primary_worktree(repo)
@@ -949,11 +957,16 @@ def _audit(repo: str, action: str, outcome: Outcome) -> None:
         repo: Primary checkout path.
         action: The engine subcommand that ran (e.g. ``"teardown"``).
         outcome: The Outcome the subcommand produced.
+
     """
     try:
+        import worktree_gate  # noqa: PLC0415
+
         common = _git_common_dir(repo)
         log_dir = Path(common) / "worktree-warden"
         log_dir.mkdir(parents=True, exist_ok=True)
+        audit_path = log_dir / "audit.log"
+        worktree_gate.rotate_audit_log(audit_path)
         record = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "action": action,
@@ -964,7 +977,7 @@ def _audit(repo: str, action: str, outcome: Outcome) -> None:
             "worktree": outcome.worktree,
             "details": outcome.details,
         }
-        with (log_dir / "audit.log").open("a") as handle:
+        with audit_path.open("a") as handle:
             handle.write(json.dumps(record) + "\n")
     except Exception:
         return
@@ -1042,6 +1055,7 @@ def cmd_recover(repo: str, target: str, gc_days: float | None) -> Outcome:
     Returns:
         Outcome whose ``details`` carries ``stranded`` (list), ``bundles``
         (list), and ``gc_removed`` (list of deleted bundle paths).
+
     """
     base = Outcome(EXIT_OK, "recover", "", target=target)
     try:
@@ -1112,6 +1126,7 @@ def _acquire_main_lock(repo: str, owner: str, reason: str) -> tuple[bool, Outcom
         by another live session (the caller returns the Outcome); ``(False, None)``
         the lock subsystem stepped aside (no session id / broken module / IO error)
         -- proceed WITHOUT a lock, like the rest of the plugin's gates.
+
     """
     if not owner:
         return False, None
@@ -1218,6 +1233,7 @@ def _run_tests(test_cmd: str, cwd: str) -> tuple[bool, str]:
     Returns:
         ``(passed, tail)`` where ``passed`` is exit-code-zero and ``tail`` is the
         last ~800 chars of combined output.
+
     """
     try:
         proc = subprocess.run(
@@ -1285,6 +1301,7 @@ def cmd_finish(
 
     Returns:
         An Outcome whose code is one of the EXIT_* values documented above.
+
     """
     if not skip_tests and not test_cmd:
         return Outcome(
@@ -1603,6 +1620,7 @@ def _refresh_main_lease(repo: str) -> tuple[bool, str | None]:
         *different, live* session reclaimed it (so the caller knows ``undo`` would
         collide with a live writer), else None (force-unlocked / our own lapsed lease /
         a stale foreign record -- no live contender, ``undo`` is safe).
+
     """
     try:
         import worktree_lock  # noqa: PLC0415  -- lazy + guarded (fail-open)
@@ -1662,6 +1680,7 @@ def _add_require_lease(p: argparse.ArgumentParser) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse argv, dispatch to the selected subcommand, and return its exit code."""
     parser = argparse.ArgumentParser(prog="worktree_engine.py")
     parser.add_argument("--repo", default=os.getcwd(), help="Primary checkout (default: cwd).")
     parser.add_argument("--pretty", action="store_true", help="Pretty-print JSON output.")
