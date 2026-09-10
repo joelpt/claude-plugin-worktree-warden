@@ -27,6 +27,20 @@ All notable changes to this project will be documented in this file.
   file, and is never named in hook output, skill text or errors, so a session under warden
   cannot discover it. No behavior change when the variable is unset or not `1`.
 
+- **Audit log rotation** (closes #33): Both audit logs now rotate at a 10MB size cap, retaining
+  the 5 most recent rotated generations. When an audit log reaches 10MB, it becomes
+  `audit.log.1`, existing numbered files shift up (e.g., `.1` → `.2`), and anything beyond
+  `.5` is deleted. Rotation is **non-blocking and best-effort**: a single non-blocking advisory
+  lock (`fcntl.LOCK_NB`) ensures only one concurrent writer performs the rotation; others skip it
+  and proceed immediately to their append. The mechanism never raises exceptions and does not block
+  any audit operation, preserving the never-raise contract that auditing must not disrupt work.
+  Forensic reconstruction is deterministic: read rotated generations newest-first as
+  `audit.log`, `audit.log.1`, `audit.log.2`, ..., `audit.log.5`. Applies to both the
+  engine audit log (`<git-common-dir>/worktree-warden/audit.log`, logging land/teardown/undo/
+  snapshot mutations) and the gate audit log (`~/.config/worktree-gate/audit.log`, logging every
+  gated Edit/Write call). For details and rotation internals, see `rotate_audit_log()` in
+  `scripts/worktree_gate.py`.
+
 - **`teardown --discard`: a sanctioned path for abandoning a worktree whose work must NOT
   land.** `teardown` refused a dirty worktree (`11 dirty_worktree`) and refused an unmerged
   branch (`12 branch_unmerged`). Both are correct defaults, but together they made abandoning
