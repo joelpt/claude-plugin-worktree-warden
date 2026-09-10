@@ -24,6 +24,7 @@ and then to the built-in defaults.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import subprocess
@@ -46,6 +47,10 @@ UNBORN_NOTICE_FILENAME = "worktree-gate-unborn-notice"
 PROJECT_CONFIG_RELPATH = Path(".claude") / "settings.worktree-warden.json"
 USER_CONFIG_BASENAME = "config.json"
 AUDIT_BASENAME = "audit.log"
+
+AUDIT_MAX_BYTES = 10 * 1024 * 1024
+AUDIT_BACKUP_COUNT = 5
+AUDIT_ROTATE_LOCK_SUFFIX = ".rotate.lock"
 
 VALID_TEARDOWN_MODES = ("ask", "auto", "always", "commit-only", "never")
 DEFAULT_TEARDOWN_MODE = "ask"
@@ -522,11 +527,87 @@ def claim_unborn_notice(git_common_dir: str | None) -> bool:
     return True
 
 
+def rotate_audit_log(
+    path: Path,
+    *,
+    max_bytes: int = AUDIT_MAX_BYTES,
+    backup_count: int = AUDIT_BACKUP_COUNT,
+) -> None:
+    """Best-effort size-capped rotation for an append-only audit log.
+
+    Call immediately before opening ``path`` for append. Never raises -- every
+    internal failure (stat, flock, rename, unlink) is swallowed so a caller
+    never needs its own try/except around this call.
+
+    Below ``max_bytes`` this costs one stat and nothing else. At/above it, a
+    single non-blocking (``LOCK_NB``) advisory flock on a sentinel file
+    (deliberately named so it never matches the ``path.<digit>`` generation
+    glob, keeping forensic globbing clean) makes exactly one concurrent caller
+    the rotation owner; every other caller fails to acquire the lock and
+    returns immediately to append against whatever file currently exists --
+    lossless, since ``open(path, "a")`` succeeds either way. The owner
+    re-stats after acquiring the lock (another caller may have already
+    rotated between this call's first stat and the lock acquisition) to guard
+    against a spurious extra generation, then cascades oldest-first:
+    ``path.<backup_count>`` is evicted, existing generations shift up by one,
+    and ``path`` itself becomes ``path.1``.
+
+    Args:
+        path: The audit log file to check and, if oversized, rotate.
+        max_bytes: Size threshold in bytes that triggers rotation.
+        backup_count: Number of rotated generations to retain.
+
+    """
+    try:
+        if path.stat().st_size < max_bytes:
+            return
+    except OSError:
+        return
+
+    lock_path = path.parent / (path.name + AUDIT_ROTATE_LOCK_SUFFIX)
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return
+
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            # Another process is already rotating (or just did) -- skip.
+            return
+
+        try:
+            try:
+                if path.stat().st_size < max_bytes:
+                    # Spurious-rotation guard: a concurrent caller already
+                    # rotated between our first stat and this lock.
+                    return
+            except OSError:
+                return
+
+            oldest = path.parent / f"{path.name}.{backup_count}"
+            if oldest.exists():
+                oldest.unlink()
+            for gen in range(backup_count - 1, 0, -1):
+                src = path.parent / f"{path.name}.{gen}"
+                if src.exists():
+                    os.rename(src, path.parent / f"{path.name}.{gen + 1}")
+            os.rename(path, path.parent / f"{path.name}.1")
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    finally:
+        os.close(fd)
+
+
 def log_event(action: str, reason: str, file_path: str | None) -> None:
     """Append an audit line; never raises (auditing must not block work)."""
     try:
         path = user_config_dir() / AUDIT_BASENAME
         path.parent.mkdir(parents=True, exist_ok=True)
+        rotate_audit_log(path)
         stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         with path.open("a") as handle:
             handle.write(f"{stamp}\t{action}\t{reason}\t{file_path or ''}\n")
