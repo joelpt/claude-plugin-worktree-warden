@@ -233,6 +233,11 @@ worktree directory is later removed by something the destruction gate can't see
 (e.g. the harness's own background-isolation cleanup), the WIP is still
 recoverable. `recover` lists the bundles; `recover --gc-days N` expires old ones.
 
+If the repo uses submodules, restoring a bundle (`git fetch <bundle> <ref>`)
+brings back the gitlink pointer correctly, but leaves submodule directories
+empty — run `git submodule update --init --recursive` after restore to
+populate their content. Irrelevant for submodule-free repos.
+
 ## Concurrency lock (serialize merges / main edits)
 
 Git has no "lock this branch for a span of work" primitive — only transient single-operation
