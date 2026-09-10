@@ -587,8 +587,7 @@ def rotate_audit_log(
                 return
 
             oldest = path.parent / f"{path.name}.{backup_count}"
-            if oldest.exists():
-                oldest.unlink()
+            oldest.unlink(missing_ok=True)
             for gen in range(backup_count - 1, 0, -1):
                 src = path.parent / f"{path.name}.{gen}"
                 if src.exists():
