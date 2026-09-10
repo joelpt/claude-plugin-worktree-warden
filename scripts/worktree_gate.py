@@ -96,6 +96,7 @@ class GitFacts:
             confirm it (fail-closed). Named for the common case (a fresh repo's
             unborn HEAD); the precise predicate is "zero commits anywhere", which
             keeps orphan-branch checkouts enforced.
+
     """
 
     is_repo: bool
@@ -116,6 +117,7 @@ class Settings:
         startup_display: Which worktrees the SessionStart banner surfaces:
             "mergeable" (only when at least one is offerable), "always"
             (whenever any linked worktree exists), or "never" (suppressed).
+
     """
 
     disabled_scope: str | None
@@ -132,6 +134,7 @@ class Decision:
         reason: Short machine-ish explanation of the ruling.
         log_grant_use: True when the allow was spent against an active
             exception, so the caller should record the use.
+
     """
 
     allow: bool
@@ -148,6 +151,7 @@ def run_git(args: list[str], cwd: str) -> tuple[int, str]:
 
     Returns:
         A ``(returncode, stdout)`` pair; ``(1, "")`` if git cannot be invoked.
+
     """
     try:
         proc = subprocess.run(
@@ -169,6 +173,7 @@ def git_facts(cwd: str) -> GitFacts:
 
     Returns:
         Populated GitFacts; a non-repo cwd yields ``is_repo=False``.
+
     """
     rc, out = run_git(
         ["rev-parse", "--show-toplevel", "--git-dir", "--git-common-dir"], cwd
@@ -242,6 +247,7 @@ def decide(
 
     Returns:
         The allow/block Decision.
+
     """
     if disabled_scope is not None:
         return Decision(True, f"enforcement disabled ({disabled_scope} scope)")
@@ -325,6 +331,7 @@ def resolve_settings(facts: GitFacts) -> Settings:
 
     Returns:
         The effective Settings.
+
     """
     user_cfg = _load_json(user_config_path())
     proj_cfg = _load_json(project_config_path(facts.repo_root))
@@ -365,6 +372,7 @@ def read_teardown_mode(facts: GitFacts) -> str:
 
     Returns:
         The effective teardown mode string.
+
     """
     user_cfg = _load_json(user_config_path())
     proj_cfg = _load_json(project_config_path(facts.repo_root))
@@ -436,6 +444,7 @@ def parse_duration(text: str) -> int:
 
     Raises:
         ValueError: If text is not a recognized duration.
+
     """
     text = text.strip().lower()
     units = {"s": 1, "m": 60, "h": 3600}
@@ -688,6 +697,7 @@ def cmd_teardown_mode(args: argparse.Namespace) -> int:
 
     Returns:
         Process exit code (0 on success, 1 on error).
+
     """
     facts = git_facts(os.getcwd())
 
