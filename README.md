@@ -108,7 +108,13 @@ worktrees of the repo your current session belongs to — never cross-repo.
   JSON line to `<git-common-dir>/worktree-warden/audit.log` — recording the
   action, branch, target, worktree path, and key SHAs (the torn-down branch tip,
   the pre-`undo` reset SHAs) — so a vanished worktree is diagnosable and its last
-  commit recoverable, not a mystery. The `recover` subcommand scans for stranded
+  commit recoverable, not a mystery. This log rotates at 10MB: the current
+  `audit.log` becomes `audit.log.1`, existing `audit.log.N` shift to `N+1`, and
+  anything beyond `audit.log.5` is dropped — read newest-first as `audit.log`,
+  `audit.log.1`, `audit.log.2`, ... for forensic reconstruction. Rotation is a
+  non-blocking, best-effort check on every append (never raises, never blocks
+  on a lock) so concurrent `land`/`teardown`/`undo`/`snapshot` calls are safe.
+  The `recover` subcommand scans for stranded
   (`prunable`) worktrees whose branch still holds unlanded commits, and for WIP
   capture bundles, printing the exact restore command for each (`--gc-days N`
   expires old bundles). `check_worktrees` now reports a worktree whose git state
@@ -207,7 +213,10 @@ worktree_gate status                     # show effective settings + any active 
 
 Settings are stored per scope (project overrides user); the grant token and
 debounce state live in `.git/` (ephemeral, never committed); the user config and
-an `audit.log` of grants/uses/blocks live under the user config dir.
+an `audit.log` of grants/uses/blocks live under the user config dir. This log
+rotates at the same 10MB / 5-generation cap as the engine's audit log above
+(`audit.log` -> `audit.log.1` -> ... -> `audit.log.5`, oldest dropped), via the
+same non-blocking, best-effort `rotate_audit_log()` helper.
 
 ### Force-disable switch (for orchestrators that own the worktree lifecycle)
 
