@@ -928,12 +928,36 @@ def cmd_teardown(
         if rc != 0:
             base.code, base.status = EXIT_GIT_ERROR, "worktree_remove_failed"
             base.message = f"git worktree remove {wt_path} failed: {err}"
+            # A salvaged stash (created just above, before removal was even
+            # attempted) is unreferenced by any ref once the worktree is gone
+            # -- its SHA is the only recovery handle. Attach it (and the
+            # captured branch tip) here too, not only on the success path, so
+            # a partial-failure Outcome/audit-log entry never drops it.
+            base.details = {
+                "branch_tip": branch_tip,
+                "discarded": discard,
+                "uncommitted": dirty,
+                "unmerged_commits": unmerged,
+                "salvaged_stash": salvaged_stash,
+            }
             return base
     if branch_exists:
         rc, _, err = _git_rc(["branch", "-D" if discard else "-d", branch], cwd=primary)
         if rc != 0:
             base.code, base.status = EXIT_GIT_ERROR, "branch_delete_failed"
             base.message = f"git branch -d {branch} failed: {err}"
+            # Same rationale as worktree_remove_failed above: by this point
+            # the worktree is already gone (removed successfully just above),
+            # so salvaged_stash is this failure's only recovery handle -- it
+            # must not be dropped from the returned Outcome/audit-log entry.
+            base.details = {
+                "worktree_removed": wt_path is not None,
+                "branch_tip": branch_tip,
+                "discarded": discard,
+                "uncommitted": dirty,
+                "unmerged_commits": unmerged,
+                "salvaged_stash": salvaged_stash,
+            }
             return base
     _git_rc(["worktree", "prune"], cwd=primary)
     base.status = "teardown_complete"

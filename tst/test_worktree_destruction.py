@@ -4,14 +4,18 @@ Two layers: pure parser tests (no git), and verdict tests against a real temp
 repo with a linked worktree exercised through clean/dirty/landed/unlanded states.
 
 R-CHARACTERIZATION-TESTS-FIRST: this file used to also cover `git worktree
-remove [--force]` / `rm -rf <worktree>` parsing and an `ExitWorktree` removal
-gate. Both shapes are now refused at the git layer itself -- every linked
-worktree is locked at creation (REQ-LOCKING-CREATE) and git itself refuses
-`git worktree remove`/`--force` on a still-locked worktree (empirically
-verified -- see plan@v1 Validation Gate Results). The cases below that used to
-assert a BLOCK for those shapes now assert the new, deliberate "always allow,
-gap documented" behavior instead of being deleted outright, so the collapse's
+remove [--force]` / `rm -rf <worktree>` parsing via `evaluate_command`. That
+parsing is now refused at the git layer itself -- every linked worktree is
+locked at creation (REQ-LOCKING-CREATE) and git itself refuses `git worktree
+remove`/`--force` on a still-locked worktree (empirically verified -- see
+plan@v1 Validation Gate Results). The parser cases below that used to assert
+a BLOCK for those shapes now assert the new, deliberate "always allow, gap
+documented" behavior instead of being deleted outright, so the collapse's
 intended behavior stays covered by a real test rather than silently untested.
+
+`evaluate_exit_worktree` (a separate, non-parser gate) is NOT part of that
+collapse -- it re-verifies current lock state and falls back to the same
+clean+landed check on an unlocked worktree; see its `VerdictTest` cases below.
 """
 
 from __future__ import annotations
@@ -228,9 +232,28 @@ class VerdictTest(unittest.TestCase):
         v = wd.evaluate_command("git branch -d feat", str(self.repo))
         self.assertTrue(v.allow)
 
-    def test_exit_worktree_remove_always_allowed_now(self) -> None:
-        """Documented behavior change: git's own lock gates this, not this module."""
+    def test_exit_worktree_remove_allowed_when_locked_even_if_unlanded(self) -> None:
+        """A currently-locked worktree defers to git's own removal refusal."""
         self._commit_in_wt()
+        _git("worktree", "lock", str(self.wt), "--reason", "test", cwd=self.repo)
+        v = wd.evaluate_exit_worktree("remove", str(self.wt))
+        self.assertTrue(v.allow)
+
+    def test_exit_worktree_remove_blocked_when_unlocked_and_unlanded(self) -> None:
+        """No lock in place -- re-verified independently, and unlanded work blocks.
+
+        This is the fix for the reviewer-flagged gap: correctness must not
+        rest entirely on the creation-time lock hook having succeeded.
+        """
+        self._commit_in_wt()
+        v = wd.evaluate_exit_worktree("remove", str(self.wt))
+        self.assertFalse(v.allow)
+        self.assertIn("not landed", v.reason)
+
+    def test_exit_worktree_remove_allowed_when_unlocked_but_landed(self) -> None:
+        """No lock in place, but clean and landed -- the fallback check allows it."""
+        self._commit_in_wt()
+        _git("merge", "--ff-only", "feat", cwd=self.repo)
         v = wd.evaluate_exit_worktree("remove", str(self.wt))
         self.assertTrue(v.allow)
 
@@ -241,9 +264,9 @@ class VerdictTest(unittest.TestCase):
         self.assertTrue(v.allow)
 
     def test_exit_worktree_remove_allowed_from_primary(self) -> None:
-        """The primary checkout is not a linked worktree; always allowed."""
+        """The primary checkout is not locked, but IS the default branch -- allowed."""
         v = wd.evaluate_exit_worktree("remove", str(self.repo))
-        self.assertTrue(v.allow)  # primary checkout is not a linked worktree
+        self.assertTrue(v.allow)
 
     def test_rebase_landed_branch_is_allowed(self) -> None:
         """A rebased-and-fast-forwarded branch is seen as landed via git cherry."""

@@ -2,16 +2,23 @@
 """Deterministic gate over `git branch -d/-D` destruction of un-landed branches.
 
 This module used to also parse `git worktree remove [--force]` / `rm -rf
-<worktree>` shapes and gate `ExitWorktree` removal. Both of those are now
-refused at the git layer itself: every linked worktree is locked at creation
-(`hooks/lock_worktree_hook.py`, REQ-LOCKING-CREATE) and native `git worktree
-lock` makes git itself refuse `git worktree remove`/`--force` on a still-locked
-worktree with `fatal: cannot remove a locked working tree` (empirically
-verified -- see plan@v1 Validation Gate Results). `worktree_engine.cmd_teardown`
-is the only path that ever unlocks (REQ-LOCKING-TEARDOWN), so git's own lock
-now subsumes this module's former worktree_remove/ExitWorktree(remove) safety
-property. This collapses the parser to the one destructive shape git has no
-native guard for: a raw `git branch -d/-D <branch>`.
+<worktree>` shapes for the same clean+landed check. That parsing is gone: every
+linked worktree is locked at creation (`hooks/lock_worktree_hook.py`,
+REQ-LOCKING-CREATE) and native `git worktree lock` makes git itself refuse
+`git worktree remove`/`--force` on a still-locked worktree with `fatal: cannot
+remove a locked working tree` (empirically verified -- see plan@v1 Validation
+Gate Results). `worktree_engine.cmd_teardown` is the only path that ever
+unlocks (REQ-LOCKING-TEARDOWN). This collapses the *parser* (which only ever
+covered `Bash` commands) to the one destructive shape git has no native guard
+for: a raw `git branch -d/-D <branch>`.
+
+`evaluate_exit_worktree` (the separate, non-parser-based `ExitWorktree`-tool
+gate) is NOT unconditional, though: it re-verifies the worktree's *current*
+lock state via `git worktree list --porcelain` rather than assuming the
+creation-time lock succeeded and is still in place, falling back to the same
+clean+landed check below whenever it finds the worktree unlocked. See that
+function's docstring for why trusting the lock hook's success implicitly would
+be a silent, undetectable regression back to the original vulnerability.
 
 Known, PERMANENT, backstopped gap (deliberate -- see README's "PreToolUse
 destruction gate" section): `rm -rf <worktree>` and any Bash-hidden/indirect
@@ -388,27 +395,69 @@ def evaluate_command(command: str, cwd: str) -> Verdict:
     return Verdict(True, "all destructive targets are clean and landed")
 
 
-def evaluate_exit_worktree(action: str, cwd: str) -> Verdict:
-    """Allow unconditionally: native `git worktree lock`/`remove` now gates this.
+def _is_worktree_locked(repo: str, path: str) -> bool:
+    """Return whether the worktree at ``path`` currently carries a `git worktree lock`.
 
-    Removal previously required proving the worktree clean+landed here. Every
-    linked worktree is now locked at creation (REQ-LOCKING-CREATE) and only
-    unlocked immediately before the engine's own teardown (REQ-LOCKING-TEARDOWN),
-    so `ExitWorktree`'s own `git worktree remove [--force]` call is refused by
-    git itself for any still-locked worktree -- this gate's prior verdict logic
-    would only ever duplicate that refusal, less reliably. Kept as a function
-    (rather than removed) so `guard_destruction_hook.py` needs no call-site
-    change.
+    Reads the shared `git worktree list --porcelain` view (works from any
+    worktree of the repo, not just ``path`` itself) rather than trusting that
+    locking succeeded earlier -- see ``evaluate_exit_worktree``.
+    """
+    rc, out = gate.run_git(["worktree", "list", "--porcelain"], repo)
+    if rc != 0:
+        return False
+    target = os.path.realpath(path)
+    current: str | None = None
+    for line in out.splitlines():
+        if line.startswith("worktree "):
+            current = os.path.realpath(line[len("worktree ") :])
+        elif line == "locked" or line.startswith("locked "):
+            if current == target:
+                return True
+    return False
+
+
+def evaluate_exit_worktree(action: str, cwd: str) -> Verdict:
+    """Re-verify the worktree is locked before trusting git's own removal refusal.
+
+    Every linked worktree is locked at creation (`lock_worktree_hook.py`,
+    REQ-LOCKING-CREATE) and only unlocked immediately before the engine's own
+    teardown (REQ-LOCKING-TEARDOWN), so `ExitWorktree`'s own `git worktree
+    remove [--force]` call is normally refused by git itself for a still-locked
+    worktree. But that protection is now an IMPLICIT dependency on the earlier
+    lock hook having actually succeeded -- this module used to independently
+    re-verify clean+landed state regardless of lock status, and that
+    defense-in-depth was dropped when the parser collapsed to branch-delete
+    only. This re-adds it, scoped narrowly: query the worktree's *current*
+    lock state directly rather than assuming it. When it IS locked, defer to
+    git's own refusal (unchanged, cheap). When it is NOT locked -- lock never
+    applied, the lock hook silently failed, or it was unlocked ahead of a
+    sanctioned teardown -- fall back to the same clean+landed check this
+    module always used for `git branch -d/-D`, so an accidental/`ExitWorktree`
+    removal of un-landed work is still caught rather than silently trusted to
+    an external precondition that may not hold.
 
     Args:
         action: The ExitWorktree ``action`` argument ("keep" or "remove").
-        cwd: The session working directory (unused; kept for signature parity).
+        cwd: The session working directory (the worktree being exited).
 
     Returns:
-        Always an allow Verdict.
+        An allow Verdict when locked (or nothing at risk to verify), else the
+        clean+landed verdict for the worktree's current branch.
 
     """
-    return Verdict(True, "git's own worktree lock gates ExitWorktree removal")
+    if action != "remove":
+        return Verdict(True, "keep does not remove anything")
+
+    rc, top = gate.run_git(["rev-parse", "--show-toplevel"], cwd)
+    repo = top if rc == 0 else cwd
+
+    if _is_worktree_locked(repo, cwd):
+        return Verdict(True, "git's own worktree lock gates ExitWorktree removal")
+
+    rc2, branch = gate.run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    if rc2 != 0 or not branch or branch == "HEAD":
+        return Verdict(True, "cannot resolve current branch; nothing to verify")
+    return _evaluate_branch(repo, branch)
 
 
 if __name__ == "__main__":

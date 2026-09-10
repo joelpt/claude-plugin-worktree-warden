@@ -21,6 +21,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import worktree_engine as engine
 
@@ -139,6 +140,51 @@ class TeardownDiscardTest(unittest.TestCase):
         self.assertEqual(out.status, "dry_run")
         self.assertTrue(self.wt.exists())
         self.assertIn("abandoned", _git("branch", "--list", "abandoned", cwd=self.repo))
+
+    def test_branch_delete_failed_after_discard_preserves_salvaged_stash(self):
+        """A branch_delete_failed partial failure must not drop the salvaged stash.
+
+        The worktree removal (and its preceding salvage) succeeds; only the
+        subsequent branch delete fails. The salvaged commit is unreferenced by
+        any ref once the worktree is gone -- its SHA in ``details`` is the
+        only recovery handle, so it must survive onto this failure Outcome.
+        """
+        real_git_rc = engine._git_rc
+
+        def fake(args, cwd=None, env=None):
+            if args[:2] == ["branch", "-D"]:
+                return 1, "", "simulated branch delete failure"
+            return real_git_rc(args, cwd=cwd, env=env)
+
+        with mock.patch.object(engine, "_git_rc", side_effect=fake):
+            out = engine.cmd_teardown(
+                "abandoned", "main", str(self.repo), dry_run=False, discard=True
+            )
+        self.assertEqual(out.status, "branch_delete_failed")
+        self.assertFalse(self.wt.exists())  # worktree remove ran and succeeded
+        salvaged = out.details.get("salvaged_stash")
+        self.assertTrue(salvaged, "salvaged_stash must survive a branch_delete_failed Outcome")
+        self.assertTrue(_object_exists(salvaged, self.repo))
+        self.assertEqual(out.details.get("branch_tip"), self.branch_tip)
+
+    def test_worktree_remove_failed_after_discard_preserves_salvaged_stash(self):
+        """A worktree_remove_failed partial failure must not drop the salvaged stash."""
+        real_git_rc = engine._git_rc
+
+        def fake(args, cwd=None, env=None):
+            if args[:2] == ["worktree", "remove"]:
+                return 1, "", "simulated worktree remove failure"
+            return real_git_rc(args, cwd=cwd, env=env)
+
+        with mock.patch.object(engine, "_git_rc", side_effect=fake):
+            out = engine.cmd_teardown(
+                "abandoned", "main", str(self.repo), dry_run=False, discard=True
+            )
+        self.assertEqual(out.status, "worktree_remove_failed")
+        salvaged = out.details.get("salvaged_stash")
+        self.assertTrue(salvaged, "salvaged_stash must survive a worktree_remove_failed Outcome")
+        self.assertTrue(_object_exists(salvaged, self.repo))
+        self.assertEqual(out.details.get("branch_tip"), self.branch_tip)
 
 
 class TeardownUnlockTest(unittest.TestCase):

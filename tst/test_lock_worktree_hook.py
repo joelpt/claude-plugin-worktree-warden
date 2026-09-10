@@ -126,6 +126,33 @@ class LockWorktreeHookTest(unittest.TestCase):
         code = _run_main(payload)
         self.assertEqual(code, 0)
 
+    def test_logs_diagnostic_to_stderr_when_lock_fails(self) -> None:
+        """A nonzero `git worktree lock` exit is surfaced on stderr, not silent."""
+        payload = {
+            "tool_name": "EnterWorktree",
+            "cwd": str(self.base / "does-not-exist"),
+            "tool_input": {"name": "feat"},
+        }
+        with mock.patch("sys.stdin", io.StringIO(json.dumps(payload))):
+            with mock.patch("sys.stderr", io.StringIO()) as fake_stderr:
+                code = h.main()
+        self.assertEqual(code, 0)
+        self.assertIn("failed to lock", fake_stderr.getvalue())
+        self.assertIn(str(self.base / "does-not-exist"), fake_stderr.getvalue())
+
+    def test_no_stderr_diagnostic_when_lock_succeeds(self) -> None:
+        """A successful lock writes nothing to stderr."""
+        payload = {
+            "tool_name": "EnterWorktree",
+            "cwd": str(self.wt),
+            "tool_input": {"name": "feat"},
+        }
+        with mock.patch("sys.stdin", io.StringIO(json.dumps(payload))):
+            with mock.patch("sys.stderr", io.StringIO()) as fake_stderr:
+                code = h.main()
+        self.assertEqual(code, 0)
+        self.assertEqual(fake_stderr.getvalue(), "")
+
 
 if __name__ == "__main__":
     unittest.main()

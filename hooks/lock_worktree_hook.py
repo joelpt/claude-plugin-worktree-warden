@@ -31,6 +31,13 @@ explicit ``path`` (an entry, not a creation).
 Fails OPEN, unconditionally: locking is best-effort defense-in-depth, never a
 requirement for the edit/session to proceed. Any error -- bad payload, no git,
 already locked, git predates lock support -- is swallowed and this exits 0.
+The ``git worktree lock`` call's own exit code IS checked, though: a nonzero
+return writes a diagnostic to stderr so a silent lock failure is at least
+detectable (the ``rm -rf``/prune protection this hook exists to provide is the
+worktree's *only* protection now that ``worktree_destruction.py`` no longer
+independently parses ``worktree remove``/``rm -rf`` -- see that module's
+docstring). A hook's stderr on a ``PostToolUse`` exit 0 is not surfaced to the
+user by the harness, so this is a best-effort audit trail, not a UI alert.
 """
 
 from __future__ import annotations
@@ -80,12 +87,21 @@ def main() -> int:
         if not path:
             return 0
 
-        subprocess.run(
+        result = subprocess.run(
             ["git", "-C", path, "worktree", "lock", path, "--reason", LOCK_REASON],
             capture_output=True,
             text=True,
             timeout=10,
         )
+        if result.returncode != 0:
+            sys.stderr.write(
+                "worktree-warden: failed to lock newly created worktree "
+                f"{path!r} (git worktree lock exited {result.returncode}): "
+                f"{result.stderr.strip()}\n"
+                "This worktree now has ZERO destruction protection -- neither "
+                "git's lock refusal nor worktree_destruction.py's (removed) "
+                "independent gate applies.\n"
+            )
     except Exception:
         pass
     return 0
