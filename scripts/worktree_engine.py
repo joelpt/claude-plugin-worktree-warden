@@ -916,6 +916,13 @@ def cmd_teardown(
 
     if wt_path is not None:
         _neutralize_noise(wt_path)
+        # Best-effort unlock (REQ-LOCKING-TEARDOWN): a worktree locked at
+        # creation (lock_worktree_hook.py) makes git itself refuse `worktree
+        # remove [--force]` with "cannot remove a locked working tree"
+        # (empirically verified -- see plan@v1 Validation Gate Results).
+        # Fail-open: an unlock error (never locked, git predates lock
+        # support) must never abort a teardown that would otherwise succeed.
+        _git_rc(["worktree", "unlock", wt_path], cwd=primary)
         remove_argv = ["worktree", "remove"] + (["--force"] if discard else []) + [wt_path]
         rc, _, err = _git_rc(remove_argv, cwd=primary)
         if rc != 0:
@@ -984,12 +991,21 @@ def _audit(repo: str, action: str, outcome: Outcome) -> None:
 
 
 def _prunable_worktrees(repo: str) -> list[dict[str, str]]:
-    """Linked worktrees git has marked ``prunable`` (their directory is gone).
+    """Linked worktrees whose directory is gone -- prunable OR locked.
 
-    Returns one dict per prunable entry with ``path``, ``branch`` (short name or
+    Returns one dict per stranded entry with ``path``, ``branch`` (short name or
     ""), and ``head`` SHA. These are the stranded worktrees — directory removed
     out from under git — whose committed work survives under the branch ref and
     is recoverable by re-adding the worktree.
+
+    A worktree ``git worktree lock``ed (REQ-LOCKING-CREATE) never shows
+    ``prunable`` even after its directory vanishes -- git's own porcelain
+    annotations are mutually exclusive between ``locked`` and ``prunable``
+    (empirically verified: see plan@v1 Validation Gate Results). So the
+    primary signal here is a direct ``os.path.isdir`` disk check; the
+    ``prunable`` annotation is kept as a secondary/best-effort corroboration
+    for the (unlocked) case where the annotation shows up before a disk check
+    would otherwise run for a path git itself has already flagged.
     """
     out = _git(["worktree", "list", "--porcelain"], cwd=repo)
     blocks = out.split("\n\n")
@@ -1006,7 +1022,7 @@ def _prunable_worktrees(repo: str) -> list[dict[str, str]]:
                 head = line[len("HEAD ") :]
             elif line.startswith("prunable"):
                 prunable = True
-        if prunable and path:
+        if path and (prunable or not os.path.isdir(path)):
             stranded.append({"path": path, "branch": branch, "head": head})
     return stranded
 

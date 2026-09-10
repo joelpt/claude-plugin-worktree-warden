@@ -141,5 +141,43 @@ class TeardownDiscardTest(unittest.TestCase):
         self.assertIn("abandoned", _git("branch", "--list", "abandoned", cwd=self.repo))
 
 
+class TeardownUnlockTest(unittest.TestCase):
+    """cmd_teardown unlocks a locked worktree before removing it (REQ-LOCKING-TEARDOWN)."""
+
+    def setUp(self) -> None:
+        """Build a repo with one landed, clean, LOCKED linked worktree."""
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmp.name)
+        self.repo = self.base / "repo"
+        self.repo.mkdir()
+        _git("init", "-b", "main", cwd=self.repo)
+        _git("config", "user.email", "t@t.test", cwd=self.repo)
+        _git("config", "user.name", "Test", cwd=self.repo)
+        (self.repo / "seed.txt").write_text("seed\n")
+        _git("add", "seed.txt", cwd=self.repo)
+        _git("commit", "-m", "seed", cwd=self.repo)
+        self.wt = self.base / "locked-feat"
+        _git("worktree", "add", "-b", "locked-feat", str(self.wt), cwd=self.repo)
+        _git("merge", "--ff-only", "locked-feat", cwd=self.repo)  # land it
+        _git("worktree", "lock", str(self.wt), "--reason", "test-lock", cwd=self.repo)
+
+    def tearDown(self) -> None:
+        """Discard the temporary repo tree."""
+        self._tmp.cleanup()
+
+    def test_teardown_unlocks_and_removes_a_locked_worktree(self) -> None:
+        """Without an unlock, `git worktree remove` would fail with a lock error."""
+        out = engine.cmd_teardown("locked-feat", "main", str(self.repo), dry_run=False)
+        self.assertEqual(out.status, "teardown_complete")
+        self.assertFalse(self.wt.exists())
+
+    def test_unlock_of_a_never_locked_worktree_does_not_abort_teardown(self) -> None:
+        """The unlock call is best-effort/fail-open: an error must not block removal."""
+        _git("worktree", "unlock", str(self.wt), cwd=self.repo)  # already unlocked
+        out = engine.cmd_teardown("locked-feat", "main", str(self.repo), dry_run=False)
+        self.assertEqual(out.status, "teardown_complete")
+        self.assertFalse(self.wt.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

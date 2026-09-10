@@ -25,6 +25,7 @@ _HOOK = _ROOT / "hooks" / "enforce_worktree_hook.py"
 _GATE = _ROOT / "scripts" / "worktree_gate.py"
 _LOCK = _ROOT / "scripts" / "worktree_lock.py"
 _ENGINE = _ROOT / "scripts" / "worktree_engine.py"
+_LOCK_HOOK = _ROOT / "hooks" / "lock_worktree_hook.py"
 
 
 class _Smoke:
@@ -39,6 +40,7 @@ class _Smoke:
         Args:
             label: Human-readable description of the check.
             passed: Whether the check held.
+
         """
         mark = "PASS" if passed else "FAIL"
         print(f"  [{mark}] {label}")
@@ -68,6 +70,7 @@ def _run_hook(
 
     Returns:
         The hook exit code and its stderr text.
+
     """
     body: dict[str, object] = {
         "tool_name": "Edit",
@@ -147,6 +150,7 @@ def main() -> int:
 
     Returns:
         0 if every check passed, 1 otherwise.
+
     """
     smoke = _Smoke()
     with tempfile.TemporaryDirectory() as tmp:
@@ -215,6 +219,37 @@ def main() -> int:
         rc_ord, _ = _lock(repo, env, "--repo", str(repo), "acquire-main", "--owner", "ORD", "x")
         smoke.check("lock --repo accepted before subcommand", rc_ord == 0)
         _lock(repo, env, "force-unlock", "--repo", str(repo), "--all")
+
+        # Lock lifecycle: the PostToolUse(EnterWorktree) hook locks a newly
+        # created worktree, and `teardown` unlocks it before removing it.
+        lockwt = base / "lockwt"
+        _git(repo, "worktree", "add", "-b", "lockme", str(lockwt))
+        lock_hook_payload = json.dumps(
+            {"tool_name": "EnterWorktree", "cwd": str(lockwt), "tool_input": {"name": "lockme"}}
+        )
+        subprocess.run(
+            [sys.executable, str(_LOCK_HOOK)],
+            input=lock_hook_payload,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+        wt_list_raw = subprocess.run(
+            ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+        ).stdout
+        smoke.check(
+            "lock hook locks a newly-created worktree",
+            f"worktree {lockwt.resolve()}" in wt_list_raw
+            and "locked" in wt_list_raw.split(f"worktree {lockwt.resolve()}", 1)[1].split("\n\n")[0],
+        )
+        rc_teardown, _ = _engine(
+            repo, env, "--repo", str(repo), "teardown", "--branch", "lockme", "--target", "main",
+        )
+        smoke.check(
+            "teardown unlocks and removes a locked worktree", rc_teardown == 0 and not lockwt.exists()
+        )
 
         # finish: one-shot land of a clean worktree (--no-lock + --skip-tests to
         # isolate the land/teardown flow from the lock store and a test runner).

@@ -29,6 +29,7 @@ class RecoverTest(unittest.TestCase):
     """A stranded worktree with unlanded work is surfaced, not buried."""
 
     def setUp(self) -> None:
+        """Build a repo with one linked worktree carrying an unlanded commit."""
         self._tmp = tempfile.TemporaryDirectory()
         self.base = Path(self._tmp.name)
         self.repo = self.base / "repo"
@@ -46,9 +47,11 @@ class RecoverTest(unittest.TestCase):
         _git("commit", "-m", "feat work", cwd=self.wt)
 
     def tearDown(self) -> None:
+        """Discard the temporary repo tree."""
         self._tmp.cleanup()
 
     def test_stranded_unlanded_worktree_is_surfaced(self) -> None:
+        """A dir-removed, still-prunable worktree with unlanded work is flagged."""
         # Remove the directory out from under git (the ffff scenario) -> prunable.
         shutil.rmtree(self.wt)
         outcome = engine.cmd_recover(str(self.repo), "main", None)
@@ -62,6 +65,7 @@ class RecoverTest(unittest.TestCase):
         self.assertIn("feat", str(entry["recovery"]))
 
     def test_emitted_recovery_command_actually_restores(self) -> None:
+        """The recovery command is a real, runnable one-liner, not a template."""
         # The recovery string must work verbatim — a prunable worktree is still
         # registered, so it needs `prune &&` before `worktree add`.
         shutil.rmtree(self.wt)
@@ -78,13 +82,34 @@ class RecoverTest(unittest.TestCase):
             _git("rev-parse", "--abbrev-ref", "HEAD", cwd=self.wt), "feat"
         )
 
+    def test_stranded_locked_worktree_is_surfaced(self) -> None:
+        """A locked worktree never shows `prunable`, so it needs a disk check.
+
+        `git worktree lock` makes git refuse to ever mark the entry
+        `prunable`, even once its directory is gone -- so relying on the
+        `prunable` porcelain annotation alone would silently stop detecting
+        this case as soon as REQ-LOCKING-CREATE locks every worktree at
+        creation (empirically verified: see plan@v1 Validation Gate Results).
+        """
+        _git("worktree", "lock", str(self.wt), "--reason", "test", cwd=self.repo)
+        shutil.rmtree(self.wt)
+        outcome = engine.cmd_recover(str(self.repo), "main", None)
+        self.assertEqual(outcome.code, engine.EXIT_OK)
+        stranded = cast(list[dict[str, object]], outcome.details["stranded"])
+        self.assertEqual(len(stranded), 1)
+        entry = stranded[0]
+        self.assertEqual(entry["branch"], "feat")
+        self.assertTrue(entry["unlanded"])
+
     def test_no_stranded_when_all_present(self) -> None:
+        """A worktree still present on disk is never reported as stranded."""
         outcome = engine.cmd_recover(str(self.repo), "main", None)
         self.assertEqual(
             cast(list[object], outcome.details["stranded"]), []
         )
 
     def test_gc_removes_old_bundles_only(self) -> None:
+        """`gc_days` deletes only bundles older than the cutoff."""
         wip = Path(engine._git_common_dir(str(self.repo))) / "worktree-warden" / "wip"
         wip.mkdir(parents=True)
         old = wip / "old.bundle"

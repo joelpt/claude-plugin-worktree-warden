@@ -302,10 +302,22 @@ def reconcile(repo: str) -> list[ExternalRemoval]:
 
     removals: list[ExternalRemoval] = []
     for path, rec in previous.items():
-        if path in current:
-            continue
-        branch = rec.get("branch", "")
-        head = rec.get("head", "")
+        cur = current.get(path)
+        if cur is not None and os.path.isdir(path):
+            continue  # still registered AND present on disk -- nothing lost
+        # Either fully vanished from `git worktree list` (the classic case),
+        # or -- new: still registered but its directory is gone. The latter
+        # happens for a LOCKED worktree (REQ-LOCKING-CREATE): git never marks
+        # a locked entry `prunable`/drops it from the list even once its
+        # directory disappears, so the pre-existing "path not in current"
+        # diff alone would never fire again once every worktree is locked at
+        # creation (empirically verified: see plan@v1 Validation Gate
+        # Results). Branch/head prefer the freshly-read `cur` record (git is
+        # the source of truth for a still-registered entry); `rec["dirty"]`
+        # is always used, since a directory-gone entry's live dirty check
+        # (`_worktree_dirty`) can only ever read as False.
+        branch = (cur.get("branch") if cur else "") or rec.get("branch", "")
+        head = (cur.get("head") if cur else "") or rec.get("head", "")
         if _warden_accounted(common, path, branch, since_ts):
             continue
 

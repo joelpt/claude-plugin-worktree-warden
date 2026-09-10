@@ -72,6 +72,26 @@ class PopulationTest(unittest.TestCase):
         self.assertTrue(r["branch_alive"])  # branch ref survives the dir removal
         self.assertIn("worktree add", r["recovery"])
 
+    def test_locked_worktree_directory_gone_is_still_flagged(self) -> None:
+        """A LOCKED worktree never disappears from `git worktree list`.
+
+        `git worktree lock` keeps the admin record registered even after its
+        directory vanishes (empirically verified: see plan@v1 Validation Gate
+        Results), so the classic "path not in current" diff alone would never
+        fire again once REQ-LOCKING-CREATE locks every worktree at creation.
+        reconcile() must also flag an entry present in BOTH previous and
+        current whose directory is gone.
+        """
+        _git("worktree", "lock", str(self.wt), "--reason", "test", cwd=self.repo)
+        wp.reconcile(str(self.repo))  # record baseline (still registered, locked)
+        shutil.rmtree(self.wt)  # directory gone; admin record survives (locked)
+        removals = wp.reconcile(str(self.repo))
+        self.assertEqual(len(removals), 1)
+        r = removals[0]
+        self.assertEqual(r["branch"], "feat")
+        self.assertTrue(r["unlanded"])
+        self.assertTrue(r["branch_alive"])
+
     def test_landed_clean_removal_is_not_flagged(self) -> None:
         """A clean, fully-landed worktree's disappearance loses nothing."""
         _git("merge", "--ff-only", "feat", cwd=self.repo)  # land it

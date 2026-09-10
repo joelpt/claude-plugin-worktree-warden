@@ -14,6 +14,14 @@
         ]
       }
     ],
+    "PostToolUse": [
+      {
+        "matcher": "EnterWorktree",
+        "hooks": [
+          { "type": "command", "command": "python3 ${CLAUDE_PLUGIN_ROOT}/hooks/lock_worktree_hook.py", "timeout": 10 }
+        ]
+      }
+    ],
     "SessionStart": [
       {
         "matcher": "startup",

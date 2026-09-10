@@ -1,32 +1,29 @@
 #!/usr/bin/env python3
-"""Deterministic gate over worktree-destroying shell commands.
+"""Deterministic gate over `git branch -d/-D` destruction of un-landed branches.
 
-The merge/teardown engine is already guarded, but it only governs work that goes
-*through* the engine. A worktree (and its uncommitted or un-landed content) can
-still be thrown away by a raw shell command — ``git worktree remove --force``,
-``rm -rf <worktree>``, ``git branch -D <branch>`` — issued by Claude, a sub-agent
-orchestrator, or any tool that shells out. Nothing in the plugin saw those, so a
-worktree could disappear with content that was never committed *or* never landed
-in the default branch.
+This module used to also parse `git worktree remove [--force]` / `rm -rf
+<worktree>` shapes and gate `ExitWorktree` removal. Both of those are now
+refused at the git layer itself: every linked worktree is locked at creation
+(`hooks/lock_worktree_hook.py`, REQ-LOCKING-CREATE) and native `git worktree
+lock` makes git itself refuse `git worktree remove`/`--force` on a still-locked
+worktree with `fatal: cannot remove a locked working tree` (empirically
+verified -- see plan@v1 Validation Gate Results). `worktree_engine.cmd_teardown`
+is the only path that ever unlocks (REQ-LOCKING-TEARDOWN), so git's own lock
+now subsumes this module's former worktree_remove/ExitWorktree(remove) safety
+property. This collapses the parser to the one destructive shape git has no
+native guard for: a raw `git branch -d/-D <branch>`.
 
-This module is the pure, testable core of a ``PreToolUse(Bash)`` gate that closes
-that hole. It parses a (possibly compound) shell command for destructive intent,
-resolves the targeted worktree/branch, and rules **block** unless the target is
-provably (a) clean — no dirty/untracked non-noise files — *and* (b) landed —
-every commit already an ancestor of the default branch. Clean+landed worktrees
-hold nothing worth keeping, so their removal is allowed; everything else is
-refused with the reason and the command to land first.
+Known, PERMANENT, backstopped gap (deliberate -- see README's "PreToolUse
+destruction gate" section): `rm -rf <worktree>` and any Bash-hidden/indirect
+destruction (`xargs`, `bash -c '...'`, command substitution) are not
+intercepted by anything in this module or by git's lock -- a locked worktree's
+files can still be deleted directly on disk, it is only the *admin record*
+that git refuses to drop. The Stop-hook WIP capture and the `recover`/
+`reconcile` audit are the sole backstops for that window; they make the loss
+detectable and recoverable, not prevented.
 
-The engine's own ``subprocess`` git calls do NOT pass through the Bash tool, so
-this gate never intercepts the engine — only operator/agent-issued shell
-commands. It fails OPEN: any parse/IO surprise allows the command (a buggy gate
-must never brick the shell), mirroring ``enforce_worktree_hook``.
-
-Known coverage limits (deliberate — they fail open, never closed): destruction
-reached through indirection the static parser cannot follow — ``xargs git
-worktree remove``, ``bash -c '…'``, command substitution, or a script the Bash
-call merely invokes — is not seen here. The Stop-hook WIP capture and the
-``recover`` audit are the backstops for those windows.
+Fails OPEN: any parse/IO surprise allows the command (a buggy gate must never
+brick the shell), mirroring `enforce_worktree_hook`.
 """
 
 from __future__ import annotations
@@ -42,11 +39,9 @@ import worktree_gate as gate
 
 NOISE_PATH = ".claude/settings.local.json"
 
-IntentKind = Literal["worktree_remove", "rm_path", "branch_delete"]
+IntentKind = Literal["branch_delete"]
 
 _SEGMENT_SEPARATORS = ("&&", "||", "|", ";", "\n", "&")
-
-_REDIRECTION = {">", ">>", "<", "2>", "2>>", "&>", "1>", "<<", "<<<"}
 
 # Leading tokens that wrap a real command without changing which command runs.
 _WRAPPERS = {
@@ -55,17 +50,19 @@ _WRAPPERS = {
 }
 _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
+_REDIRECTION = {">", ">>", "<", "2>", "2>>", "&>", "1>", "<<", "<<<"}
+
 
 @dataclass(frozen=True)
 class DestructiveIntent:
-    """One destructive operation parsed out of a shell command.
+    """One `git branch -d/-D` deletion parsed out of a shell command.
 
     Attributes:
-        kind: Which destructive shape this is.
-        target: The path (for ``worktree_remove``/``rm_path``) or branch name
-            (for ``branch_delete``) the command would destroy.
+        kind: Always "branch_delete" (the only shape this module still parses).
+        target: The branch name the command would delete.
         cwd: Directory the command runs in, after honoring any ``git -C <dir>``.
-        forced: Whether a force flag (``--force``/``-f``/``-D``) was present.
+        forced: Whether ``-D``/``--delete --force`` was used.
+
     """
 
     kind: IntentKind
@@ -82,6 +79,7 @@ class Verdict:
         allow: Whether the command may proceed.
         reason: Short machine-ish explanation of the ruling.
         recovery: A user-facing hint (land/commit first) when blocking, else "".
+
     """
 
     allow: bool
@@ -145,7 +143,7 @@ def _operands(args: list[str]) -> list[str]:
     """Non-flag, non-redirection operands from a token list.
 
     Drops flags, shell redirection operators (``>``, ``2>``, …) and the filename
-    that immediately follows a redirection, so ``... <wt> > /dev/null`` does not
+    that immediately follows a redirection, so ``... feat > /dev/null`` does not
     surface ``/dev/null`` as an operand.
     """
     out: list[str] = []
@@ -166,8 +164,9 @@ def _operands(args: list[str]) -> list[str]:
 def _unwrap_prefix(tokens: list[str]) -> list[str]:
     """Drop leading env-assignments and command wrappers (sudo/env/time/…).
 
-    So ``FOO=bar git worktree remove …`` and ``sudo rm -rf …`` are still seen as
-    the git/rm command they ultimately run, rather than slipping past the gate.
+    So ``FOO=bar git branch -D feat`` and ``sudo git branch -D feat`` are still
+    seen as the git command they ultimately run, rather than slipping past the
+    gate.
     """
     i = 0
     while i < len(tokens):
@@ -183,65 +182,41 @@ def _unwrap_prefix(tokens: list[str]) -> list[str]:
 
 
 def _parse_segment(segment: str, cwd: str) -> list[DestructiveIntent]:
-    """Parse one command segment into zero or more DestructiveIntents."""
+    """Parse one command segment into zero or more branch-delete intents."""
     tokens = _unwrap_prefix(_safe_split(segment))
     if not tokens:
         return []
     cmd = os.path.basename(tokens[0].lstrip("\\"))
-
-    if cmd == "git":
-        rest, eff_cwd = _strip_git_global_opts(tokens, cwd)
-        if not rest:
-            return []
-        sub = rest[0]
-        if sub == "worktree" and len(rest) >= 2 and rest[1] == "remove":
-            args = rest[2:]
-            forced = any(a in ("--force", "-f") for a in args)
-            paths = _operands(args)
-            # `git worktree remove` takes exactly one path operand.
-            if paths:
-                return [DestructiveIntent("worktree_remove", paths[0], eff_cwd, forced)]
-            return []
-        if sub == "branch":
-            args = rest[1:]
-            is_delete = any(a in ("-d", "-D", "--delete") for a in args)
-            if not is_delete:
-                return []
-            forced = "-D" in args or (
-                "--delete" in args and "--force" in args
-            )
-            # `git branch -D a b c` deletes every named branch; gate each.
-            return [
-                DestructiveIntent("branch_delete", name, eff_cwd, forced)
-                for name in _operands(args)
-            ]
+    if cmd != "git":
         return []
 
-    if cmd == "rm":
-        args = tokens[1:]
-        short = [f[1:].lower() for f in args if f.startswith("-") and not f.startswith("--")]
-        long = [f for f in args if f.startswith("--")]
-        recursive = any("r" in s for s in short) or "--recursive" in long
-        forced = any("f" in s for s in short) or "--force" in long
-        if not recursive:
-            return []
-        return [
-            DestructiveIntent("rm_path", path, cwd, forced)
-            for path in _operands(args)
-        ]
-    return []
+    rest, eff_cwd = _strip_git_global_opts(tokens, cwd)
+    if not rest or rest[0] != "branch":
+        return []
+    args = rest[1:]
+    is_delete = any(a in ("-d", "-D", "--delete") for a in args)
+    if not is_delete:
+        return []
+    forced = "-D" in args or ("--delete" in args and "--force" in args)
+    # `git branch -D a b c` deletes every named branch; gate each.
+    return [
+        DestructiveIntent("branch_delete", name, eff_cwd, forced)
+        for name in _operands(args)
+    ]
 
 
 def parse_destructive_command(command: str, cwd: str) -> list[DestructiveIntent]:
-    """Extract every destructive intent from a (possibly compound) command.
+    """Extract every `git branch -d/-D` intent from a (possibly compound) command.
 
     Args:
         command: The raw shell command string from the Bash tool call.
         cwd: The session working directory the command runs in.
 
     Returns:
-        A list of DestructiveIntent (empty when the command destroys nothing
-        this gate cares about).
+        A list of DestructiveIntent (empty when the command deletes no branch
+        this gate cares about -- including a `git worktree remove`/`rm -rf`,
+        which git's own worktree lock now handles; see module docstring).
+
     """
     intents: list[DestructiveIntent] = []
     for segment in _split_segments(command):
@@ -263,22 +238,6 @@ def _default_branch(repo: str) -> str:
         if rc2 == 0:
             return cand
     return "main"
-
-
-def _worktree_branch(repo: str, wt_path: str) -> str | None:
-    """Branch checked out at ``wt_path``, or None if it is not a worktree."""
-    target = os.path.realpath(wt_path)
-    rc, out = gate.run_git(["worktree", "list", "--porcelain"], repo)
-    if rc != 0:
-        return None
-    current: str | None = None
-    for line in out.splitlines():
-        if line.startswith("worktree "):
-            current = os.path.realpath(line[len("worktree ") :])
-        elif line.startswith("branch ") and current == target:
-            ref = line[len("branch ") :]
-            return ref.removeprefix("refs/heads/")
-    return None
 
 
 def _porcelain_z(cwd: str) -> str | None:
@@ -340,6 +299,7 @@ def _branch_worktree_path(repo: str, branch: str) -> str | None:
 
 
 def _branch_exists(repo: str, branch: str) -> bool:
+    """Return whether ``branch`` resolves as a local ref in ``repo``."""
     rc, _ = gate.run_git(
         ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], repo
     )
@@ -347,7 +307,7 @@ def _branch_exists(repo: str, branch: str) -> bool:
 
 
 def _is_landed(repo: str, branch: str, target: str) -> bool:
-    """True iff every commit on ``branch`` is already present in ``target``.
+    """Return True iff every commit on ``branch`` is already present in ``target``.
 
     Uses ``git cherry``, which compares by *patch content*, not SHA ancestry, so
     a branch whose commits were **rebased** onto ``target`` and fast-forwarded
@@ -367,7 +327,7 @@ def _is_landed(repo: str, branch: str, target: str) -> bool:
 
 
 def _evaluate_branch(repo: str, branch: str) -> Verdict:
-    """Rule on destroying ``branch`` (delete or remove of its worktree)."""
+    """Rule on deleting ``branch`` via `git branch -d/-D`."""
     if not _branch_exists(repo, branch):
         return Verdict(True, f"branch '{branch}' does not exist")
     target = _default_branch(repo)
@@ -402,69 +362,54 @@ def _evaluate_branch(repo: str, branch: str) -> Verdict:
 
 
 def evaluate_command(command: str, cwd: str) -> Verdict:
-    """Rule on a Bash command. Allow unless it destroys un-landed/dirty content.
+    """Rule on a Bash command. Allow unless it `git branch -d/-D`s un-landed content.
 
     Args:
         command: The raw shell command from the Bash tool call.
         cwd: The session working directory.
 
     Returns:
-        A Verdict; ``allow=True`` for any command that destroys nothing this gate
-        protects (the overwhelmingly common case).
+        A Verdict; ``allow=True`` for any command that deletes no branch this
+        gate protects (the overwhelmingly common case, and now also every
+        `git worktree remove`/`rm -rf` shape -- see module docstring for why
+        those are no longer parsed here).
+
     """
     intents = parse_destructive_command(command, cwd)
     if not intents:
-        return Verdict(True, "no destructive worktree/branch operation")
+        return Verdict(True, "no destructive branch-delete operation")
 
     for intent in intents:
         rc, top = gate.run_git(["rev-parse", "--show-toplevel"], intent.cwd)
         repo = top if rc == 0 else intent.cwd
-
-        if intent.kind == "branch_delete":
-            verdict = _evaluate_branch(repo, intent.target)
-        else:
-            wt = intent.target if os.path.isabs(intent.target) else os.path.join(
-                intent.cwd, intent.target
-            )
-            branch = _worktree_branch(repo, wt)
-            if branch is None:
-                # Not a registered worktree of this repo — out of scope, allow.
-                verdict = Verdict(True, "target is not a linked worktree")
-            else:
-                verdict = _evaluate_branch(repo, branch)
-
+        verdict = _evaluate_branch(repo, intent.target)
         if not verdict.allow:
             return verdict
     return Verdict(True, "all destructive targets are clean and landed")
 
 
 def evaluate_exit_worktree(action: str, cwd: str) -> Verdict:
-    """Rule on an ``ExitWorktree`` call (the harness's own removal path).
+    """Allow unconditionally: native `git worktree lock`/`remove` now gates this.
 
-    Only ``action == "remove"`` from inside a linked worktree is gated; a keep
-    leaves the directory on disk and is always allowed.
+    Removal previously required proving the worktree clean+landed here. Every
+    linked worktree is now locked at creation (REQ-LOCKING-CREATE) and only
+    unlocked immediately before the engine's own teardown (REQ-LOCKING-TEARDOWN),
+    so `ExitWorktree`'s own `git worktree remove [--force]` call is refused by
+    git itself for any still-locked worktree -- this gate's prior verdict logic
+    would only ever duplicate that refusal, less reliably. Kept as a function
+    (rather than removed) so `guard_destruction_hook.py` needs no call-site
+    change.
 
     Args:
         action: The ExitWorktree ``action`` argument ("keep" or "remove").
-        cwd: The session working directory (expected inside the worktree).
+        cwd: The session working directory (unused; kept for signature parity).
 
     Returns:
-        A Verdict ruling on the removal.
+        Always an allow Verdict.
+
     """
-    if action != "remove":
-        return Verdict(True, "ExitWorktree keep leaves the worktree on disk")
-    rc, top = gate.run_git(["rev-parse", "--show-toplevel"], cwd)
-    if rc != 0:
-        return Verdict(True, "not inside a git repository")
-    rc2, common = gate.run_git(["rev-parse", "--git-dir", "--git-common-dir"], cwd)
-    lines = common.splitlines()
-    if rc2 != 0 or len(lines) != 2:
-        return Verdict(True, "could not resolve worktree context")
-    git_dir = os.path.realpath(os.path.join(cwd, lines[0]))
-    common_dir = os.path.realpath(os.path.join(cwd, lines[1]))
-    if git_dir == common_dir:
-        return Verdict(True, "not a linked worktree")
-    branch = _worktree_branch(top, top)
-    if branch is None:
-        return Verdict(True, "detached or unresolved worktree")
-    return _evaluate_branch(top, branch)
+    return Verdict(True, "git's own worktree lock gates ExitWorktree removal")
+
+
+if __name__ == "__main__":
+    pass

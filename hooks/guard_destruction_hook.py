@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""PreToolUse gate: block destruction of a dirty or un-landed worktree/branch.
+"""PreToolUse gate: block `git branch -d/-D` deletion of an un-landed branch.
 
 Sister to ``enforce_worktree_hook`` (which gates *edits* to the main checkout).
-This gates *destruction*: a raw ``git worktree remove --force``, ``rm -rf
-<worktree>``, ``git branch -D``, or an ``ExitWorktree`` remove can throw away a
-worktree whose content was never committed or never landed in the default
-branch. The merge/teardown engine is guarded, but commands issued directly
-through the Bash tool bypass it entirely — that is the hole this closes.
+This now covers only ``git branch -d/-D`` — a raw ``git worktree remove
+--force``, ``rm -rf <worktree>``, or an ``ExitWorktree`` remove are no longer
+intercepted here: every linked worktree is now locked at creation
+(``lock_worktree_hook.py``, REQ-LOCKING-CREATE) and native ``git worktree
+lock`` makes git itself refuse a ``worktree remove``/``--force``/
+``ExitWorktree`` removal on a still-locked worktree (empirically verified —
+see plan@v1 Validation Gate Results). ``rm -rf``/Bash-hidden indirection
+remains a documented, PERMANENT, backstopped gap (see README) — this hook
+never saw those paths reliably to begin with (see
+``worktree_destruction.py``'s module docstring). The merge/teardown engine is
+guarded, but a raw ``git branch -D`` issued directly through the Bash tool
+bypasses it entirely — that is the hole this closes.
 
 Blocking uses **exit code 2** (stderr fed back to Claude), not the JSON
 ``permissionDecision`` route, for the same load-bearing reason as the edit gate:
@@ -78,6 +85,7 @@ def _report_gate_load_failure(module_name: str, exc: BaseException, tb: str) -> 
         module_name: The sibling module(s) whose import failed.
         exc: The exception raised by the failed import.
         tb: Pre-formatted traceback text recorded in the sentinel body.
+
     """
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     diagnostic = (
@@ -137,6 +145,7 @@ def _block(reason: str, recovery: str) -> int:
 
     Returns:
         Always 2, for use as an exit code via ``return _block(...)``.
+
     """
     gate.log_event("destroy-block", reason, None)
     msg = (

@@ -1,7 +1,11 @@
 """End-to-end tests driving the real guard_destruction_hook subprocess.
 
-Covers what the pure-module tests cannot: that the hook script loads, returns
-exit code 2 to block (the bypassPermissions-safe path), and exit 0 to allow.
+Covers what the pure-module tests cannot: that the hook script loads, and
+returns exit code 0 to allow. `git branch -D` blocking is still exercised
+here too; `git worktree remove` is now always allowed by this hook (git's own
+worktree lock, applied at creation, is what refuses it -- see
+worktree_destruction.py's module docstring and plan@v1 Validation Gate
+Results).
 """
 
 from __future__ import annotations
@@ -22,6 +26,7 @@ class GuardHookTest(unittest.TestCase):
     """Drive the destruction-guard hook as a real subprocess."""
 
     def setUp(self) -> None:
+        """Build a repo with one linked worktree on branch 'feat'."""
         self._tmp = tempfile.TemporaryDirectory()
         self.base = Path(self._tmp.name)
         self.repo = self.base / "repo"
@@ -36,9 +41,11 @@ class GuardHookTest(unittest.TestCase):
         self._git("worktree", "add", "-b", "feat", str(self.wt))
 
     def tearDown(self) -> None:
+        """Discard the temporary repo tree."""
         self._tmp.cleanup()
 
     def _git(self, *args: str, cwd: Path | None = None) -> None:
+        """Run a git command in the test repo (or ``cwd`` if given)."""
         subprocess.run(
             ["git", "-C", str(cwd or self.repo), *args],
             check=True,
@@ -47,9 +54,11 @@ class GuardHookTest(unittest.TestCase):
         )
 
     def _env(self) -> dict[str, str]:
+        """Return an environment pointing CLAUDE_PLUGIN_ROOT at this checkout."""
         return {**os.environ, "CLAUDE_PLUGIN_ROOT": str(_ROOT)}
 
     def _run(self, command: str, cwd: str) -> tuple[int, str]:
+        """Drive the hook subprocess with a Bash-tool-shaped payload."""
         payload = json.dumps(
             {"tool_name": "Bash", "cwd": cwd, "tool_input": {"command": command}}
         )
@@ -63,21 +72,32 @@ class GuardHookTest(unittest.TestCase):
         )
         return proc.returncode, proc.stderr
 
-    def test_blocks_unlanded_worktree_remove_with_exit_2(self) -> None:
+    def test_worktree_remove_now_allowed_gap_documented(self) -> None:
+        """`git worktree remove` is no longer intercepted here (git's own lock gates it)."""
         (self.wt / "w.txt").write_text("work\n")
         self._git("add", "w.txt", cwd=self.wt)
         self._git("commit", "-m", "work", cwd=self.wt)
-        code, err = self._run(
+        code, _ = self._run(
             f"git worktree remove --force {self.wt}", str(self.repo)
         )
+        self.assertEqual(code, 0)
+
+    def test_blocks_unlanded_branch_delete_with_exit_2(self) -> None:
+        """`git branch -D` of an unlanded branch is still blocked with exit 2."""
+        (self.wt / "w.txt").write_text("work\n")
+        self._git("add", "w.txt", cwd=self.wt)
+        self._git("commit", "-m", "work", cwd=self.wt)
+        code, err = self._run("git branch -D feat", str(self.repo))
         self.assertEqual(code, 2)
         self.assertIn("worktree-warden blocked", err)
 
     def test_allows_harmless_command_with_exit_0(self) -> None:
+        """A non-destructive command is always allowed."""
         code, _ = self._run("git status", str(self.repo))
         self.assertEqual(code, 0)
 
     def test_allows_clean_landed_remove(self) -> None:
+        """A clean, landed worktree's `worktree remove` is allowed."""
         code, _ = self._run(f"git worktree remove {self.wt}", str(self.repo))
         self.assertEqual(code, 0)
 
