@@ -12,7 +12,9 @@ which removes a worktree natively at session end. The only defense against losin
 git **bundle** under ``<git-common-dir>/worktree-warden/wip/``. Bundles live
 *outside* all refs, so they are invisible to ``git log`` / ``git branch`` (no
 history pollution) and self-contained; ``recover`` lists them and ``recover
---gc-days`` expires them. Recovery: ``git fetch <bundle> <ref>``.
+--gc-days`` expires them. Recovery: ``git fetch <bundle> <ref>``. If the repo
+has submodules, that restores the gitlink pointer but leaves submodule
+directories empty — follow up with ``git submodule update --init --recursive``.
 
 Everything here is best-effort: any failure returns None and captures nothing, so
 a Stop hook can call it without risk of blocking or erroring the session.
