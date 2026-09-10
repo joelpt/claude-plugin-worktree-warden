@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Worktree admin records are now protected from garbage collection by native `git worktree lock` (#26).**
+  Every linked worktree is locked immediately after creation (via a new `PostToolUse(EnterWorktree)` hook)
+  and stays locked for its entire life until `worktree_engine teardown` unlocks it immediately before removal.
+  This makes `recover` and `reconcile` reliable even when a worktree's directory is removed externally (e.g.
+  `rm -rf`, stray cleanup, force-quit housekeeping) — git never marks a locked worktree `prunable` and never
+  drops its admin record from `git worktree list`, so recovery works by checking `os.path.isdir` directly
+  instead of relying on git's `prunable` annotation.
+  
+- **Destruction gate now covers only `git branch -d/-D`** (#26). With native worktree locking in place,
+  git itself refuses `git worktree remove [--force]` on a still-locked worktree at the git layer, so the
+  parser no longer intercepts that case. `git branch -d/-D` (the only destructive command the parser can
+  reliably intercept in shell syntax) is still gated by worktree cleanliness + landed status. `rm -rf`
+  and any Bash-hidden destruction (via `bash -c`, `xargs`, etc.) remain known, uncompensated gaps,
+  documented in README and backstopped only by WIP bundle capture and the `recover` audit.
+
 ### Added
 
 - **`run_tests_on_finish` setting (default off).** Finish no longer auto-detects and runs
