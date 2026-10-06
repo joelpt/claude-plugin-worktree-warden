@@ -24,6 +24,8 @@ The verdict that frames every milestone: **the philosophy and the core mechanism
 - **Repo-scoped, always.** The plugin only ever inspects and acts on worktrees of the repo the current session belongs to.
 - **Concurrency is serialized cooperatively, not by git.** Git has no branch-span lock; multi-step operations (above all the multi-process merge) are serialized by a cooperative advisory lock keyed by `realpath(worktree-toplevel)`. The lock is a *coordination aid, not a safety gate*: it fails open and is deliberately **decoupled** from the edit/destruction gates' import path, so a lock bug can never disable enforcement (the opposite would expand the gate's blast radius).
 
+- **One hidden, session-wide off switch exists, for the orchestrator that owns the lifecycle.** `WORKTREE_WARDEN_FORCE_DISABLE=1` makes every hook exit 0 silently, before any guarded import. It is not a user-facing opt-out (those are `worktree_gate disable` and `teardown-mode never`, which are repo/user scoped and advertised in hook output). It must never be named in hook output, skill text, errors or the audit log, so a session under warden cannot discover and abuse it; it is documented only in README, this file and CHANGELOG. Driver: Jack alone reaps worktrees while it drives (Jack JACKADR-001, "Jack alone owns worktree teardown while it drives"). The Stop hook was the real interference, not a hidden reaper: warden never deletes automatically, but its nudge can send a worker to merge and tear down its own worktree.
+
 ## Milestone roadmap (design intent)
 
 Sequence is M1 → M2 → M3 → M4; each milestone depends on the prior. Exit criteria below; live completion status is in the tracking issue.

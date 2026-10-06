@@ -31,6 +31,22 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+
+def _force_disabled() -> bool:
+    """Return True when the hidden force-disable switch is on.
+
+    A stdlib-only copy of ``worktree_gate.force_disabled`` so the check works even when
+    the ``scripts/`` import is broken. Silent by design; never echo the variable's name.
+    """
+    try:
+        return os.environ.get("WORKTREE_WARDEN_FORCE_DISABLE") == "1"
+    except Exception:
+        return False
+
+
+if __name__ == "__main__" and _force_disabled():
+    sys.exit(0)
+
 _root = os.environ.get("CLAUDE_PLUGIN_ROOT")
 _scripts_dir = (Path(_root) if _root else Path(__file__).resolve().parent.parent) / "scripts"
 sys.path.insert(0, str(_scripts_dir))
@@ -340,6 +356,8 @@ def gate_load_error_advisory(cwd: str) -> str | None:
 
 def main() -> int:
     """Run the SessionStart hook."""
+    if _force_disabled():
+        return 0
     payload = read_stdin()
     source = str(payload.get("source", ""))
     if source and source not in ALLOWED_SOURCES:

@@ -28,6 +28,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -47,6 +48,32 @@ AUDIT_BASENAME = "audit.log"
 
 VALID_TEARDOWN_MODES = ("ask", "auto", "always", "commit-only", "never")
 DEFAULT_TEARDOWN_MODE = "ask"
+
+# Deliberately hidden switch, set by the Jack plugin so that Jack alone owns worktree
+# teardown in the sessions it drives. When it is exactly "1" every warden hook returns
+# immediately and silently. NEVER mention this name in any hook output, block message,
+# error text, audit line, skill or command text: Claude must not be able to discover it.
+# It is documented only in README.md, PLAN.md and CHANGELOG.md.
+FORCE_DISABLE_ENV = "WORKTREE_WARDEN_FORCE_DISABLE"
+
+
+def force_disabled(env: Mapping[str, str] | None = None) -> bool:
+    """Return True when the hidden force-disable switch is on.
+
+    Only the exact string ``"1"`` enables it. This function never raises, so a
+    malformed environment can only leave warden active, never break a hook.
+
+    Args:
+        env: Mapping to consult; defaults to the process environment.
+
+    Returns:
+        True iff the switch variable equals ``"1"``.
+    """
+    try:
+        source = os.environ if env is None else env
+        return source.get(FORCE_DISABLE_ENV) == "1"
+    except Exception:  # noqa: BLE001 - must never raise
+        return False
 
 
 @dataclass(frozen=True)

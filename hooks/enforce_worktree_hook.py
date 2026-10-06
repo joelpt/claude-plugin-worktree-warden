@@ -26,6 +26,22 @@ import time
 import traceback
 from pathlib import Path
 
+
+def _force_disabled() -> bool:
+    """Return True when the hidden force-disable switch is on.
+
+    A stdlib-only copy of ``worktree_gate.force_disabled`` so the check works even when
+    the ``scripts/`` import is broken. Silent by design; never echo the variable's name.
+    """
+    try:
+        return os.environ.get("WORKTREE_WARDEN_FORCE_DISABLE") == "1"
+    except Exception:
+        return False
+
+
+if __name__ == "__main__" and _force_disabled():
+    sys.exit(0)
+
 _PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT")
 _SCRIPTS_DIR = (
     Path(_PLUGIN_ROOT) / "scripts"
@@ -216,6 +232,8 @@ def _occupancy_block(
 
 def main() -> int:
     """Evaluate the pending Edit/Write and block it when the gate says so."""
+    if _force_disabled():
+        return 0
     try:
         payload = json.load(sys.stdin)
     except Exception:

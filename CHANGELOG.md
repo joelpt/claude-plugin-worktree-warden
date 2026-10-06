@@ -6,6 +6,21 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Hidden session-wide force-disable switch for an orchestrator that owns the worktree
+  lifecycle.** With `WORKTREE_WARDEN_FORCE_DISABLE=1` in the environment, all four hooks
+  (`auto_teardown_hook`, `check_worktrees_hook`, `enforce_worktree_hook`,
+  `guard_destruction_hook`) exit 0 at once with no output and no side effects (no WIP
+  bundle, lock, audit entry, debounce state or load-error sentinel). Only the exact value
+  `1` counts, and the check runs before the hooks' guarded imports so it also holds on a
+  broken install. Shared helper: `worktree_gate.force_disabled()`; each hook carries a
+  stdlib-only copy. Motivation: the Stop hook's "run finish-worktree" nudge can send a
+  pipeline worker to merge and remove its own worktree outside the orchestrator's land
+  authority. A change to the `env` block of `.claude/settings.local.json` reaches later
+  hooks of a running session (subagents and child `claude` processes included); a Bash
+  `export` does not. By design the switch is documented only in README, PLAN.md and this
+  file, and is never named in hook output, skill text or errors, so a session under warden
+  cannot discover it. No behavior change when the variable is unset or not `1`.
+
 - **`teardown --discard`: a sanctioned path for abandoning a worktree whose work must NOT
   land.** `teardown` refused a dirty worktree (`11 dirty_worktree`) and refused an unmerged
   branch (`12 branch_unmerged`). Both are correct defaults, but together they made abandoning

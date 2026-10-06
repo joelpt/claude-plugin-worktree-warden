@@ -36,6 +36,22 @@ import time
 from pathlib import Path
 from typing import TypedDict, cast
 
+
+def _force_disabled() -> bool:
+    """Return True when the hidden force-disable switch is on.
+
+    A stdlib-only copy of ``worktree_gate.force_disabled`` so the check works even when
+    the ``scripts/`` import is broken. Silent by design; never echo the variable's name.
+    """
+    try:
+        return os.environ.get("WORKTREE_WARDEN_FORCE_DISABLE") == "1"
+    except Exception:
+        return False
+
+
+if __name__ == "__main__" and _force_disabled():
+    sys.exit(0)
+
 _root = os.environ.get("CLAUDE_PLUGIN_ROOT")
 _scripts_dir = (
     Path(_root) if _root else Path(__file__).resolve().parent.parent
@@ -241,6 +257,8 @@ def main() -> int:
     Returns:
         Always 0 — the hook never hard-fails (fail-open contract).
     """
+    if _force_disabled():
+        return 0
     try:
         payload = cast(_HookPayload, json.load(sys.stdin))
     except Exception:

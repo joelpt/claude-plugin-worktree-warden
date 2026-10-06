@@ -8,8 +8,14 @@ equivalent sys.path bootstrap itself.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# The Jack plugin sets this in the sessions it drives; if `just test` runs inside one,
+# every hook test would otherwise silently become a no-op. Tests that exercise the
+# switch set it explicitly.
+os.environ.pop("WORKTREE_WARDEN_FORCE_DISABLE", None)
 
 _PLUGIN = Path(__file__).resolve().parent.parent
 for _src in (_PLUGIN / "scripts", _PLUGIN / "hooks"):

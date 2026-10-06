@@ -208,6 +208,29 @@ Settings are stored per scope (project overrides user); the grant token and
 debounce state live in `.git/` (ephemeral, never committed); the user config and
 an `audit.log` of grants/uses/blocks live under the user config dir.
 
+### Force-disable switch (for orchestrators that own the worktree lifecycle)
+
+Setting the environment variable `WORKTREE_WARDEN_FORCE_DISABLE=1` makes all four hooks
+(`auto_teardown_hook`, `check_worktrees_hook`, `enforce_worktree_hook`,
+`guard_destruction_hook`) exit 0 immediately: no output, no WIP bundle, no lock, no
+audit entry, no debounce state, no diagnostic. Only the exact value `1` counts. The check
+runs before the hooks' guarded `scripts/` imports, so it holds even on a broken install.
+
+It exists for one caller: an orchestrator (the Jack plugin) that drives a whole session
+and must be the only thing that merges and removes worktrees. Without it, the Stop hook's
+"run finish-worktree" nudge can send a pipeline worker off to land and tear down its own
+worktree outside the orchestrator's authority. The variable is inherited by every child
+process, and a change to the `env` block of the project's `.claude/settings.local.json`
+reaches later hooks of a running session, including subagents and child `claude`
+processes. A Bash-tool `export` does not reach hooks.
+
+**This switch is deliberately undiscoverable from inside a session.** It is documented only
+in this README, `PLAN.md` and `CHANGELOG.md`. Never mention it, or the variable's name, in
+hook output, skill text, error messages, the audit log or any other text an agent reads;
+the point is that a Claude session working under warden cannot find it and talk itself
+into using it. The skills `finish-worktree`, `check-worktrees` and the others are
+unchanged and keep working when the switch is off. A test pins the no-mention rule.
+
 ### Auto-teardown
 
 The **Stop hook** fires when a session ends while inside a linked worktree that
