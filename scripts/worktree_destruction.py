@@ -175,10 +175,13 @@ def _operands(args: list[str]) -> list[str]:
     """
     out: list[str] = []
     skip_next = False
-    for tok in args:
+    for i, tok in enumerate(args):
         if skip_next:
             skip_next = False
             continue
+        if tok == "--":
+            out.extend(args[i + 1 :])
+            break
         if tok in _REDIRECTION:
             skip_next = True
             continue
@@ -186,6 +189,34 @@ def _operands(args: list[str]) -> list[str]:
             continue
         out.append(tok)
     return out
+
+
+def _branch_delete_mode(args: list[str]) -> tuple[bool, bool]:
+    """Return (is_delete, forced) for ``git branch`` arguments.
+
+    Understands short-flag clusters (``-fD``, ``-rd``) and unambiguous long
+    option abbreviations (``--del``, ``--forc``), as git itself does. ``-d``
+    combined with a force flag is equivalent to ``-D``. Scanning stops at a
+    bare ``--``.
+    """
+    delete = force = False
+    for tok in args:
+        if tok == "--":
+            break
+        if tok.startswith("--"):
+            if len(tok) >= 5 and "--delete".startswith(tok):
+                delete = True
+            elif len(tok) >= 6 and "--force".startswith(tok):
+                force = True
+        elif tok.startswith("-") and tok[1:].isalpha():
+            letters = tok[1:]
+            if "D" in letters:
+                delete = force = True
+            if "d" in letters:
+                delete = True
+            if "f" in letters:
+                force = True
+    return delete, delete and force
 
 
 def _unwrap_prefix(tokens: list[str]) -> list[str]:
@@ -274,10 +305,9 @@ def _parse_segment(segment: str, cwd: str) -> list[DestructiveIntent]:
     if not rest or rest[0] != "branch":
         return []
     args = rest[1:]
-    is_delete = any(a in ("-d", "-D", "--delete") for a in args)
+    is_delete, forced = _branch_delete_mode(args)
     if not is_delete:
         return []
-    forced = "-D" in args or ("--delete" in args and "--force" in args)
     # `git branch -D a b c` deletes every named branch; gate each.
     return [
         DestructiveIntent("branch_delete", name, eff_cwd, forced)
@@ -334,7 +364,7 @@ def _porcelain_z(cwd: str) -> str | None:
     The plugin's shared ``run_git`` strips stdout, which would eat the leading
     space of the FIRST porcelain record (e.g. ``" M path"`` → ``"M path"``) and
     desync the fixed-offset parse. Status parsing must see bytes verbatim, so
-    this reads them directly. Returns None on any failure (treated as clean).
+    this reads them directly. Returns None on any failure; callers fail closed.
     """
     try:
         proc = subprocess.run(
@@ -348,16 +378,17 @@ def _porcelain_z(cwd: str) -> str | None:
     return proc.stdout if proc.returncode == 0 else None
 
 
-def _non_noise_dirty(repo: str, branch: str) -> list[str]:
+def _non_noise_dirty(repo: str, branch: str) -> list[str] | None:
     """Non-noise dirty paths in the worktree checked out at ``branch``.
 
     Reads status from the branch's worktree directory; returns [] when the
-    worktree directory is missing (already gone — nothing dirty to protect).
+    worktree directory is missing (already gone — nothing dirty to protect)
+    and None when the status exists but cannot be read.
     """
     wt = _branch_worktree_path(repo, branch)
     if wt is None or not os.path.isdir(wt):
         return []
-    return _dirty_paths(wt) or []
+    return _dirty_paths(wt)
 
 
 def _dirty_paths(wt: str) -> list[str] | None:
@@ -427,6 +458,12 @@ def _evaluate_branch(repo: str, branch: str) -> Verdict:
     if branch == target:
         return Verdict(True, f"'{branch}' is the default branch")
     dirty = _non_noise_dirty(repo, branch)
+    if dirty is None:
+        return Verdict(
+            False,
+            f"cannot read the status of the worktree for '{branch}'",
+            recovery=_ENGINE_RECOVERY,
+        )
     if dirty:
         sample = ", ".join(dirty[:5]) + ("…" if len(dirty) > 5 else "")
         return Verdict(

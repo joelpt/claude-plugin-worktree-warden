@@ -128,6 +128,43 @@ class ParseTest(unittest.TestCase):
         for cmd in ("rm -Rf /tmp/wt", "rm -R /tmp/wt", "rm -fR /tmp/wt"):
             self.assertEqual(wd.parse_destructive_command(cmd, "/r"), [], cmd)
 
+    def test_branch_delete_flag_clusters_and_abbreviations(self) -> None:
+        """Clustered short flags and abbreviated long options still delete."""
+        cases = {
+            "git branch -fD feat": True,
+            "git branch -Df feat": True,
+            "git branch -rD feat": True,
+            "git branch -fd feat": True,
+            "git branch -dr feat": False,
+            "git branch --del feat": False,
+            "git branch --delet --force feat": True,
+            "git branch --force --delete feat": True,
+        }
+        for cmd, forced in cases.items():
+            intents = wd.parse_destructive_command(cmd, "/r")
+            self.assertEqual([i.target for i in intents], ["feat"], cmd)
+            self.assertEqual(intents[0].kind, "branch_delete", cmd)
+            self.assertEqual(intents[0].forced, forced, cmd)
+
+    def test_branch_non_delete_flags_not_parsed(self) -> None:
+        """Listing and creating branches never produce an intent."""
+        for cmd in (
+            "git branch -a",
+            "git branch -vv",
+            "git branch -f feat HEAD",
+            "git branch --list",
+        ):
+            self.assertEqual(wd.parse_destructive_command(cmd, "/r"), [], cmd)
+
+    def test_operand_after_double_dash_is_a_target(self) -> None:
+        """A branch or worktree named like a flag after `--` is still gated."""
+        intents = wd.parse_destructive_command("git branch -D -- -weird", "/r")
+        self.assertEqual([i.target for i in intents], ["-weird"])
+        intents = wd.parse_destructive_command(
+            "git worktree remove -ff -- -weird", "/r"
+        )
+        self.assertEqual([i.target for i in intents], ["-weird"])
+
     def test_branch_delete_multiple_targets(self) -> None:
         """`git branch -D a b c` deletes every named branch; gate each."""
         intents = wd.parse_destructive_command("git branch -D a b c", "/r")
@@ -202,6 +239,16 @@ class VerdictTest(unittest.TestCase):
     def tearDown(self) -> None:
         """Discard the temporary repo tree."""
         self._tmp.cleanup()
+
+    def test_branch_delete_blocked_when_status_unreadable(self) -> None:
+        """An unreadable worktree status fails CLOSED for `git branch -D`."""
+        real = wd._porcelain_z
+        wd._porcelain_z = lambda cwd: None  # type: ignore[assignment]
+        try:
+            verdict = wd.evaluate_command("git branch -D feat", str(self.repo))
+        finally:
+            wd._porcelain_z = real  # type: ignore[assignment]
+        self.assertFalse(verdict.allow)
 
     def _commit_in_wt(self) -> None:
         """Commit one unlanded change in the linked worktree."""
