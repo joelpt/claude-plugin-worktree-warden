@@ -68,7 +68,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
 EXIT_OK = 0
 EXIT_NOT_APPLICABLE = 10
@@ -644,7 +644,8 @@ def cmd_finish_recap(repo: str, base: str, tip: str = "HEAD", limit: int = 20) -
     return Outcome(
         EXIT_OK,
         "finish_recap",
-        f"{details['commit_count']} commit(s), {details['diffstat']['file_count']} changed file(s).",
+        f"{details['commit_count']} commit(s), "
+        f"{cast(dict[str, object], details['diffstat'])['file_count']} changed file(s).",
         primary=repo,
         details=details,
     )
