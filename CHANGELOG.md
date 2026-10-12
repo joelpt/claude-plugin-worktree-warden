@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Destruction gate again blocks the `git worktree remove` / `unlock` lock bypasses.** #26 narrowed the
+  gate to `git branch -d/-D` and left `git worktree lock` as the only protection, but git's own error for a
+  locked worktree advertises `remove -f -f`, and `git worktree unlock X && git worktree remove --force X`
+  (or `rm`-ing the lock file) passed the gate. The gate now judges command shape, independent of lock
+  state: `git worktree unlock`, `rm` under `.git/worktrees/`, and `remove` with two or more force flags
+  (`-ff`, `--forc --forc`, ...) are refused outright; a single-force `remove` is judged by the target
+  worktree's path (dirty files, then un-landed commits on its HEAD, covering detached HEAD) and an
+  unresolvable target is refused. `cd` in an earlier segment and `git -C` are honored. Supersedes the
+  "covers only `git branch -d/-D`" entry below. `rm -rf <worktree dir>` stays a documented gap.
+
 ### Changed
 
 - **Worktree admin records are now protected from garbage collection by native `git worktree lock` (#26).**
@@ -14,7 +26,7 @@ All notable changes to this project will be documented in this file.
   drops its admin record from `git worktree list`, so recovery works by checking `os.path.isdir` directly
   instead of relying on git's `prunable` annotation.
   
-- **Destruction gate now covers only `git branch -d/-D`** (#26). With native worktree locking in place,
+- **Destruction gate now covers only `git branch -d/-D`** (#26) — superseded; see the Fixed entry above. With native worktree locking in place,
   git itself refuses `git worktree remove [--force]` on a still-locked worktree at the git layer, so the
   parser no longer intercepts that case. `git branch -d/-D` (the only destructive command the parser can
   reliably intercept in shell syntax) is still gated by worktree cleanliness + landed status. `rm -rf`

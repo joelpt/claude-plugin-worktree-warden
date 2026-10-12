@@ -42,34 +42,42 @@ worktrees of the repo your current session belongs to — never cross-repo.
   session. `worktree_engine`'s own `teardown` is the only path that ever
   unlocks (immediately before its own `git worktree remove`), so a worktree
   stays locked for its entire life outside of a sanctioned teardown.
-- **PreToolUse destruction gate** (`Bash`) — hard-blocks a raw
-  `git branch -d/-D <branch>` that would delete a branch whose worktree is
-  **dirty or not yet landed** in the default branch. The check is
-  deterministic (clean **and** an ancestor of the default branch → allowed;
-  anything else → exit-2 refusal with the command to land first). Blocks
-  under every permission mode; **fails open** on any surprise (it only
-  refuses when it can *prove* content is at risk).
+- **PreToolUse destruction gate** (`Bash`) — hard-blocks, under every
+  permission mode, the commands that would destroy un-landed worktree state.
+  It judges the command's *shape*, never the live lock state (the hook runs
+  before the command, so in `unlock X && remove --force X` the lock still reads
+  as held):
+  - `git branch -d/-D <branch>` whose worktree is **dirty or not yet landed**
+    in the default branch (clean **and** landed → allowed).
+  - `git worktree unlock` and `rm` of anything under `.git/worktrees/` (a
+    worktree's admin record or its `locked` file) — refused outright. The
+    engine's own `teardown` unlocks from a Python subprocess that never passes
+    through this gate, so no sanctioned flow needs these from Bash.
+  - `git worktree remove` with **two or more force flags** (`-f -f`, `-ff`,
+    `--force --force`, any `--f…` abbreviation) — refused outright, since git's
+    own error for a locked worktree advertises `remove -f -f` as the override.
+  - `git worktree remove --force` (one force) — judged by the target
+    worktree's *path* (bare folder names and `cd`/`-C` relative targets
+    resolve): dirty files, then commits on its HEAD not in the default branch,
+    which also covers a detached HEAD. A target that is not a registered
+    worktree, or whose status cannot be read, is refused (fails **closed**).
+    An unforced `remove` is left to git, which already refuses a dirty tree.
 
-  **This gate no longer intercepts `git worktree remove [--force]` or an
-  `ExitWorktree` remove** (both are always allowed by this gate). Both are
-  now refused at the **git layer itself**: since every linked worktree is
-  locked at creation (the PostToolUse lock hook above), git itself refuses
-  `git worktree remove`/`--force`/an `ExitWorktree` removal on a still-locked
-  worktree with `fatal: cannot remove a locked working tree` — raw stderr
-  from git, not a friendly gate message — unless `worktree_engine teardown`
-  has unlocked it first (empirically verified against a real repo; see the
-  plugin's own implementation-plan validation notes).
+  The refusal points to `/worktree-warden:finish-worktree`; a stale worktree
+  that really must go is for the user to run themselves with the `!` prefix.
+  The git worktree lock (PostToolUse lock hook above) is a second layer, not
+  the gate: that hook fails open, and an `ExitWorktree` remove still relies on
+  it (re-verified against the live lock state).
 
-  **`rm -rf <worktree>` and any Bash-hidden/indirect destruction** (`xargs`,
-  `bash -c '...'`, command substitution, a script the Bash call merely
-  invokes) remain a **known, PERMANENT, uncompensated bypass** — this was
-  already an unclosable static-parser gap before the collapse above, and
-  git's own worktree lock does not close it either: locking only protects the
-  admin *record* from `prune`, it does nothing to stop the worktree's files
-  being deleted directly on disk. The Stop-hook WIP bundle capture (below)
-  and the `recover`/`reconcile` external-removal audit are the sole backstops
-  for that window — they make the loss *detectable and recoverable*, never
-  *prevented*.
+  **`rm -rf <worktree directory>` and any Bash-hidden/indirect destruction**
+  (`xargs`, `sh -c '...'`, `eval`, command substitution, `git -c alias.x=...`,
+  a script the Bash call merely invokes) remain a **known, PERMANENT,
+  uncompensated bypass** — an unclosable static-parser gap, and git's own
+  worktree lock does not close it either: locking only protects the admin
+  *record* from `prune`, it does nothing to stop the worktree's files being
+  deleted directly on disk. The Stop-hook WIP bundle capture (below) and the
+  `recover`/`reconcile` external-removal audit are the sole backstops for that
+  window — they make the loss *detectable and recoverable*, never *prevented*.
 - **SessionStart hook** — on `startup`/`resume`, only when cwd is the repo's
   **main** worktree, surfaces the repo's linked worktrees as a user-facing
   `systemMessage` banner: a category breakdown (mergeable / ⏳ cooldown / ❌
@@ -108,7 +116,8 @@ worktrees of the repo your current session belongs to — never cross-repo.
   CLI manages exceptions and persistent settings.
 - `scripts/worktree_destruction.py` — pure, testable core of the destruction
   gate: parses a (possibly compound) shell command for destructive intent
-  (`git worktree remove`, `rm -rf`, `git branch -d/-D`) and rules block/allow by
+  (`git branch -d/-D`, `git worktree remove`/`unlock`, `rm` of the
+  `.git/worktrees/` admin area) and rules block/allow by command shape or by
   checking the target worktree/branch is clean **and** landed. Imported by
   `hooks/guard_destruction_hook.py`.
 - `scripts/worktree_wip.py` — non-destructive WIP capture: snapshots a worktree's
@@ -306,7 +315,9 @@ it is created (the PostToolUse `EnterWorktree` lock hook, above) and stays
 locked for its entire life. `worktree_engine teardown` is the only path that
 ever unlocks a worktree, and it does so immediately before its own `git
 worktree remove` call — so a worktree is unlocked for, at most, the span of
-one teardown invocation. This is what makes `recover` reliable even when a
+one teardown invocation. The Bash destruction gate enforces this: a manual
+`git worktree unlock`, `remove -f -f`, or `rm` of a worktree's lock file is
+refused. This is what makes `recover` reliable even when a
 worktree's directory disappears while it is still locked: git never marks a
 locked entry `prunable`, and its admin record never drops out of `git
 worktree list`, so `recover`'s stranded-worktree detector and the

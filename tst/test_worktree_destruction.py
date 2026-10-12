@@ -1,21 +1,16 @@
-"""Tests for the deterministic `git branch -d/-D` destruction gate.
+"""Tests for the deterministic worktree/branch destruction gate.
 
 Two layers: pure parser tests (no git), and verdict tests against a real temp
 repo with a linked worktree exercised through clean/dirty/landed/unlanded states.
 
-R-CHARACTERIZATION-TESTS-FIRST: this file used to also cover `git worktree
-remove [--force]` / `rm -rf <worktree>` parsing via `evaluate_command`. That
-parsing is now refused at the git layer itself -- every linked worktree is
-locked at creation (REQ-LOCKING-CREATE) and git itself refuses `git worktree
-remove`/`--force` on a still-locked worktree (empirically verified -- see
-plan@v1 Validation Gate Results). The parser cases below that used to assert
-a BLOCK for those shapes now assert the new, deliberate "always allow, gap
-documented" behavior instead of being deleted outright, so the collapse's
-intended behavior stays covered by a real test rather than silently untested.
+The gate judges command *shape*, not live lock state: `git worktree unlock`,
+`rm` of the `.git/worktrees/` admin area and `git worktree remove` with two or
+more force flags are blocked outright; a single force is judged by the target
+worktree's path. `rm -rf <worktree dir>` stays a documented, permanent gap.
 
-`evaluate_exit_worktree` (a separate, non-parser gate) is NOT part of that
-collapse -- it re-verifies current lock state and falls back to the same
-clean+landed check on an unlocked worktree; see its `VerdictTest` cases below.
+`evaluate_exit_worktree` (a separate, non-parser gate) re-verifies current lock
+state and falls back to the same clean+landed check on an unlocked worktree;
+see its `VerdictTest` cases below.
 """
 
 from __future__ import annotations
@@ -38,12 +33,59 @@ def _git(*args: str, cwd: Path) -> str:
 class ParseTest(unittest.TestCase):
     """The parser recognizes only `git branch -d/-D` now; everything else is []."""
 
-    def test_worktree_remove_no_longer_parsed(self) -> None:
-        """`git worktree remove` is no longer this module's concern (git's lock gates it)."""
-        intents = wd.parse_destructive_command(
-            "git worktree remove --force /tmp/wt", "/repo"
+    def test_forced_worktree_remove_parsed_with_force_count(self) -> None:
+        """A forced `git worktree remove` parses to one intent counting its forces."""
+        cases = {
+            "git worktree remove --force /tmp/wt": 1,
+            "git worktree remove -f /tmp/wt": 1,
+            "git worktree remove -f -f /tmp/wt": 2,
+            "git worktree remove -ff /tmp/wt": 2,
+            "git worktree remove --force --force /tmp/wt": 2,
+            "git worktree remove --forc --forc /tmp/wt": 2,
+            "git worktree remove --f --force /tmp/wt": 2,
+            "git -C /repo worktree remove -f -f /tmp/wt": 2,
+        }
+        for cmd, forces in cases.items():
+            intents = wd.parse_destructive_command(cmd, "/repo")
+            self.assertEqual(len(intents), 1, cmd)
+            self.assertEqual(intents[0].kind, "worktree_remove", cmd)
+            self.assertEqual(intents[0].force_count, forces, cmd)
+            self.assertEqual(intents[0].target, "/tmp/wt", cmd)
+
+    def test_unforced_worktree_remove_not_parsed(self) -> None:
+        """Without force git itself refuses a dirty worktree, so nothing to gate."""
+        self.assertEqual(
+            wd.parse_destructive_command("git worktree remove /tmp/wt", "/repo"), []
         )
-        self.assertEqual(intents, [])
+
+    def test_worktree_unlock_parsed(self) -> None:
+        """Any `git worktree unlock` parses, alone or chained with a remove."""
+        intents = wd.parse_destructive_command(
+            "git worktree unlock /tmp/wt && git worktree remove --force /tmp/wt",
+            "/repo",
+        )
+        self.assertEqual(
+            [i.kind for i in intents], ["worktree_unlock", "worktree_remove"]
+        )
+
+    def test_rm_of_worktree_admin_record_or_lock_file_parsed(self) -> None:
+        """`rm` aimed at `.git/worktrees/...` (admin dir or its `locked` file) parses."""
+        for cmd in (
+            "rm /repo/.git/worktrees/wt/locked",
+            "rm -rf /repo/.git/worktrees/wt",
+            "rm -f .git/worktrees/wt/locked",
+            "sudo rm /repo/.git/worktrees/wt/locked",
+        ):
+            intents = wd.parse_destructive_command(cmd, "/repo")
+            self.assertEqual([i.kind for i in intents], ["worktree_admin_rm"], cmd)
+
+    def test_cd_is_tracked_across_segments(self) -> None:
+        """A `cd` in an earlier segment sets the cwd of later git segments."""
+        intents = wd.parse_destructive_command(
+            "cd /tmp/wt && git worktree remove -ff .", "/repo"
+        )
+        self.assertEqual(len(intents), 1)
+        self.assertEqual(intents[0].cwd, "/tmp/wt")
 
     def test_branch_delete_force(self) -> None:
         """`git branch -D <name>` parses to one forced branch_delete intent."""
@@ -167,16 +209,108 @@ class VerdictTest(unittest.TestCase):
         _git("add", "work.txt", cwd=self.wt)
         _git("commit", "-m", "feat work", cwd=self.wt)
 
-    def test_worktree_remove_of_unlanded_branch_now_allowed(self) -> None:
-        """Documented gap: `worktree remove` is no longer intercepted here.
+    def _lock(self) -> None:
+        """Lock the linked worktree the way the creation hook does."""
+        _git("worktree", "lock", str(self.wt), cwd=self.repo)
 
-        git's own worktree lock is what refuses this now (at the git layer,
-        not this gate) -- see plan@v1 Validation Gate Results.
-        """
+    def _verdict(self, command: str, cwd: Path | None = None) -> wd.Verdict:
+        """Rule on ``command`` from the primary checkout unless ``cwd`` is given."""
+        return wd.evaluate_command(command, str(cwd or self.repo))
+
+    def test_single_force_remove_of_unlanded_unlocked_worktree_blocked(self) -> None:
+        """`remove --force` on an unlocked worktree with unlanded commits is refused."""
         self._commit_in_wt()
-        v = wd.evaluate_command(
-            f"git worktree remove --force {self.wt}", str(self.repo)
+        v = self._verdict(f"git worktree remove --force {self.wt}")
+        self.assertFalse(v.allow)
+
+    def test_single_force_remove_of_dirty_unlocked_worktree_blocked(self) -> None:
+        """`remove --force` on an unlocked dirty worktree is refused."""
+        (self.wt / "scratch.txt").write_text("uncommitted\n")
+        v = self._verdict(f"git worktree remove --force {self.wt}")
+        self.assertFalse(v.allow)
+        self.assertIn("uncommitted", v.reason)
+
+    def test_single_force_remove_of_clean_landed_worktree_allowed(self) -> None:
+        """`remove --force` of a clean, landed worktree is allowed."""
+        self._commit_in_wt()
+        _git("merge", "--ff-only", "feat", cwd=self.repo)
+        self.assertTrue(self._verdict(f"git worktree remove --force {self.wt}").allow)
+
+    def test_single_force_remove_by_folder_name_is_judged(self) -> None:
+        """The bare folder-name operand resolves to the worktree and is judged."""
+        (self.wt / "scratch.txt").write_text("uncommitted\n")
+        self.assertFalse(self._verdict("git worktree remove --force wt").allow)
+
+    def test_single_force_remove_of_dirty_detached_head_worktree_blocked(self) -> None:
+        """A detached-HEAD worktree has no branch; its dirt is still protected."""
+        _git("checkout", "--detach", cwd=self.wt)
+        (self.wt / "scratch.txt").write_text("uncommitted\n")
+        self.assertFalse(self._verdict(f"git worktree remove --force {self.wt}").allow)
+
+    def test_single_force_remove_of_unlanded_detached_head_worktree_blocked(self) -> None:
+        """Commits made on a detached HEAD that are in no branch are protected."""
+        _git("checkout", "--detach", cwd=self.wt)
+        self._commit_in_wt()
+        self.assertFalse(self._verdict(f"git worktree remove --force {self.wt}").allow)
+
+    def test_single_force_remove_of_unresolvable_target_blocked(self) -> None:
+        """Fail closed: a forced remove whose target is no known worktree is refused."""
+        v = self._verdict(f"git worktree remove --force {self.base / 'nowhere'}")
+        self.assertFalse(v.allow)
+        self.assertIn("resolve", v.reason)
+
+    def test_double_force_remove_blocked_even_when_clean_and_landed(self) -> None:
+        """Every spelling of two forces is refused outright: it is never routine."""
+        for spelling in ("-f -f", "-ff", "--force --force", "--forc --forc", "-f --force"):
+            v = self._verdict(f"git worktree remove {spelling} {self.wt}")
+            self.assertFalse(v.allow, spelling)
+            self.assertIn("finish-worktree", v.recovery, spelling)
+
+    def test_double_force_remove_of_locked_dirty_worktree_blocked(self) -> None:
+        """The bypass git's own error message advertises (`remove -f -f`)."""
+        self._lock()
+        (self.wt / "scratch.txt").write_text("uncommitted\n")
+        self.assertFalse(self._verdict(f"git worktree remove -f -f {self.wt}").allow)
+
+    def test_unlock_blocked_even_when_clean(self) -> None:
+        """`git worktree unlock` is never routine from Bash; the engine unlocks itself."""
+        self._lock()
+        v = self._verdict(f"git worktree unlock {self.wt}")
+        self.assertFalse(v.allow)
+        self.assertIn("finish-worktree", v.recovery)
+
+    def test_unlock_then_remove_chain_blocked(self) -> None:
+        """The chained bypass is refused at its first segment, lock state ignored."""
+        self._lock()
+        (self.wt / "scratch.txt").write_text("uncommitted\n")
+        v = self._verdict(
+            f"git worktree unlock {self.wt} && git worktree remove --force {self.wt}"
         )
+        self.assertFalse(v.allow)
+
+    def test_rm_of_lock_file_or_admin_record_blocked(self) -> None:
+        """Deleting the lock file (or the admin dir) is an unlock in disguise."""
+        admin = self.repo / ".git" / "worktrees" / "wt"
+        for cmd in (f"rm {admin / 'locked'}", f"rm -rf {admin}"):
+            self.assertFalse(self._verdict(cmd).allow, cmd)
+
+    def test_cd_into_worktree_then_relative_double_force_blocked(self) -> None:
+        """`cd <wt> && git worktree remove -ff .` is judged against the real cwd."""
+        self.assertFalse(
+            self._verdict(f"cd {self.wt} && git worktree remove -ff .").allow
+        )
+
+    def test_dash_c_single_force_remove_is_judged_in_that_repo(self) -> None:
+        """`git -C <repo> worktree remove --force` resolves against ``-C``."""
+        (self.wt / "scratch.txt").write_text("uncommitted\n")
+        v = self._verdict(
+            f"git -C {self.repo} worktree remove --force {self.wt}", self.base
+        )
+        self.assertFalse(v.allow)
+
+    def test_engine_teardown_command_is_not_blocked(self) -> None:
+        """The sanctioned Bash entry point is `python3 worktree_engine.py ...`."""
+        v = self._verdict("python3 scripts/worktree_engine.py teardown --branch feat")
         self.assertTrue(v.allow)
 
     def test_rm_of_unlanded_worktree_now_allowed(self) -> None:

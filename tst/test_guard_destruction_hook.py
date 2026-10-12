@@ -1,11 +1,9 @@
 """End-to-end tests driving the real guard_destruction_hook subprocess.
 
 Covers what the pure-module tests cannot: that the hook script loads, and
-returns exit code 0 to allow. `git branch -D` blocking is still exercised
-here too; `git worktree remove` is now always allowed by this hook (git's own
-worktree lock, applied at creation, is what refuses it -- see
-worktree_destruction.py's module docstring and plan@v1 Validation Gate
-Results).
+returns exit code 0 to allow and exit code 2 to block `git branch -D` of an
+unlanded branch and the `git worktree remove`/`unlock` lock-bypass shapes (see
+worktree_destruction.py's module docstring).
 """
 
 from __future__ import annotations
@@ -72,15 +70,25 @@ class GuardHookTest(unittest.TestCase):
         )
         return proc.returncode, proc.stderr
 
-    def test_worktree_remove_now_allowed_gap_documented(self) -> None:
-        """`git worktree remove` is no longer intercepted here (git's own lock gates it)."""
+    def test_blocks_forced_remove_of_unlanded_worktree_with_exit_2(self) -> None:
+        """`git worktree remove --force` of an unlanded worktree is blocked with exit 2."""
         (self.wt / "w.txt").write_text("work\n")
         self._git("add", "w.txt", cwd=self.wt)
         self._git("commit", "-m", "work", cwd=self.wt)
-        code, _ = self._run(
+        code, err = self._run(
             f"git worktree remove --force {self.wt}", str(self.repo)
         )
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 2)
+        self.assertIn("finish-worktree", err)
+
+    def test_blocks_lock_bypass_shapes_with_exit_2(self) -> None:
+        """The double-force and unlock-then-remove bypasses are blocked with exit 2."""
+        for cmd in (
+            f"git worktree remove -f -f {self.wt}",
+            f"git worktree unlock {self.wt} && git worktree remove --force {self.wt}",
+        ):
+            code, _ = self._run(cmd, str(self.repo))
+            self.assertEqual(code, 2, cmd)
 
     def test_blocks_unlanded_branch_delete_with_exit_2(self) -> None:
         """`git branch -D` of an unlanded branch is still blocked with exit 2."""
