@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **`run_tests_on_finish` setting (default off).** Finish no longer auto-detects and runs
+  the repo's tests unless `worktree_gate run-tests-on-finish on` (user or project scope)
+  enables it; `finish-preflight` otherwise reports `--skip-tests` with source `disabled`,
+  and `merge-worktrees` checks the same setting. The force-disable switch overrides an
+  enabled setting. BEHAVIOR CHANGE: finish previously ran tests by default.
+
 - **Hidden session-wide force-disable switch for an orchestrator that owns the worktree
   lifecycle.** With `WORKTREE_WARDEN_FORCE_DISABLE=1` in the environment, all four hooks
   (`auto_teardown_hook`, `check_worktrees_hook`, `enforce_worktree_hook`,

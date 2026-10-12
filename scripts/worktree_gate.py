@@ -15,7 +15,8 @@ Persistent settings live in a small JSON config at two scopes:
               alongside other Claude tooling config and can be committed.
 
 Each config may set ``enforce`` (bool), ``window_seconds`` (int), and
-``startup_display`` (one of "mergeable"/"always"/"never"). A project value
+``startup_display`` (one of "mergeable"/"always"/"never"), and
+``run_tests_on_finish`` (bool, default false). A project value
 overrides the user value key-by-key; absent keys fall back to the user config
 and then to the built-in defaults.
 """
@@ -375,6 +376,41 @@ def read_teardown_mode(facts: GitFacts) -> str:
     return mode
 
 
+def read_run_tests_on_finish(facts: GitFacts) -> bool:
+    """Return whether finish may auto-detect and run the repo's tests.
+
+    Project config overrides user config; non-bool values are ignored.
+
+    Args:
+        facts: Resolved git context (project config is keyed by its repo root).
+
+    Returns:
+        True only when a scope explicitly enables it; the default is False.
+    """
+    enabled = False
+    for cfg in (
+        _load_json(user_config_path()),
+        _load_json(project_config_path(facts.repo_root)),
+    ):
+        value = cfg.get("run_tests_on_finish")
+        if isinstance(value, bool):
+            enabled = value
+    return enabled
+
+
+def tests_on_finish_enabled(facts: GitFacts, env: Mapping[str, str] | None = None) -> bool:
+    """Return whether finish should run tests, honoring the force-disable switch.
+
+    Args:
+        facts: Resolved git context.
+        env: Environment mapping to consult for the switch; defaults to the process one.
+
+    Returns:
+        False when force-disabled; otherwise the ``run_tests_on_finish`` setting.
+    """
+    return not force_disabled(env) and read_run_tests_on_finish(facts)
+
+
 def read_grant_expiry(git_common_dir: str | None) -> float | None:
     """Return the active exception's expiry epoch, or None if there is none."""
     data = _load_json(grant_path(git_common_dir))
@@ -699,6 +735,31 @@ def cmd_teardown_mode(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run_tests_on_finish(args: argparse.Namespace) -> int:
+    """Show or set whether finish auto-runs the repo's tests.
+
+    Args:
+        args: Parsed arguments; ``args.state`` is "on", "off" or None to show,
+            ``args.user`` selects user scope.
+
+    Returns:
+        Process exit code (0 on success, 1 on error).
+    """
+    facts = git_facts(os.getcwd())
+    if not args.state:
+        state = "on" if tests_on_finish_enabled(facts) else "off"
+        print(f"worktree-gate run-tests-on-finish: {state}")
+        return 0
+    path = _scope_config_path(args, facts)
+    if path is None:
+        print("worktree-gate: not in a git repo; use --user for global scope.")
+        return 1
+    _update_config(path, run_tests_on_finish=args.state == "on")
+    scope = "user" if args.user else "project"
+    print(f"worktree-gate run-tests-on-finish: set to '{args.state}' ({scope} scope) -> {path}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Construct the worktree-gate argument parser."""
     parser = argparse.ArgumentParser(prog="worktree-gate")
@@ -738,6 +799,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     teardown.add_argument("--user", action="store_true", help="global scope")
 
+    run_tests = sub.add_parser(
+        "run-tests-on-finish", help="show or set whether finish auto-runs the repo's tests"
+    )
+    run_tests.add_argument("state", nargs="?", choices=("on", "off"), help="omit to show")
+    run_tests.add_argument("--user", action="store_true", help="global scope")
+
     return parser
 
 
@@ -750,6 +817,7 @@ def main(argv: list[str] | None = None) -> int:
         "enable": cmd_enable,
         "set-window": cmd_set_window,
         "teardown-mode": cmd_teardown_mode,
+        "run-tests-on-finish": cmd_run_tests_on_finish,
         "set-startup-display": cmd_set_startup_display,
     }
     if args.command in handlers_with_args:

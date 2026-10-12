@@ -617,7 +617,7 @@ def cmd_finish_preflight(worktree: str, target_override: str | None = None) -> O
         return Outcome(EXIT_GIT_ERROR, "git_error", str(exc))
 
     classification = "primary" if is_primary else "linked"
-    test = resolve_test_args(Path(primary))
+    test = resolve_test_args(Path(primary)) if _tests_enabled(primary) else _TESTS_DISABLED
     return Outcome(
         EXIT_OK,
         "finish_preflight",
@@ -1172,6 +1172,19 @@ def _has_python_tests(repo: Path) -> bool:
     if any((repo / name).exists() for name in markers):
         return True
     return any((repo / name).exists() for name in ("pyproject.toml", "setup.cfg", "tests"))
+
+
+_TESTS_DISABLED: dict[str, object] = {"argv": ["--skip-tests"], "source": "disabled"}
+
+
+def _tests_enabled(primary: str) -> bool:
+    """Return whether finish may auto-run tests; any failure to decide means no."""
+    try:
+        import worktree_gate  # noqa: PLC0415
+
+        return worktree_gate.tests_on_finish_enabled(worktree_gate.git_facts(primary))
+    except Exception:  # noqa: BLE001 - failing safe means not running tests
+        return False
 
 
 def resolve_test_args(repo: Path) -> dict[str, object]:

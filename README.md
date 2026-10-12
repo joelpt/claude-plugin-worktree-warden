@@ -201,6 +201,7 @@ worktree_gate set-window 30m             # tune the exception window (e.g. 900, 
 worktree_gate set-startup-display never  # session-start banner: mergeable | always | never
 worktree_gate teardown-mode auto         # Stop hook behaviour: ask|auto|commit-only|always|never
 worktree_gate teardown-mode auto --user  # same, user scope (all repos)
+worktree_gate run-tests-on-finish on     # let finish auto-detect + run the repo's tests (default: off)
 worktree_gate status                     # show effective settings + any active exception
 ```
 
@@ -215,6 +216,8 @@ Setting the environment variable `WORKTREE_WARDEN_FORCE_DISABLE=1` makes all fou
 `guard_destruction_hook`) exit 0 immediately: no output, no WIP bundle, no lock, no
 audit entry, no debounce state, no diagnostic. Only the exact value `1` counts. The check
 runs before the hooks' guarded `scripts/` imports, so it holds even on a broken install.
+It also turns off the auto-detected post-land test run in finish, regardless of the
+`run-tests-on-finish` setting.
 
 It exists for one caller: an orchestrator (the Jack plugin) that drives a whole session
 and must be the only thing that merges and removes worktrees. Without it, the Stop hook's

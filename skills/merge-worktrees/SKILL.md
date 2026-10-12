@@ -56,7 +56,9 @@ python3 $ENGINE --repo $REPO preflight --branches <b1,b2,...>
 
 - default order: oldest first
 - if unclear: read [order.md](order.md)
-- resolve the repo test command inline at skill-run time if needed:
+- tests are opt-in: run `python3 $GATE run-tests-on-finish`; when it prints
+  `off`, use `--skip-tests` and skip the detection below. When `on`, resolve
+  the repo test command inline at skill-run time:
   - `just test` when `Justfile` has `test:`
   - else `npm test` when `package.json` exists
   - else `pytest` for Python repos

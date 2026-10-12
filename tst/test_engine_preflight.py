@@ -8,11 +8,13 @@ JSON-output contract.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import worktree_engine as engine
 
@@ -227,6 +229,40 @@ class FinishPreflightTest(unittest.TestCase):
         self.assertEqual(out.primary, str(self.repo.resolve()))
         self.assertEqual(out.details["kind"], "linked")
         self.assertFalse(out.details["detached"])
+
+    def test_tests_off_by_default(self) -> None:
+        """Without the opt-in setting, no test command is auto-detected."""
+        (self.repo / "Justfile").write_text("test:\n    true\n")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.base / "xdg")}):
+            out = engine.cmd_finish_preflight(str(self.wt))
+        assert isinstance(out.details, dict)
+        self.assertEqual(out.details["test_argv"], ["--skip-tests"])
+        self.assertEqual(out.details["test_source"], "disabled")
+
+    def test_tests_detected_when_setting_enabled(self) -> None:
+        """With run_tests_on_finish on, the repo test command is detected."""
+        (self.repo / "Justfile").write_text("test:\n    true\n")
+        xdg = self.base / "xdg"
+        cfg = xdg / "worktree-gate" / "config.json"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text(json.dumps({"run_tests_on_finish": True}))
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg)}):
+            out = engine.cmd_finish_preflight(str(self.wt))
+        assert isinstance(out.details, dict)
+        self.assertEqual(out.details["test_argv"], ["--test-cmd", "just test"])
+
+    def test_force_disable_suppresses_enabled_tests(self) -> None:
+        """The force-disable switch wins over an enabled setting."""
+        (self.repo / "Justfile").write_text("test:\n    true\n")
+        xdg = self.base / "xdg"
+        cfg = xdg / "worktree-gate" / "config.json"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text(json.dumps({"run_tests_on_finish": True}))
+        env = {"XDG_CONFIG_HOME": str(xdg), "WORKTREE_WARDEN_FORCE_DISABLE": "1"}
+        with mock.patch.dict(os.environ, env):
+            out = engine.cmd_finish_preflight(str(self.wt))
+        assert isinstance(out.details, dict)
+        self.assertEqual(out.details["test_argv"], ["--skip-tests"])
 
     def test_target_override_used(self) -> None:
         """When --target is supplied, it is returned as the target."""

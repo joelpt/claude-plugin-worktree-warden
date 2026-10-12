@@ -433,3 +433,59 @@ class TeardownModeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunTestsOnFinishTest(unittest.TestCase):
+    """Teardown mode config read and CLI round-trip."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self._xdg = base / "xdg"
+        self._git = base / "repo" / ".git"
+        self._git.mkdir(parents=True)
+        self._prev_xdg = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self._xdg)
+        self.common_dir = str(os.path.realpath(str(self._git)))
+        self.repo_root = str(base / "repo")
+        self.facts = _main_facts(self.repo_root, str(self._git))
+
+    def tearDown(self) -> None:
+        if self._prev_xdg is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._prev_xdg
+        self._tmp.cleanup()
+
+    def _write_user(self, data: dict[str, object]) -> None:
+        path = gate.user_config_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+
+    def _write_project(self, data: dict[str, object]) -> None:
+        path = gate.project_config_path(self.repo_root)
+        assert path is not None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+
+    def test_default_is_off(self) -> None:
+        self.assertFalse(gate.read_run_tests_on_finish(self.facts))
+
+    def test_user_enables(self) -> None:
+        self._write_user({"run_tests_on_finish": True})
+        self.assertTrue(gate.read_run_tests_on_finish(self.facts))
+
+    def test_project_overrides_user(self) -> None:
+        self._write_user({"run_tests_on_finish": True})
+        self._write_project({"run_tests_on_finish": False})
+        self.assertFalse(gate.read_run_tests_on_finish(self.facts))
+
+    def test_non_bool_ignored(self) -> None:
+        self._write_user({"run_tests_on_finish": "yes"})
+        self.assertFalse(gate.read_run_tests_on_finish(self.facts))
+
+    def test_force_disable_overrides_enabled_setting(self) -> None:
+        self._write_user({"run_tests_on_finish": True})
+        env = {"WORKTREE_WARDEN_FORCE_DISABLE": "1"}
+        self.assertFalse(gate.tests_on_finish_enabled(self.facts, env))
+        self.assertTrue(gate.tests_on_finish_enabled(self.facts, {}))
