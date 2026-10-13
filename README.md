@@ -77,8 +77,9 @@ worktrees of the repo your current session belongs to — never cross-repo.
   known at run time.
   This is a text heuristic and can over-block.
 
-  A git invocation that defines an alias for itself (`git -c alias.x=... x`,
-  `--config-env`) is refused outright.
+  A git invocation that injects config able to run a command (`git -c alias.x=... x`,
+  `-c core.fsmonitor=...`, `--config-env`, `GIT_CONFIG_*` and editor/pager env vars)
+  is refused outright, for any subcommand.
 
   **`rm -rf <worktree directory>` and destruction hidden behind a script the
   Bash call merely invokes** remain a **known, PERMANENT,

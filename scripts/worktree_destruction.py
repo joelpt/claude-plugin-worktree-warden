@@ -81,6 +81,20 @@ IntentKind = Literal[
 
 # Environment variables that redirect which repository git operates on.
 _GIT_REDIRECT_ENV = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"}
+
+# Config keys / env vars through which git runs a command for an otherwise
+# harmless subcommand (a fsmonitor, editor, pager, hook, alias, include ...).
+_EXEC_CONFIG_KEYS = {
+    "core.fsmonitor", "core.editor", "core.pager", "core.hookspath",
+    "core.sshcommand", "core.askpass", "core.gitproxy", "diff.external",
+    "sequence.editor", "gpg.program", "credential.helper",
+}
+_EXEC_CONFIG_SUFFIXES = (".command", ".cmd", ".textconv", ".driver", ".helper", ".program")
+_INERT_ENV_VALUES = {"cat", "true", "false", ":"}
+_EXEC_GIT_ENV = {
+    "GIT_EXTERNAL_DIFF", "GIT_PAGER", "GIT_EDITOR", "GIT_SEQUENCE_EDITOR",
+    "GIT_SSH_COMMAND", "GIT_ASKPASS", "GIT_PROXY_COMMAND",
+}
 _GIT_REDIRECT_OPTS = ("--git-dir", "--work-tree")
 _DYNAMIC_PATH_CHARS = ("$", "`", "*", "?", "[")
 
@@ -456,7 +470,7 @@ def _parse_segment(segment: str, cwd: str) -> list[DestructiveIntent]:
         return []
 
     rest, eff_cwd, global_opts = _strip_git_global_opts(tokens, cwd)
-    if _overrides_alias(global_opts):
+    if _injects_config(global_opts, raw):
         return [_unresolved(segment, eff_cwd)]
     if rest and rest[0] == "worktree":
         intents = _parse_git_worktree(rest, eff_cwd)
@@ -503,12 +517,67 @@ def _is_benign_head(segment: str) -> bool:
     if head != "git":
         return head in _BENIGN_HEADS
     rest, _, opts = _strip_git_global_opts(tokens, "")
-    return not _overrides_alias(opts) and bool(rest) and rest[0] in _BENIGN_GIT_SUBCOMMANDS
+    benign = bool(rest) and rest[0] in _BENIGN_GIT_SUBCOMMANDS
+    return benign and not _injects_config(opts, _safe_split(segment))
 
 
-def _overrides_alias(global_opts: list[str]) -> bool:
-    """Return whether git global options define an alias for this invocation."""
-    return any("alias." in o or o.startswith("--config-env") for o in global_opts)
+def _is_exec_config_key(key: str) -> bool:
+    """Return whether a git config key (any case) can make git run a command."""
+    key = key.lower()
+    return (
+        key.startswith(("alias.", "include"))
+        or key in _EXEC_CONFIG_KEYS
+        or key.endswith(_EXEC_CONFIG_SUFFIXES)
+    )
+
+
+def _is_config_env(assignment: str) -> bool:
+    """Return whether a ``NAME=value`` env assignment can inject a command into git.
+
+    ``GIT_CONFIG*`` always can; the editor/pager-style variables only when the
+    value is not one of the inert commands (``GIT_PAGER=cat`` is routine).
+    """
+    name, _, value = assignment.partition("=")
+    if name.startswith("GIT_CONFIG"):
+        return True
+    return name in _EXEC_GIT_ENV and value not in _INERT_ENV_VALUES
+
+
+def _injects_config(global_opts: list[str], raw_tokens: list[str]) -> bool:
+    """Return whether this git invocation injects config that can execute commands.
+
+    Looks at ``-c key=value`` (key matched case-insensitively), any
+    ``--config-env``, and an env prefix such as ``GIT_CONFIG_PARAMETERS``.
+    Ordinary settings (``-c user.name=x``) are not injection.
+    """
+    for i, opt in enumerate(global_opts):
+        if opt.startswith("--config-env"):
+            return True
+        if opt == "-c" and i + 1 < len(global_opts):
+            if _is_exec_config_key(global_opts[i + 1].split("=", 1)[0]):
+                return True
+    for tok in raw_tokens:
+        if os.path.basename(tok.lstrip("\\")) == "git":
+            break
+        if _ENV_ASSIGN.match(tok) and _is_config_env(tok):
+            return True
+    return False
+
+
+def _sets_git_config_env(segment: str) -> bool:
+    """Return whether a segment persistently sets a config-injecting env var."""
+    tokens = _safe_split(segment)
+    if tokens and tokens[0] in ("export", "declare", "typeset"):
+        tokens = tokens[1:]
+    elif not tokens or not all(_ENV_ASSIGN.match(t) for t in tokens):
+        return False
+    return any(_is_config_env(t) for t in tokens)
+
+
+def _is_git_segment(segment: str) -> bool:
+    """Return whether the command a segment runs is a literal ``git``."""
+    tokens = _unwrap_prefix(_safe_split(segment))
+    return bool(tokens) and os.path.basename(tokens[0].lstrip("\\")) == "git"
 
 
 def _unresolved(target: str, cwd: str) -> DestructiveIntent:
@@ -535,6 +604,7 @@ def parse_destructive_command(command: str, cwd: str) -> list[DestructiveIntent]
     """
     intents: list[DestructiveIntent] = []
     unresolved = False
+    config_poisoned = False
     segments, quote_open = _scan_segments(command)
     if _DESTRUCTIVE_TEXT.search(command) and _is_opaque(command, segments, quote_open):
         intents.append(_unresolved("", cwd))
@@ -549,8 +619,13 @@ def parse_destructive_command(command: str, cwd: str) -> list[DestructiveIntent]
         if _sets_git_redirect(segment):
             unresolved = True
             continue
+        if _sets_git_config_env(segment):
+            config_poisoned = True
+            continue
         parsed = _parse_segment(segment, cwd)
         if not parsed and _SEGMENT_DESTRUCTIVE.search(segment) and not _is_benign_head(segment):
+            parsed = [_unresolved(segment, cwd)]
+        if config_poisoned and not parsed and _is_git_segment(segment):
             parsed = [_unresolved(segment, cwd)]
         if unresolved and parsed:
             parsed = [_unresolved(p.target, p.cwd) for p in parsed]

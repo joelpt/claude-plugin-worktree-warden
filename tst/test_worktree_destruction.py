@@ -289,6 +289,36 @@ class ParseTest(unittest.TestCase):
             kinds = {i.kind for i in wd.parse_destructive_command(cmd, "/r")}
             self.assertIn("unresolved_context", kinds, cmd)
 
+    def test_git_config_injection_fails_closed(self) -> None:
+        """Config that can execute commands is refused for any git subcommand."""
+        cases = (
+            "git -c Alias.b='br\"\"anch -D' b feat",
+            "git -c ALIAS.b=x b",
+            "git -c core.fsmonitor='x' status",
+            "git -c core.editor=x commit",
+            "git -c diff.external=x diff",
+            "git -c core.hooksPath=/tmp/h commit",
+            "git -c include.path=/tmp/f status",
+            "git -c includeIf.gitdir:/a.path=/tmp/f status",
+            "git --config-env=core.pager=P log",
+            "GIT_CONFIG_PARAMETERS=\"'alias.b=x'\" git b",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.b GIT_CONFIG_VALUE_0=x git b",
+            "env GIT_EXTERNAL_DIFF=x git diff",
+            "export GIT_CONFIG_COUNT=1 && git status",
+        )
+        for cmd in cases:
+            kinds = {i.kind for i in wd.parse_destructive_command(cmd, "/r")}
+            self.assertIn("unresolved_context", kinds, cmd)
+
+    def test_harmless_git_config_passes(self) -> None:
+        """Ordinary `-c` settings and non-config env prefixes stay allowed."""
+        for cmd in (
+            "git -c user.name=x -c core.quotepath=off commit -m m",
+            "git -c color.ui=always log",
+            "GIT_AUTHOR_NAME=x git commit -m m",
+        ):
+            self.assertEqual(wd.parse_destructive_command(cmd, "/r"), [], cmd)
+
     def test_destructive_text_in_benign_commands_passes(self) -> None:
         """Mentioning a destructive command in a message or search is not destructive."""
         for cmd in (
