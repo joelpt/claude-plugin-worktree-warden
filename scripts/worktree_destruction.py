@@ -45,8 +45,8 @@ head only prints or searches text (``echo``, ``grep``, ...).
 
 Known, PERMANENT, backstopped gap (deliberate -- see README's "PreToolUse
 destruction gate" section): `rm -rf <worktree>` on the worktree directory
-itself, destruction through a script the Bash call merely invokes, and
-`git -c alias.x=...` are not intercepted by this
+itself and destruction through a script the Bash call merely invokes are
+not intercepted by this
 module or by git's lock -- a locked worktree's files can still be deleted
 directly on disk, it is only the *admin record* that git refuses to drop. The
 Stop-hook WIP capture and the `recover`/`reconcile` audit are the sole
@@ -84,11 +84,22 @@ _GIT_REDIRECT_ENV = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"}
 _GIT_REDIRECT_OPTS = ("--git-dir", "--work-tree")
 _DYNAMIC_PATH_CHARS = ("$", "`", "*", "?", "[")
 
-# Heads whose arguments are data for destructive-looking text (``git`` itself
-# was already judged by the parser).
+# Read-only commands whose arguments are only data for destructive-looking
+# text. Nothing here may write a file or spawn a shell (no tee, sort -o,
+# uniq OUT, pagers).
 _BENIGN_HEADS = {
-    "git", "echo", "printf", "cat", "grep", "egrep", "fgrep", "rg", "ag",
-    "less", "more", "head", "tail", "man", "wc", "diff", "tee", "sort", "uniq",
+    "echo", "printf", "cat", "grep", "egrep", "fgrep", "rg", "ag",
+    "head", "tail", "wc",
+}
+
+# git subcommands that carry text as data and cannot run a branch/worktree
+# delete; any other subcommand (including a user-defined alias) is not benign.
+_BENIGN_GIT_SUBCOMMANDS = {
+    "commit", "log", "grep", "show", "diff", "status", "tag", "notes", "add",
+    "blame", "shortlog", "describe", "rev-parse", "rev-list", "stash",
+    # Modeled by the parser, whose empty result is authoritative (e.g. an
+    # unforced `worktree remove`, which git itself refuses on a dirty tree).
+    "branch", "worktree",
 }
 
 _OPAQUE_MARKERS =("$(", "`", "$'", '$"', "<(", ">(", "<<")
@@ -445,6 +456,8 @@ def _parse_segment(segment: str, cwd: str) -> list[DestructiveIntent]:
         return []
 
     rest, eff_cwd, global_opts = _strip_git_global_opts(tokens, cwd)
+    if _overrides_alias(global_opts):
+        return [_unresolved(segment, eff_cwd)]
     if rest and rest[0] == "worktree":
         intents = _parse_git_worktree(rest, eff_cwd)
     elif rest and rest[0] == "branch":
@@ -484,7 +497,18 @@ def _is_benign_head(segment: str) -> bool:
     tokens = _unwrap_prefix(_safe_split(segment))
     if not tokens:
         return True
-    return os.path.basename(tokens[0].lstrip("\\")) in _BENIGN_HEADS
+    if ">" in segment:
+        return False
+    head = os.path.basename(tokens[0].lstrip("\\"))
+    if head != "git":
+        return head in _BENIGN_HEADS
+    rest, _, opts = _strip_git_global_opts(tokens, "")
+    return not _overrides_alias(opts) and bool(rest) and rest[0] in _BENIGN_GIT_SUBCOMMANDS
+
+
+def _overrides_alias(global_opts: list[str]) -> bool:
+    """Return whether git global options define an alias for this invocation."""
+    return any("alias." in o or o.startswith("--config-env") for o in global_opts)
 
 
 def _unresolved(target: str, cwd: str) -> DestructiveIntent:

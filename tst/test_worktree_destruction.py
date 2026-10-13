@@ -272,6 +272,23 @@ class ParseTest(unittest.TestCase):
             kinds = {i.kind for i in wd.parse_destructive_command(cmd, "/r")}
             self.assertIn("unresolved_context", kinds, cmd)
 
+    def test_git_alias_and_write_capable_heads_fail_closed(self) -> None:
+        """Git aliases, write-capable commands and redirects cannot hide destructive text."""
+        cases = (
+            "git -c alias.b='branch -D' b feat",
+            "git -c alias.w='!git worktree remove -ff' w wt",
+            "git --config-env=alias.b=BR b feat",
+            "git rmb branch -D feat",
+            "printf '' | tee .git/worktrees/wt/gitdir",
+            "sort -o .git/worktrees/wt/gitdir /dev/null",
+            "uniq a .git/worktrees/wt/gitdir",
+            "echo x > .git/worktrees/wt/locked",
+            "less 'branch -D x'",
+        )
+        for cmd in cases:
+            kinds = {i.kind for i in wd.parse_destructive_command(cmd, "/r")}
+            self.assertIn("unresolved_context", kinds, cmd)
+
     def test_destructive_text_in_benign_commands_passes(self) -> None:
         """Mentioning a destructive command in a message or search is not destructive."""
         for cmd in (

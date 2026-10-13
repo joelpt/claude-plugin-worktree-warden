@@ -77,8 +77,11 @@ worktrees of the repo your current session belongs to — never cross-repo.
   known at run time.
   This is a text heuristic and can over-block.
 
+  A git invocation that defines an alias for itself (`git -c alias.x=... x`,
+  `--config-env`) is refused outright.
+
   **`rm -rf <worktree directory>` and destruction hidden behind a script the
-  Bash call merely invokes or `git -c alias.x=...`** remain a **known, PERMANENT,
+  Bash call merely invokes** remain a **known, PERMANENT,
   uncompensated bypass** — an unclosable static-parser gap, and git's own
   worktree lock does not close it either: locking only protects the admin
   *record* from `prune`, it does nothing to stop the worktree's files being
