@@ -39,6 +39,9 @@ the parser cannot model -- command or process substitution, heredocs, ANSI-C
 quoting, an unterminated quote, ``( )``/``{ }``/``if``/``for`` blocks, or a
 runner such as ``eval``, ``xargs``, ``find -exec`` or ``sh -c``. That is a
 text heuristic, so it can over-block; it never under-blocks the verbs above.
+A segment that looks destructive but whose command head is not a literal
+``git`` (``$VAR``, a wrapper's leftover flag value) is refused too, unless the
+head only prints or searches text (``echo``, ``grep``, ...).
 
 Known, PERMANENT, backstopped gap (deliberate -- see README's "PreToolUse
 destruction gate" section): `rm -rf <worktree>` on the worktree directory
@@ -81,7 +84,14 @@ _GIT_REDIRECT_ENV = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"}
 _GIT_REDIRECT_OPTS = ("--git-dir", "--work-tree")
 _DYNAMIC_PATH_CHARS = ("$", "`", "*", "?", "[")
 
-_OPAQUE_MARKERS = ("$(", "`", "$'", '$"', "<(", ">(", "<<")
+# Heads whose arguments are data for destructive-looking text (``git`` itself
+# was already judged by the parser).
+_BENIGN_HEADS = {
+    "git", "echo", "printf", "cat", "grep", "egrep", "fgrep", "rg", "ag",
+    "less", "more", "head", "tail", "man", "wc", "diff", "tee", "sort", "uniq",
+}
+
+_OPAQUE_MARKERS =("$(", "`", "$'", '$"', "<(", ">(", "<<")
 _SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
 _OPAQUE_HEADS = {
     "eval", "xargs", "parallel", "source", ".", "if", "then", "else", "elif",
@@ -91,6 +101,12 @@ _OPAQUE_HEADS = {
 
 # Text that looks like a gated destructive operation anywhere in the command,
 # including inside quotes or substitutions the segment parser cannot see into.
+_SEGMENT_DESTRUCTIVE = re.compile(
+    r"\bbranch\b.*(\s-[A-Za-z]*[dD]|\s--de)"
+    r"|\bworktree\b.*\b(remove|unlock)\b"
+    r"|\.git/worktrees|worktrees/[^/\s]+/locked",
+    re.DOTALL,
+)
 _DESTRUCTIVE_TEXT = re.compile(
     r"\bgit\b.*\bbranch\b.*(\s-[A-Za-z]*[dD]|\s--de)"
     r"|\bgit\b.*\bworktree\b.*\b(remove|unlock)\b"
@@ -457,6 +473,20 @@ def _is_expanded(target: str) -> bool:
     return target.startswith("~") or any(c in target for c in (*_DYNAMIC_PATH_CHARS, "{"))
 
 
+def _is_benign_head(segment: str) -> bool:
+    """Return whether destructive-looking text in ``segment`` is only data.
+
+    True when the command that runs is a literal ``git`` (the parser already
+    judged it) or a command that merely prints or searches text. Anything else
+    -- ``$VAR``, a wrapper's leftover flag value, an unknown program -- might be
+    the destructive command itself, so the caller fails closed.
+    """
+    tokens = _unwrap_prefix(_safe_split(segment))
+    if not tokens:
+        return True
+    return os.path.basename(tokens[0].lstrip("\\")) in _BENIGN_HEADS
+
+
 def _unresolved(target: str, cwd: str) -> DestructiveIntent:
     """Build the intent for a destructive command whose repo/cwd is unknowable."""
     return DestructiveIntent("unresolved_context", target, cwd, False)
@@ -496,6 +526,8 @@ def parse_destructive_command(command: str, cwd: str) -> list[DestructiveIntent]
             unresolved = True
             continue
         parsed = _parse_segment(segment, cwd)
+        if not parsed and _SEGMENT_DESTRUCTIVE.search(segment) and not _is_benign_head(segment):
+            parsed = [_unresolved(segment, cwd)]
         if unresolved and parsed:
             parsed = [_unresolved(p.target, p.cwd) for p in parsed]
         intents.extend(parsed)

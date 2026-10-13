@@ -10,6 +10,7 @@ All notable changes to this project will be documented in this file.
   A command whose text contains `git branch -d/-D`, `git worktree remove|unlock` or a `.git/worktrees` path, together with command or process substitution, heredocs, ANSI-C quoting, an unterminated quote, `( )`/`{ }`/`if`/`for` blocks, `eval`, `xargs`, `find -exec` or `sh -c`, is now refused (`unresolved_context`).
   This closes the previously documented `sh -c`/`xargs`/`eval`/substitution gap for those verbs; it is a text heuristic and can over-block.
   `builtin cd`/`command cd` are tracked like `cd`, wrapper flags (`env -i`) no longer hide the command, and git-redirecting env vars are detected anywhere before `git`.
+  A segment that looks destructive but whose command is not a literal `git` (a `$VAR` head, a wrapper's leftover flag value as in `sudo -u root git ...` or `nice -n 5 git ...`) is refused unless the command only prints or searches text (`echo`, `grep`, `cat`, ...).
   A gated target the shell would expand first (`$VAR`, `{a,b}`, globs, `~`) is refused instead of being looked up literally.
   Supersedes the "permanent gap" wording in the entry below for those shapes; `rm -rf <worktree>`, indirect scripts and `git -c alias.x=...` remain uncovered.
 - **Destruction gate parser hardening (security review follow-up).**

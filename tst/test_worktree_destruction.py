@@ -260,6 +260,29 @@ class ParseTest(unittest.TestCase):
             kinds = {i.kind for i in wd.parse_destructive_command(cmd, "/r")}
             self.assertEqual(kinds, {"unresolved_context"}, cmd)
 
+    def test_unresolvable_head_with_destructive_text_fails_closed(self) -> None:
+        """If the command head is not a literal git, destructive text is refused."""
+        cases = (
+            "G=git; $G branch -D x",
+            "sudo -u root git branch -D x",
+            "nice -n 5 git branch -D x",
+            "doas -u root git worktree remove -ff wt",
+        )
+        for cmd in cases:
+            kinds = {i.kind for i in wd.parse_destructive_command(cmd, "/r")}
+            self.assertIn("unresolved_context", kinds, cmd)
+
+    def test_destructive_text_in_benign_commands_passes(self) -> None:
+        """Mentioning a destructive command in a message or search is not destructive."""
+        for cmd in (
+            'git commit -m "fix: git branch -D handling"',
+            'echo "git branch -D x"',
+            "grep -r 'git branch -D' .",
+            "git log --grep='git branch -D'",
+            "printf '%s' 'git worktree remove -ff wt'",
+        ):
+            self.assertEqual(wd.parse_destructive_command(cmd, "/r"), [], cmd)
+
     def test_builtin_and_command_cd_are_tracked(self) -> None:
         """`builtin cd` / `command cd` move the cwd like a bare `cd`."""
         for cmd in ("builtin cd /o && git branch -D f", "command cd /o && git branch -D f"):
