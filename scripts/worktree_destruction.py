@@ -27,6 +27,12 @@ the shapes above are what an agent reaches for once git refuses.
 re-verifies the worktree's *current* lock state and falls back to the
 clean+landed check below whenever it finds the worktree unlocked.
 
+A destructive command whose repository or working directory the gate cannot
+determine statically -- ``GIT_DIR``/``--git-dir``/``--work-tree`` overrides,
+``cd $VAR``, ``cd -``, ``popd`` or a subshell ``cd`` followed by a gated
+command -- is blocked outright (``unresolved_context``) rather than judged
+against the wrong repo.
+
 Known, PERMANENT, backstopped gap (deliberate -- see README's "PreToolUse
 destruction gate" section): `rm -rf <worktree>` on the worktree directory
 itself and any Bash-hidden or indirect destruction (`xargs`, `sh -c '...'`,
@@ -56,8 +62,17 @@ import worktree_gate as gate
 NOISE_PATH = ".claude/settings.local.json"
 
 IntentKind = Literal[
-    "branch_delete", "worktree_remove", "worktree_unlock", "worktree_admin_rm"
+    "branch_delete",
+    "worktree_remove",
+    "worktree_unlock",
+    "worktree_admin_rm",
+    "unresolved_context",
 ]
+
+# Environment variables that redirect which repository git operates on.
+_GIT_REDIRECT_ENV = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"}
+_GIT_REDIRECT_OPTS = ("--git-dir", "--work-tree")
+_DYNAMIC_PATH_CHARS = ("$", "`", "*", "?", "[")
 
 # Matches a path that points into a repo's linked-worktree admin area
 # (`<common-dir>/worktrees/<name>[/locked]`); deleting it drops git's lock.
@@ -116,12 +131,36 @@ class Verdict:
 
 def _split_segments(command: str) -> list[str]:
     """Split a compound command on shell operators into runnable segments."""
-    segments = [command]
-    for sep in _SEGMENT_SEPARATORS:
-        nxt: list[str] = []
-        for seg in segments:
-            nxt.extend(seg.split(sep))
-        segments = nxt
+    segments: list[str] = []
+    buf: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote[-1]:
+                quote = ""
+            elif ch == "\\" and quote in ('"', "$'") and i + 1 < len(command):
+                i += 1
+                buf.append(command[i])
+        elif ch == "\\" and i + 1 < len(command):
+            buf.append(ch + command[i + 1])
+            i += 1
+        elif ch in "'\"":
+            # bash ANSI-C quoting ($'...') honors backslash escapes, unlike '...'.
+            quote = "$'" if ch == "'" and command[i - 1 : i] == "$" else ch
+            buf.append(ch)
+        else:
+            sep = next((s for s in _SEGMENT_SEPARATORS if command.startswith(s, i)), "")
+            if sep:
+                segments.append("".join(buf))
+                buf = []
+                i += len(sep) - 1
+            else:
+                buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
     return [s.strip() for s in segments if s.strip()]
 
 
@@ -136,8 +175,10 @@ def _safe_split(segment: str) -> list[str]:
             return segment.split()
 
 
-def _strip_git_global_opts(tokens: list[str], cwd: str) -> tuple[list[str], str]:
-    """Drop leading ``git`` global options, returning (rest, effective_cwd).
+def _strip_git_global_opts(
+    tokens: list[str], cwd: str
+) -> tuple[list[str], str, list[str]]:
+    """Drop leading ``git`` global options, returning (rest, effective_cwd, opts).
 
     Honors ``-C <dir>`` so the command's real working directory is used for the
     git lookups; other global options that take a value are skipped so the
@@ -163,7 +204,7 @@ def _strip_git_global_opts(tokens: list[str], cwd: str) -> tuple[list[str], str]
             i += 2
             continue
         i += 1
-    return tokens[i:], eff_cwd
+    return tokens[i:], eff_cwd, tokens[1:i]
 
 
 def _operands(args: list[str]) -> list[str]:
@@ -258,15 +299,52 @@ def _force_count(args: list[str]) -> int:
     return count
 
 
-def _cd_target(segment: str, cwd: str) -> str | None:
-    """Return the directory a lone ``cd <dir>`` segment moves to, else None."""
+def _cwd_change(segment: str, cwd: str) -> tuple[bool, str | None]:
+    """Classify a segment's effect on the working directory.
+
+    Returns:
+        ``(False, None)`` when the segment does not change directory;
+        ``(True, new_cwd)`` for a resolvable ``cd``/``pushd``; and
+        ``(True, None)`` when the new directory cannot be known statically
+        (``cd -``, ``popd``, ``$VAR``/backtick/glob targets, or a ``cd`` inside
+        a subshell whose scope ends before the next segment).
+    """
+    scoped = segment.lstrip().startswith(("(", "{"))
+    tokens = _safe_split(segment.lstrip("({ \t"))
+    if not tokens or tokens[0] not in ("cd", "pushd", "popd"):
+        return False, None
+    if scoped or tokens[0] == "popd":
+        return True, None
+    dirs = [t for t in tokens[1:] if not t.startswith("-") or t == "-"]
+    target = dirs[0] if dirs else "~"
+    if target == "-" or any(c in target for c in _DYNAMIC_PATH_CHARS):
+        return True, None
+    target = os.path.expanduser(target)
+    return True, target if os.path.isabs(target) else os.path.normpath(os.path.join(cwd, target))
+
+
+def _sets_git_redirect(segment: str) -> bool:
+    """Return whether a segment persistently sets a git-redirecting env var."""
     tokens = _safe_split(segment)
-    if not tokens or tokens[0] != "cd":
-        return None
-    dirs = [t for t in tokens[1:] if not t.startswith("-")]
-    if not dirs:
-        return None
-    return dirs[0] if os.path.isabs(dirs[0]) else os.path.normpath(os.path.join(cwd, dirs[0]))
+    if tokens and tokens[0] in ("export", "declare", "typeset"):
+        tokens = tokens[1:]
+    elif not tokens or not all(_ENV_ASSIGN.match(t) for t in tokens):
+        return False
+    return any(t.split("=", 1)[0] in _GIT_REDIRECT_ENV for t in tokens)
+
+
+def _redirects_git(raw_tokens: list[str], git_global_opts: list[str]) -> bool:
+    """Return whether a git command's env prefix or global options redirect its repo."""
+    for tok in raw_tokens:
+        if not _ENV_ASSIGN.match(tok) and os.path.basename(tok) not in _WRAPPERS:
+            break
+        if tok.split("=", 1)[0] in _GIT_REDIRECT_ENV:
+            return True
+    return any(
+        o == opt or o.startswith(opt + "=")
+        for o in git_global_opts
+        for opt in _GIT_REDIRECT_OPTS
+    )
 
 
 def _parse_git_worktree(rest: list[str], cwd: str) -> list[DestructiveIntent]:
@@ -286,7 +364,8 @@ def _parse_git_worktree(rest: list[str], cwd: str) -> list[DestructiveIntent]:
 
 def _parse_segment(segment: str, cwd: str) -> list[DestructiveIntent]:
     """Parse one command segment into zero or more destructive intents."""
-    tokens = _unwrap_prefix(_safe_split(segment))
+    raw = _safe_split(segment)
+    tokens = _unwrap_prefix(raw)
     if not tokens:
         return []
     cmd = os.path.basename(tokens[0].lstrip("\\"))
@@ -299,20 +378,31 @@ def _parse_segment(segment: str, cwd: str) -> list[DestructiveIntent]:
     if cmd != "git":
         return []
 
-    rest, eff_cwd = _strip_git_global_opts(tokens, cwd)
+    rest, eff_cwd, global_opts = _strip_git_global_opts(tokens, cwd)
     if rest and rest[0] == "worktree":
-        return _parse_git_worktree(rest, eff_cwd)
-    if not rest or rest[0] != "branch":
+        intents = _parse_git_worktree(rest, eff_cwd)
+    elif rest and rest[0] == "branch":
+        args = rest[1:]
+        is_delete, forced = _branch_delete_mode(args)
+        # `git branch -D a b c` deletes every named branch; gate each.
+        intents = (
+            [
+                DestructiveIntent("branch_delete", name, eff_cwd, forced)
+                for name in _operands(args)
+            ]
+            if is_delete
+            else []
+        )
+    else:
         return []
-    args = rest[1:]
-    is_delete, forced = _branch_delete_mode(args)
-    if not is_delete:
-        return []
-    # `git branch -D a b c` deletes every named branch; gate each.
-    return [
-        DestructiveIntent("branch_delete", name, eff_cwd, forced)
-        for name in _operands(args)
-    ]
+    if intents and _redirects_git(raw, global_opts):
+        return [_unresolved(intents[0].target, eff_cwd)]
+    return intents
+
+
+def _unresolved(target: str, cwd: str) -> DestructiveIntent:
+    """Build the intent for a destructive command whose repo/cwd is unknowable."""
+    return DestructiveIntent("unresolved_context", target, cwd, False)
 
 
 def parse_destructive_command(command: str, cwd: str) -> list[DestructiveIntent]:
@@ -333,12 +423,22 @@ def parse_destructive_command(command: str, cwd: str) -> list[DestructiveIntent]
 
     """
     intents: list[DestructiveIntent] = []
+    unresolved = False
     for segment in _split_segments(command):
-        moved = _cd_target(segment, cwd)
-        if moved is not None:
-            cwd = moved
+        is_cd, moved = _cwd_change(segment, cwd)
+        if is_cd:
+            if moved is None:
+                unresolved = True
+            else:
+                cwd = moved
             continue
-        intents.extend(_parse_segment(segment, cwd))
+        if _sets_git_redirect(segment):
+            unresolved = True
+            continue
+        parsed = _parse_segment(segment, cwd)
+        if unresolved and parsed:
+            parsed = [_unresolved(p.target, p.cwd) for p in parsed]
+        intents.extend(parsed)
     return intents
 
 
@@ -563,6 +663,16 @@ def _evaluate_intent(intent: DestructiveIntent) -> Verdict:
     repo = top if rc == 0 else intent.cwd
     if intent.kind == "branch_delete":
         return _evaluate_branch(repo, intent.target)
+    if intent.kind == "unresolved_context":
+        return Verdict(
+            False,
+            "destructive git command runs in a directory or repository the gate "
+            "cannot determine (git-dir override, `cd $VAR`, `cd -`, `popd` or a subshell `cd`)",
+            recovery=(
+                "Re-run it with a literal path (`git -C <dir> …`) and no "
+                "GIT_DIR/--git-dir override, or use `/worktree-warden:finish-worktree`."
+            ),
+        )
     if intent.kind == "worktree_unlock":
         return Verdict(
             False,

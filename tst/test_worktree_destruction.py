@@ -165,6 +165,59 @@ class ParseTest(unittest.TestCase):
         )
         self.assertEqual([i.target for i in intents], ["-weird"])
 
+    def test_git_dir_override_is_unresolved_context(self) -> None:
+        """A redirected git dir means the gate cannot know which repo is hit."""
+        cases = (
+            "git --git-dir=/o/.git branch -D feat",
+            "git --git-dir /o/.git branch -D feat",
+            "git --work-tree=/o branch -D feat",
+            "GIT_DIR=/o/.git git branch -D feat",
+            "env GIT_WORK_TREE=/o git worktree unlock wt",
+            "export GIT_DIR=/o/.git && git branch -D feat",
+        )
+        for cmd in cases:
+            intents = wd.parse_destructive_command(cmd, "/r")
+            self.assertTrue(intents, cmd)
+            self.assertEqual({i.kind for i in intents}, {"unresolved_context"}, cmd)
+
+    def test_unresolvable_cd_poisons_later_destructive_segments(self) -> None:
+        """`cd $VAR`, `cd -`, `popd` and subshell `cd` leave the cwd unknowable."""
+        cases = (
+            "cd $WT && git branch -D feat",
+            "cd - && git branch -D feat",
+            "cd `pwd`/x && git branch -D feat",
+            "popd && git branch -D feat",
+            "(cd /o && true) && git branch -D feat",
+        )
+        for cmd in cases:
+            intents = wd.parse_destructive_command(cmd, "/r")
+            self.assertEqual({i.kind for i in intents}, {"unresolved_context"}, cmd)
+
+    def test_pushd_and_tilde_cd_are_tracked(self) -> None:
+        """`pushd <dir>` moves the cwd like `cd`; `~` expands to the home dir."""
+        intents = wd.parse_destructive_command("pushd /o && git branch -D f", "/r")
+        self.assertEqual([(i.kind, i.cwd) for i in intents], [("branch_delete", "/o")])
+        intents = wd.parse_destructive_command("cd ~ && git branch -D f", "/r")
+        self.assertEqual(intents[0].cwd, str(Path("~").expanduser()))
+
+    def test_quoted_separators_do_not_split_segments(self) -> None:
+        """A `;` or `&&` inside quotes belongs to one argument, not a new segment."""
+        intents = wd.parse_destructive_command('git branch -D "feat;x"', "/r")
+        self.assertEqual([i.target for i in intents], ["feat;x"])
+        intents = wd.parse_destructive_command("git branch -D 'a && b'", "/r")
+        self.assertEqual([i.target for i in intents], ["a && b"])
+
+    def test_ansi_c_quoting_does_not_desync_quote_state(self) -> None:
+        """`$'\\''` is one escaped quote; a later separator still splits."""
+        cmd = "echo $'\\'' ; git branch -D feat ; echo '"
+        intents = wd.parse_destructive_command(cmd, "/r")
+        self.assertEqual([i.target for i in intents], ["feat"])
+
+    def test_unresolved_context_verdict_blocks(self) -> None:
+        """The evaluator refuses an unresolved-context intent outright."""
+        verdict = wd.evaluate_command("cd $WT && git branch -D feat", "/tmp")
+        self.assertFalse(verdict.allow)
+
     def test_branch_delete_multiple_targets(self) -> None:
         """`git branch -D a b c` deletes every named branch; gate each."""
         intents = wd.parse_destructive_command("git branch -D a b c", "/r")

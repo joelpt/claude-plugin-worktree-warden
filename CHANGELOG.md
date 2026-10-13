@@ -6,6 +6,13 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Destruction gate parser hardening (security review follow-up).**
+  `git branch` delete detection now understands clustered short flags (`-fD`, `-rd`) and abbreviated long options (`--del`, `--forc`), and `-d` plus a force flag counts as forced.
+  Operands after a bare `--` are gated targets, and separators inside quotes (including `$'...'` ANSI-C quoting) no longer split a command into segments.
+  An unreadable worktree status now blocks `git branch -D` instead of being treated as clean.
+  A destructive command whose repository or directory cannot be determined statically is refused: `GIT_DIR`/`--git-dir`/`--work-tree` overrides, and `cd $VAR`, `cd -`, `popd` or a subshell `cd` before a gated command.
+  `pushd` and `cd ~` are now tracked like `cd`.
+  `sh -c`, `xargs` and `eval` remain the documented, backstopped gap.
 - **Destruction gate again blocks the `git worktree remove` / `unlock` lock bypasses.** #26 narrowed the
   gate to `git branch -d/-D` and left `git worktree lock` as the only protection, but git's own error for a
   locked worktree advertises `remove -f -f`, and `git worktree unlock X && git worktree remove --force X`
