@@ -211,7 +211,60 @@ class ParseTest(unittest.TestCase):
         """`$'\\''` is one escaped quote; a later separator still splits."""
         cmd = "echo $'\\'' ; git branch -D feat ; echo '"
         intents = wd.parse_destructive_command(cmd, "/r")
-        self.assertEqual([i.target for i in intents], ["feat"])
+        self.assertIn(("branch_delete", "feat"), [(i.kind, i.target) for i in intents])
+
+    def test_opaque_constructs_with_destructive_verb_fail_closed(self) -> None:
+        """Constructs the parser cannot model are refused when a destructive verb appears."""
+        cases = (
+            "bash -c 'git branch -D feat'",
+            'sh -c "git worktree remove -ff wt"',
+            "eval 'git branch -D feat'",
+            "echo $(git branch -D feat)",
+            "echo `git branch -D feat`",
+            "echo feat | xargs git branch -D",
+            "find . -exec git worktree unlock {} +",
+            "if true; then git branch -D feat; fi",
+            "{ git branch -D feat; }",
+            "(git branch -D feat)",
+            "echo ' ; git branch -D feat",
+            "cat <(git branch -D feat)",
+            "bash -c 'rm -rf .git/worktrees/x/locked'",
+            "env -i GIT_DIR=/o git branch -D feat",
+        )
+        for cmd in cases:
+            kinds = {i.kind for i in wd.parse_destructive_command(cmd, "/r")}
+            self.assertIn("unresolved_context", kinds, cmd)
+
+    def test_opaque_constructs_without_destructive_verb_pass(self) -> None:
+        """Opaque constructs alone, or plain destructive-free git use, stay allowed."""
+        for cmd in (
+            "echo $(date)",
+            "bash -c 'ls -la'",
+            "git branch --list $(echo x)",
+            "if true; then echo hi; fi",
+            "git worktree list",
+        ):
+            self.assertEqual(wd.parse_destructive_command(cmd, "/r"), [], cmd)
+
+    def test_expansion_in_target_fails_closed(self) -> None:
+        """A target the shell will expand before git sees it cannot be judged literally."""
+        cases = (
+            "git branch -D $B",
+            "git branch -D ${B}",
+            "git branch -D {feat,other}",
+            "git branch -D feat*",
+            "git branch -D ~feat",
+            "git worktree remove -f $WT",
+        )
+        for cmd in cases:
+            kinds = {i.kind for i in wd.parse_destructive_command(cmd, "/r")}
+            self.assertEqual(kinds, {"unresolved_context"}, cmd)
+
+    def test_builtin_and_command_cd_are_tracked(self) -> None:
+        """`builtin cd` / `command cd` move the cwd like a bare `cd`."""
+        for cmd in ("builtin cd /o && git branch -D f", "command cd /o && git branch -D f"):
+            intents = wd.parse_destructive_command(cmd, "/r")
+            self.assertEqual([(i.kind, i.cwd) for i in intents], [("branch_delete", "/o")], cmd)
 
     def test_unresolved_context_verdict_blocks(self) -> None:
         """The evaluator refuses an unresolved-context intent outright."""

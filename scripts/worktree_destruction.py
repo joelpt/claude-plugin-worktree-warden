@@ -33,10 +33,17 @@ determine statically -- ``GIT_DIR``/``--git-dir``/``--work-tree`` overrides,
 command -- is blocked outright (``unresolved_context``) rather than judged
 against the wrong repo.
 
+The same applies when the command text *looks* destructive (``git branch -D``,
+``git worktree remove|unlock``, ``.git/worktrees``) but also uses a construct
+the parser cannot model -- command or process substitution, heredocs, ANSI-C
+quoting, an unterminated quote, ``( )``/``{ }``/``if``/``for`` blocks, or a
+runner such as ``eval``, ``xargs``, ``find -exec`` or ``sh -c``. That is a
+text heuristic, so it can over-block; it never under-blocks the verbs above.
+
 Known, PERMANENT, backstopped gap (deliberate -- see README's "PreToolUse
 destruction gate" section): `rm -rf <worktree>` on the worktree directory
-itself and any Bash-hidden or indirect destruction (`xargs`, `sh -c '...'`,
-`eval`, command substitution, `git -c alias.x=...`) are not intercepted by this
+itself, destruction through a script the Bash call merely invokes, and
+`git -c alias.x=...` are not intercepted by this
 module or by git's lock -- a locked worktree's files can still be deleted
 directly on disk, it is only the *admin record* that git refuses to drop. The
 Stop-hook WIP capture and the `recover`/`reconcile` audit are the sole
@@ -73,6 +80,23 @@ IntentKind = Literal[
 _GIT_REDIRECT_ENV = {"GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"}
 _GIT_REDIRECT_OPTS = ("--git-dir", "--work-tree")
 _DYNAMIC_PATH_CHARS = ("$", "`", "*", "?", "[")
+
+_OPAQUE_MARKERS = ("$(", "`", "$'", '$"', "<(", ">(", "<<")
+_SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
+_OPAQUE_HEADS = {
+    "eval", "xargs", "parallel", "source", ".", "if", "then", "else", "elif",
+    "fi", "do", "done", "while", "until", "for", "case", "esac", "select",
+    "function",
+}
+
+# Text that looks like a gated destructive operation anywhere in the command,
+# including inside quotes or substitutions the segment parser cannot see into.
+_DESTRUCTIVE_TEXT = re.compile(
+    r"\bgit\b.*\bbranch\b.*(\s-[A-Za-z]*[dD]|\s--de)"
+    r"|\bgit\b.*\bworktree\b.*\b(remove|unlock)\b"
+    r"|\.git/worktrees|worktrees/[^/\s]+/locked",
+    re.DOTALL,
+)
 
 # Matches a path that points into a repo's linked-worktree admin area
 # (`<common-dir>/worktrees/<name>[/locked]`); deleting it drops git's lock.
@@ -129,8 +153,8 @@ class Verdict:
     recovery: str = ""
 
 
-def _split_segments(command: str) -> list[str]:
-    """Split a compound command on shell operators into runnable segments."""
+def _scan_segments(command: str) -> tuple[list[str], bool]:
+    """Split on unquoted shell operators; also report whether a quote was left open."""
     segments: list[str] = []
     buf: list[str] = []
     quote = ""
@@ -161,7 +185,31 @@ def _split_segments(command: str) -> list[str]:
                 buf.append(ch)
         i += 1
     segments.append("".join(buf))
-    return [s.strip() for s in segments if s.strip()]
+    return [s.strip() for s in segments if s.strip()], bool(quote)
+
+
+def _is_opaque(command: str, segments: list[str], quote_open: bool) -> bool:
+    """Return whether the command uses a construct this parser cannot model.
+
+    Covers substitution, process substitution, heredocs, ANSI-C quoting, an
+    unterminated quote, grouping/control-flow keywords, and command runners
+    (``eval``, ``xargs``, ``find -exec``, ``sh -c``) that execute text the
+    segment splitter never sees as its own command.
+    """
+    if quote_open or any(m in command for m in _OPAQUE_MARKERS):
+        return True
+    for seg in segments:
+        if seg.startswith(("(", "{")):
+            return True
+        tokens = _unwrap_prefix(_safe_split(seg))
+        if not tokens:
+            continue
+        head = os.path.basename(tokens[0].lstrip("\\"))
+        if head in _OPAQUE_HEADS or (head in _SHELLS and "-c" in tokens):
+            return True
+        if "-exec" in tokens or "-execdir" in tokens:
+            return True
+    return False
 
 
 def _safe_split(segment: str) -> list[str]:
@@ -275,6 +323,8 @@ def _unwrap_prefix(tokens: list[str]) -> list[str]:
             continue
         if os.path.basename(tok.lstrip("\\")) in _WRAPPERS:
             i += 1
+            while i < len(tokens) and tokens[i].startswith("-"):
+                i += 1
             continue
         break
     return tokens[i:]
@@ -310,7 +360,7 @@ def _cwd_change(segment: str, cwd: str) -> tuple[bool, str | None]:
         a subshell whose scope ends before the next segment).
     """
     scoped = segment.lstrip().startswith(("(", "{"))
-    tokens = _safe_split(segment.lstrip("({ \t"))
+    tokens = _unwrap_prefix(_safe_split(segment.lstrip("({ \t")))
     if not tokens or tokens[0] not in ("cd", "pushd", "popd"):
         return False, None
     if scoped or tokens[0] == "popd":
@@ -336,9 +386,9 @@ def _sets_git_redirect(segment: str) -> bool:
 def _redirects_git(raw_tokens: list[str], git_global_opts: list[str]) -> bool:
     """Return whether a git command's env prefix or global options redirect its repo."""
     for tok in raw_tokens:
-        if not _ENV_ASSIGN.match(tok) and os.path.basename(tok) not in _WRAPPERS:
+        if os.path.basename(tok.lstrip("\\")) == "git":
             break
-        if tok.split("=", 1)[0] in _GIT_REDIRECT_ENV:
+        if _ENV_ASSIGN.match(tok) and tok.split("=", 1)[0] in _GIT_REDIRECT_ENV:
             return True
     return any(
         o == opt or o.startswith(opt + "=")
@@ -395,9 +445,16 @@ def _parse_segment(segment: str, cwd: str) -> list[DestructiveIntent]:
         )
     else:
         return []
-    if intents and _redirects_git(raw, global_opts):
+    if intents and (
+        _redirects_git(raw, global_opts) or any(_is_expanded(i.target) for i in intents)
+    ):
         return [_unresolved(intents[0].target, eff_cwd)]
     return intents
+
+
+def _is_expanded(target: str) -> bool:
+    """Return whether the shell would expand ``target`` before git sees it."""
+    return target.startswith("~") or any(c in target for c in (*_DYNAMIC_PATH_CHARS, "{"))
 
 
 def _unresolved(target: str, cwd: str) -> DestructiveIntent:
@@ -424,7 +481,10 @@ def parse_destructive_command(command: str, cwd: str) -> list[DestructiveIntent]
     """
     intents: list[DestructiveIntent] = []
     unresolved = False
-    for segment in _split_segments(command):
+    segments, quote_open = _scan_segments(command)
+    if _DESTRUCTIVE_TEXT.search(command) and _is_opaque(command, segments, quote_open):
+        intents.append(_unresolved("", cwd))
+    for segment in segments:
         is_cd, moved = _cwd_change(segment, cwd)
         if is_cd:
             if moved is None:

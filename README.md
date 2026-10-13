@@ -69,9 +69,16 @@ worktrees of the repo your current session belongs to — never cross-repo.
   the gate: that hook fails open, and an `ExitWorktree` remove still relies on
   it (re-verified against the live lock state).
 
-  **`rm -rf <worktree directory>` and any Bash-hidden/indirect destruction**
-  (`xargs`, `sh -c '...'`, `eval`, command substitution, `git -c alias.x=...`,
-  a script the Bash call merely invokes) remain a **known, PERMANENT,
+  A command whose text contains a destructive verb (`git branch -D`,
+  `git worktree remove|unlock`, `.git/worktrees`) *and* a construct the parser
+  cannot model (`sh -c`, `xargs`, `eval`, `find -exec`, command substitution,
+  heredocs, `if`/`{ }`/`( )` blocks, an unterminated quote) is refused, as is a
+  `GIT_DIR`/`--git-dir`/`--work-tree` override or a `cd` whose target is only
+  known at run time.
+  This is a text heuristic and can over-block.
+
+  **`rm -rf <worktree directory>` and destruction hidden behind a script the
+  Bash call merely invokes or `git -c alias.x=...`** remain a **known, PERMANENT,
   uncompensated bypass** — an unclosable static-parser gap, and git's own
   worktree lock does not close it either: locking only protects the admin
   *record* from `prune`, it does nothing to stop the worktree's files being

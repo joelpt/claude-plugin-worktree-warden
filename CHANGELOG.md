@@ -6,6 +6,12 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Destruction gate refuses destructive verbs hidden behind constructs the parser cannot model.**
+  A command whose text contains `git branch -d/-D`, `git worktree remove|unlock` or a `.git/worktrees` path, together with command or process substitution, heredocs, ANSI-C quoting, an unterminated quote, `( )`/`{ }`/`if`/`for` blocks, `eval`, `xargs`, `find -exec` or `sh -c`, is now refused (`unresolved_context`).
+  This closes the previously documented `sh -c`/`xargs`/`eval`/substitution gap for those verbs; it is a text heuristic and can over-block.
+  `builtin cd`/`command cd` are tracked like `cd`, wrapper flags (`env -i`) no longer hide the command, and git-redirecting env vars are detected anywhere before `git`.
+  A gated target the shell would expand first (`$VAR`, `{a,b}`, globs, `~`) is refused instead of being looked up literally.
+  Supersedes the "permanent gap" wording in the entry below for those shapes; `rm -rf <worktree>`, indirect scripts and `git -c alias.x=...` remain uncovered.
 - **Destruction gate parser hardening (security review follow-up).**
   `git branch` delete detection now understands clustered short flags (`-fD`, `-rd`) and abbreviated long options (`--del`, `--forc`), and `-d` plus a force flag counts as forced.
   Operands after a bare `--` are gated targets, and separators inside quotes (including `$'...'` ANSI-C quoting) no longer split a command into segments.
