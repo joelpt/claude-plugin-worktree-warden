@@ -1,5 +1,6 @@
 ---
 name: request-exception
+description: Open a timed exception to edit the main checkout when the gate blocks.
 user-invocable: false
 ---
 

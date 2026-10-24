@@ -1,5 +1,6 @@
 ---
 name: finish-exception
+description: Close the active main-checkout exception and re-gate main edits.
 user-invocable: false
 ---
 
