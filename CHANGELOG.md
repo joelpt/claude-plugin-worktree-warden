@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Stand-down registry owner names are validated.** `register` rejects an owner outside
+  `[A-Za-z0-9._-]{1,64}` and reads drop claims whose owner key fails that pattern, so a hand-edited
+  registry cannot inject tabs or newlines into the tab-separated audit log.
+
 ### Added
 
 - **Stand-down registry: a session-scoped, multi-owner way for any plugin to switch warden off (Release A).**

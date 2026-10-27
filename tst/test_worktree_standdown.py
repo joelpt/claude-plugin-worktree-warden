@@ -380,6 +380,20 @@ class StandDownForTest(RegistryCase):
     def test_no_claim_is_false_without_audit(self) -> None:
         self.assertFalse(sd.stand_down_for("h", "s1", self.repo))
 
+    def test_forged_owner_in_registry_is_dropped_and_never_audited(self) -> None:
+        pid = self.spawn().pid
+        sd.register("s1", "jack", "r", pid=pid, cwd=self.repo)
+        data = json.loads(self.data.read_text())
+        claims = data["sessions"]["s1"]["claims"]
+        claims["x\n2026-01-01T00:00:00Z\tstanddown\tFORGED"] = dict(claims["jack"])
+        self.data.write_text(json.dumps(data))
+        self.assertEqual(sd.active_claims("s1", self.repo), {"jack": "r"})
+
+    def test_register_rejects_unsafe_owner(self) -> None:
+        for owner in ("a b", "x\ny", "t\tt", "a" * 65, "é"):
+            with self.assertRaises(RuntimeError):
+                sd.register("s1", owner, "r", pid=self.spawn().pid, cwd=self.repo)
+
 
 if __name__ == "__main__":
     unittest.main()

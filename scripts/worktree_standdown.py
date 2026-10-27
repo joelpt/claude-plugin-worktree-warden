@@ -30,6 +30,7 @@ import argparse
 import fcntl
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -45,6 +46,7 @@ _PS_TIMEOUT_S = 5
 _GIT_TIMEOUT_S = 10
 _MAX_ANCESTOR_DEPTH = 64
 _AUDIT_REASON_MAX = 200
+_OWNER_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 def canonical_common_dir(cwd: str | os.PathLike[str] | None = None) -> str:
@@ -150,7 +152,11 @@ def _valid_claims(sessions: dict[str, dict[str, object]], session_id: str) -> di
     claims = entry.get("claims") if isinstance(entry, dict) else None
     if not isinstance(claims, dict):
         return {}
-    return {owner: claim for owner, claim in claims.items() if _claim_valid(claim)}
+    return {
+        owner: claim
+        for owner, claim in claims.items()
+        if isinstance(owner, str) and _OWNER_RE.fullmatch(owner) and _claim_valid(claim)
+    }
 
 
 def _prune(sessions: dict[str, dict[str, object]]) -> dict[str, dict[str, object]]:
@@ -220,6 +226,8 @@ def register(
     """
     if not session_id or not owner:
         raise RuntimeError("session id and owner are required")
+    if not _OWNER_RE.fullmatch(owner):
+        raise RuntimeError("owner must match [A-Za-z0-9._-]{1,64}")
     claim_pid = os.getpid() if pid is None else pid
     comm = _proc_comm(claim_pid)
     if comm is None:
