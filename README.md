@@ -125,6 +125,8 @@ worktrees of the repo your current session belongs to — never cross-repo.
   `worktree-gate` CLI (`grant`, `finished`, `disable`, `enable`, `set-window`,
   `set-startup-display`, `status`). The PreToolUse hook imports its policy; the
   CLI manages exceptions and persistent settings.
+- `scripts/worktree_standdown.py` — the session-scoped stand-down registry
+  (`register`, `release`, `active`, `show`); see "Stand-down registry" below.
 - `scripts/worktree_destruction.py` — pure, testable core of the destruction
   gate: parses a (possibly compound) shell command for destructive intent
   (`git branch -d/-D`, `git worktree remove`/`unlock`, `rm` of the
@@ -289,6 +291,52 @@ hook output, skill text, error messages, the audit log or any other text an agen
 the point is that a Claude session working under warden cannot find it and talk itself
 into using it. The skills `finish-worktree`, `check-worktrees` and the others are
 unchanged and keep working when the switch is off. A test pins the no-mention rule.
+
+### Stand-down registry (for other plugins)
+
+A plugin that drives a whole session and must be the only thing merging and removing
+worktrees can ask warden to stand down for **that session only**. Warden's four hooks and
+the finish auto-test run then do nothing for the session, and stay fully active for every
+other session in the repo. This is the cross-plugin contract; the failure direction is part
+of it: **any doubt means warden stays active.**
+
+- **Files.** `<git-common-dir>/worktree-warden-standdown.json` (data) and
+  `<git-common-dir>/worktree-warden-standdown.lock` (flock sidecar, never deleted). The
+  directory is `git rev-parse --path-format=absolute --git-common-dir` run in the cwd, then
+  `realpath`, so the main checkout and every linked worktree share one file.
+- **Format (v1).** `{"version": 1, "sessions": {"<session_id>": {"claims": {"<owner>": {"pid": 123,
+  "pid_comm": "claude", "reason": "...", "since": "<ISO-8601 UTC>"}}}}}`.
+- **Claim keying.** One claim per (session, owner), so two plugins in one session never overwrite
+  each other. `release` removes only the named owner's claim and is idempotent. Warden stands
+  down while any valid claim exists for the session.
+- **Liveness.** A claim is valid only while `pid` is alive (`kill(pid, 0)`; `EPERM` counts as
+  alive) and `ps -o comm=` for that pid still has the recorded `pid_comm` basename (guards pid
+  reuse). A crashed client therefore cannot strand a stand-down.
+- **Writers** (`register`, `release`) take an exclusive `flock` on the sidecar, read the JSON
+  (missing, empty, malformed or unknown-version content is treated as empty and overwritten),
+  prune every dead claim and claim-less session, then publish with a same-directory temp file and
+  `os.replace`. An empty registry deletes only the data file. Pruning never removes a live claim.
+- **Readers** (`is_standing_down`, and every hook) never write and never lock. They look up only
+  the caller's own session id, verify liveness, and return "not standing down" on a missing
+  session id, missing or unreadable file, parse error, unknown `version`, or git error.
+- **Releasing is the client's job.** Warden does not release on `Stop`/`SubagentStop`.
+
+CLI (`python3 scripts/worktree_standdown.py <command>`; `--session-id` defaults to
+`$CLAUDE_CODE_SESSION_ID`, `--cwd` to the current directory):
+
+| Command | Behavior |
+|---------|----------|
+| `register --owner NAME [--reason TEXT]` | Claim for this session. The pid is the nearest ancestor process whose command name contains `claude`; with none, it refuses and exits 2. |
+| `release --owner NAME` | Drop that owner's claim (no error if absent). |
+| `active` | Silent; exit 0 if standing down, else 1. |
+| `show` | Print the registry JSON (`{}` if none). |
+
+Errors are one stderr line and exit 2. From Python: `register`, `release`, `is_standing_down`,
+`canonical_common_dir`. Each stand-down a hook honors is written to `audit.log` as
+`standdown<TAB>hook: owner=... reason=...`.
+
+The environment switch above still works in this release, as a migration shim. It is
+**deprecated and will be removed in the next release**; move to the registry.
 
 ### Auto-teardown
 

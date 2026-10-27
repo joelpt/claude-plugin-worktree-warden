@@ -583,7 +583,9 @@ def cmd_preflight(repo: str, branches: list[str]) -> Outcome:
     return out
 
 
-def cmd_finish_preflight(worktree: str, target_override: str | None = None) -> Outcome:
+def cmd_finish_preflight(
+    worktree: str, target_override: str | None = None, session_id: str | None = None
+) -> Outcome:
     """Capture all identity data for /finish-worktree in one engine call.
 
     Replaces separate model-issued git calls for PRIMARY, TARGET, BRANCH, and
@@ -594,6 +596,8 @@ def cmd_finish_preflight(worktree: str, target_override: str | None = None) -> O
         worktree: Absolute path of the linked worktree being finished.
         target_override: If provided, skip symbolic-ref lookup and use this
             branch as TARGET.
+        session_id: Session whose stand-down registry claims disable auto-run
+            tests; None means no identity (never standing down).
 
     Returns:
         Outcome with top-level ``primary``, ``target``, ``branch``, and
@@ -623,7 +627,7 @@ def cmd_finish_preflight(worktree: str, target_override: str | None = None) -> O
         return Outcome(EXIT_GIT_ERROR, "git_error", str(exc))
 
     classification = "primary" if is_primary else "linked"
-    test = resolve_test_args(Path(primary)) if _tests_enabled(primary) else _TESTS_DISABLED
+    test = resolve_test_args(Path(primary)) if _tests_enabled(primary, session_id) else _TESTS_DISABLED
     return Outcome(
         EXIT_OK,
         "finish_preflight",
@@ -1232,12 +1236,19 @@ def _has_python_tests(repo: Path) -> bool:
 _TESTS_DISABLED: dict[str, object] = {"argv": ["--skip-tests"], "source": "disabled"}
 
 
-def _tests_enabled(primary: str) -> bool:
-    """Return whether finish may auto-run tests; any failure to decide means no."""
+def _tests_enabled(primary: str, session_id: str | None = None) -> bool:
+    """Return whether finish may auto-run tests; any failure to decide means no.
+
+    Args:
+        primary: Primary checkout path.
+        session_id: Session whose stand-down claims apply; None means no identity.
+    """
     try:
         import worktree_gate  # noqa: PLC0415
 
-        return worktree_gate.tests_on_finish_enabled(worktree_gate.git_facts(primary))
+        return worktree_gate.tests_on_finish_enabled(
+            worktree_gate.git_facts(primary), session_id=session_id
+        )
     except Exception:  # noqa: BLE001 - failing safe means not running tests
         return False
 
@@ -1849,7 +1860,9 @@ def main(argv: list[str] | None = None) -> int:
             branches = [b for b in args.branches.split(",") if b]
             return cmd_preflight(repo, branches).emit(pretty=args.pretty)
         if args.cmd == "finish-preflight":
-            return cmd_finish_preflight(args.worktree, args.target).emit(pretty=args.pretty)
+            return cmd_finish_preflight(
+                args.worktree, args.target, os.environ.get("CLAUDE_CODE_SESSION_ID") or None
+            ).emit(pretty=args.pretty)
         if args.cmd == "finish-recap":
             return cmd_finish_recap(repo, args.base, args.tip, args.limit).emit(pretty=args.pretty)
         if args.cmd == "land":

@@ -411,17 +411,32 @@ def read_run_tests_on_finish(facts: GitFacts) -> bool:
     return enabled
 
 
-def tests_on_finish_enabled(facts: GitFacts, env: Mapping[str, str] | None = None) -> bool:
-    """Return whether finish should run tests, honoring the force-disable switch.
+def tests_on_finish_enabled(
+    facts: GitFacts, env: Mapping[str, str] | None = None, session_id: str | None = None
+) -> bool:
+    """Return whether finish should run tests, honoring both stand-down mechanisms.
 
     Args:
         facts: Resolved git context.
         env: Environment mapping to consult for the switch; defaults to the process one.
+        session_id: Session whose stand-down registry claims apply; None means no
+            identity, which never counts as standing down.
 
     Returns:
-        False when force-disabled; otherwise the ``run_tests_on_finish`` setting.
+        False when force-disabled or the session holds a stand-down claim; otherwise
+        the ``run_tests_on_finish`` setting.
     """
-    return not force_disabled(env) and read_run_tests_on_finish(facts)
+    if force_disabled(env):
+        return False
+    if session_id and facts.repo_root:
+        try:
+            import worktree_standdown  # noqa: PLC0415 - lazy; sibling script
+
+            if worktree_standdown.stand_down_for("tests_on_finish", session_id, facts.repo_root):
+                return False
+        except Exception:  # noqa: BLE001 - failing safe means warden stays active
+            pass
+    return read_run_tests_on_finish(facts)
 
 
 def read_grant_expiry(git_common_dir: str | None) -> float | None:

@@ -354,6 +354,22 @@ def gate_load_error_advisory(cwd: str) -> str | None:
     )
 
 
+def _registry_standdown(payload: dict[str, object]) -> bool:
+    """Return True when this session holds a valid stand-down registry claim.
+
+    Reads the registry without locking or writing; any failure means "not standing down".
+    Each claim that causes a stand-down is recorded in the audit log.
+    """
+    try:
+        import worktree_standdown  # noqa: PLC0415 - lazy: a broken module must not break the hook
+
+        return worktree_standdown.stand_down_for(
+            Path(__file__).stem, str(payload.get("session_id") or ""), str(payload.get("cwd") or os.getcwd())
+        )
+    except Exception:
+        return False
+
+
 def main() -> int:
     """Run the SessionStart hook."""
     if _force_disabled():
@@ -361,6 +377,8 @@ def main() -> int:
     payload = read_stdin()
     source = str(payload.get("source", ""))
     if source and source not in ALLOWED_SOURCES:
+        return 0
+    if _registry_standdown(payload):
         return 0
     cwd = str(payload.get("cwd") or os.getcwd())
 

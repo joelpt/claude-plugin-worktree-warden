@@ -162,6 +162,22 @@ def _block(reason: str, recovery: str) -> int:
     return 2
 
 
+def _registry_standdown(payload: dict[str, object]) -> bool:
+    """Return True when this session holds a valid stand-down registry claim.
+
+    Reads the registry without locking or writing; any failure means "not standing down".
+    Each claim that causes a stand-down is recorded in the audit log.
+    """
+    try:
+        import worktree_standdown  # noqa: PLC0415 - lazy: a broken module must not break the hook
+
+        return worktree_standdown.stand_down_for(
+            Path(__file__).stem, str(payload.get("session_id") or ""), str(payload.get("cwd") or os.getcwd())
+        )
+    except Exception:
+        return False
+
+
 def main() -> int:
     """Evaluate the pending Bash / ExitWorktree call and block unsafe destruction."""
     if _force_disabled():
@@ -173,6 +189,8 @@ def main() -> int:
 
     try:
         tool = payload.get("tool_name")
+        if tool in ("Bash", "ExitWorktree") and _registry_standdown(payload):
+            return 0
         cwd = payload.get("cwd") or os.getcwd()
         tool_input = payload.get("tool_input") or {}
 

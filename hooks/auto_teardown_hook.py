@@ -251,6 +251,22 @@ def _build_reason(
     return ""
 
 
+def _registry_standdown(payload: dict[str, object]) -> bool:
+    """Return True when this session holds a valid stand-down registry claim.
+
+    Reads the registry without locking or writing; any failure means "not standing down".
+    Each claim that causes a stand-down is recorded in the audit log.
+    """
+    try:
+        import worktree_standdown  # noqa: PLC0415 - lazy: a broken module must not break the hook
+
+        return worktree_standdown.stand_down_for(
+            Path(__file__).stem, str(payload.get("session_id") or ""), str(payload.get("cwd") or os.getcwd())
+        )
+    except Exception:
+        return False
+
+
 def main() -> int:
     """Hook entry point: parse payload, apply eligibility gates, emit decision.
 
@@ -265,6 +281,9 @@ def main() -> int:
         return 0
 
     if payload.get("stop_hook_active") is True:
+        return 0
+
+    if _registry_standdown(cast(dict[str, object], payload)):
         return 0
 
     cwd: str = payload.get("cwd") or os.getcwd()

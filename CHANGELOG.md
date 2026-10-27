@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Stand-down registry: a session-scoped, multi-owner way for any plugin to switch warden off (Release A).**
+  `scripts/worktree_standdown.py` (stdlib only; CLI `register|release|active|show`) keeps claims in
+  `<git-common-dir>/worktree-warden-standdown.json`, guarded by a persistent `worktree-warden-standdown.lock`
+  sidecar. Claims are keyed by session id and owner, die with their `claude` process (pid plus command-name
+  check, so pid reuse cannot revive one), and affect only the session that registered them, unlike a project-wide
+  setting that outlives the session. `enforce_worktree_hook`, `guard_destruction_hook`, `auto_teardown_hook`,
+  `check_worktrees_hook` and the finish auto-test run stand down while the session holds any valid claim, and
+  record owner and reason in `audit.log`. Every read-side failure leaves warden active. The finish engine now
+  takes the session id from `CLAUDE_CODE_SESSION_ID`. `devtools/smoke_standdown.py` (`just smoke-standdown`)
+  drives it end to end with real processes.
+  The existing environment switch still works in this release but is deprecated and will be removed in the next one.
+
 ### Fixed
 
 - **Destruction gate refuses destructive verbs hidden behind constructs the parser cannot model.**

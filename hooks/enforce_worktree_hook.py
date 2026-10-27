@@ -230,6 +230,22 @@ def _occupancy_block(
         return None
 
 
+def _registry_standdown(payload: dict[str, object]) -> bool:
+    """Return True when this session holds a valid stand-down registry claim.
+
+    Reads the registry without locking or writing; any failure means "not standing down".
+    Each claim that causes a stand-down is recorded in the audit log.
+    """
+    try:
+        import worktree_standdown  # noqa: PLC0415 - lazy: a broken module must not break the hook
+
+        return worktree_standdown.stand_down_for(
+            Path(__file__).stem, str(payload.get("session_id") or ""), str(payload.get("cwd") or os.getcwd())
+        )
+    except Exception:
+        return False
+
+
 def main() -> int:
     """Evaluate the pending Edit/Write and block it when the gate says so."""
     if _force_disabled():
@@ -241,6 +257,8 @@ def main() -> int:
 
     try:
         if payload.get("tool_name") not in ("Edit", "Write"):
+            return 0
+        if _registry_standdown(payload):
             return 0
         cwd = payload.get("cwd") or os.getcwd()
         tool_input = payload.get("tool_input") or {}
